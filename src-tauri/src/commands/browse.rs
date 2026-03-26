@@ -337,12 +337,6 @@ pub async fn show_in_folder(path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Return popular Hugging Face GGUF models for the Browse tab.
-#[tauri::command]
-pub async fn list_hub_models() -> Result<Vec<HubModel>, String> {
-    fetch_hub_models(None, 0, 80, true).await
-}
-
 #[tauri::command]
 pub async fn list_downloads(
     state: tauri::State<'_, SharedState>,

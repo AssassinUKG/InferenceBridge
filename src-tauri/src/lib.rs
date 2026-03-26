@@ -204,7 +204,6 @@ pub fn run() {
             commands::settings::get_llama_info,
             commands::settings::download_llama_build,
             commands::benchmark::run_model_test,
-            commands::browse::list_hub_models,
             commands::browse::download_hub_model,
             commands::browse::list_downloads,
             commands::browse::cancel_download,

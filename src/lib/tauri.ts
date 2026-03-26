@@ -167,8 +167,6 @@ export interface DownloadProgress {
   error: string | null;
 }
 
-export const listHubModels = () => invoke<HubModel[]>("list_hub_models");
-
 export const searchHubModels = (query: string, offset: number = 0) =>
   invoke<HubModel[]>("search_hub_models", { query, offset });
 
