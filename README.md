@@ -1,8 +1,8 @@
 # InferenceBridge
 
-**A local LLM desktop app** — run any GGUF model on your own hardware with an OpenAI-compatible API and a clean, modern UI.
+**A local LLM desktop app** - run any GGUF model on your own hardware with an OpenAI-compatible API and a clean, modern UI.
 
-Built with Tauri (Rust) + React. Wraps `llama-server` from [llama.cpp](https://github.com/ggerganov/llama.cpp) and manages the whole thing — process lifecycle, model loading, streaming chat, API serving, and context monitoring.
+Built with Tauri (Rust) + React. Wraps `llama-server` from [llama.cpp](https://github.com/ggerganov/llama.cpp) and manages the whole thing - process lifecycle, model loading, streaming chat, API serving, and context monitoring.
 
 ---
 
