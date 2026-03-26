@@ -34,8 +34,9 @@ Thumbs.db
 # User config (contains local paths — use inference-bridge.example.toml as template)
 /inference-bridge.toml
 
-# Runtime app-support directory (used as config fallback in dev)
+# Runtime app-support directories (used as config fallback in dev)
 /.inference-bridge/
+/src-tauri/.inference-bridge/
 
 # Icon build artifacts
 /ib-icon-source.png
