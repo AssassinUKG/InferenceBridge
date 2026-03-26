@@ -1,0 +1,46 @@
+# Node
+node_modules/
+dist/
+.env
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Rust
+/target/
+# Note: Cargo.lock is intentionally kept for binary crates (reproducible builds)
+
+# Tauri
+/src-tauri/target/
+/src-tauri/.cargo/
+/src-tauri/bundle/
+
+# VSCode
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Misc
+*.swp
+*.swo
+.idea/
+*.iml
+
+# User config (contains local paths — use inference-bridge.example.toml as template)
+/inference-bridge.toml
+
+# Runtime app-support directory (used as config fallback in dev)
+/.inference-bridge/
+
+# Icon build artifacts
+/ib-icon-source.png
+
+# Internal dev notes not needed for public repo
+/API_GUI_ISSUES.md
+/IMPROVEMENTS_CHECKLIST.md
+/build-all.cmd

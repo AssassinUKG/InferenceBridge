@@ -1,0 +1,25 @@
+# InferenceBridge — example configuration
+# Copy to: %APPDATA%\InferenceBridge\inference-bridge.toml (Windows)
+#       or: ~/.config/InferenceBridge/inference-bridge.toml (Linux/Mac)
+
+[server]
+port = 8800
+host = "127.0.0.1"
+
+[models]
+# Point at your LM Studio models cache and any additional model directories
+scan_dirs = [
+    "C:\\Users\\richa\\.cache\\lm-studio\\models",
+]
+default_context = 8192
+
+[process]
+# Leave empty to auto-detect llama-server from PATH
+llama_server_path = ""
+# -1 = offload all layers to GPU
+gpu_layers = -1
+# 0 = auto-detect thread count
+threads = 0
+
+[ui]
+theme = "dark"

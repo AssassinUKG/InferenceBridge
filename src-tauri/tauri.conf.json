@@ -1,0 +1,38 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nickelpack/tauri-v2-schema/main/schema.json",
+  "productName": "InferenceBridge",
+  "version": "0.1.0",
+  "identifier": "com.inferencebridge.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "InferenceBridge",
+        "width": 1200,
+        "height": 800,
+        "resizable": true,
+        "fullscreen": false,
+        "minWidth": 800,
+        "minHeight": 600
+      }
+    ],
+    "security": {
+      "csp": null
+    },
+    "trayIcon": {
+      "tooltip": "InferenceBridge",
+      "iconPath": "icons/icon.png"
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": true
+    }
+  }
+}

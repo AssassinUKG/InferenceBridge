@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Capability for the main window — allows all app IPC commands and core events","local":true,"windows":["main"],"permissions":["core:default","shell:allow-open"]}}

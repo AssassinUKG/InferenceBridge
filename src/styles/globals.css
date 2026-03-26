@@ -1,0 +1,102 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  --bg: #111113;
+  --surface-1: #1a1a1c;
+  --surface-2: #222226;
+  --surface-3: #2c2c30;
+  --border: rgba(255, 255, 255, 0.07);
+  --border-mid: rgba(255, 255, 255, 0.12);
+  --text-0: #e4e4e8;
+  --text-1: #8c8c94;
+  --text-2: #52525a;
+  --accent: #22d3ee;
+  --accent-dim: rgba(34, 211, 238, 0.15);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: "Aptos", "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+  color: var(--text-0);
+  background: var(--bg);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+#root {
+  isolation: isolate;
+}
+
+/* Slim scrollbars */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+
+/* Custom range slider */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  border: 2px solid rgba(0, 0, 0, 0.5);
+  box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.15);
+  transition: box-shadow 0.15s;
+}
+
+input[type="range"]::-webkit-slider-thumb:hover {
+  box-shadow: 0 0 0 5px rgba(34, 211, 238, 0.22);
+}
+
+input[type="range"]::-webkit-slider-runnable-track {
+  border-radius: 2px;
+}
+
+@layer components {
+  .settings-input {
+    @apply w-full rounded-lg border border-white bg-white px-3 py-2 text-sm text-slate-100 outline-none transition focus:border-cyan-400/40 focus:ring-1 focus:ring-cyan-400/15;
+    border-color: rgba(255,255,255,0.08);
+    background-color: rgba(255,255,255,0.05);
+  }
+}

@@ -1,0 +1,18 @@
+# Normalise line endings to LF in the repo, checkout as native on each OS
+* text=auto eol=lf
+
+# Windows batch/PowerShell scripts stay CRLF on Windows checkout
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+
+# Binary files — no line-ending processing
+*.png binary
+*.ico binary
+*.icns binary
+*.gguf binary
+*.db binary
+*.woff2 binary
+*.woff binary
+*.ttf binary
+*.otf binary

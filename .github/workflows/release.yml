@@ -1,0 +1,93 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'          # trigger on v1.0.0, v1.2.3, etc.
+  workflow_dispatch:  # allow manual trigger from GitHub UI
+
+permissions:
+  contents: write   # needed to create GitHub Releases and upload assets
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+            args: '--target x86_64-pc-windows-msvc'
+          - os: macos-latest
+            name: macOS (Apple Silicon)
+            args: '--target aarch64-apple-darwin'
+          - os: ubuntu-22.04
+            name: Linux
+            args: '--target x86_64-unknown-linux-gnu'
+
+    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.name }}
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Node ────────────────────────────────────────────────────────────────
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # ── Rust ────────────────────────────────────────────────────────────────
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'windows-latest' && 'x86_64-pc-windows-msvc' || matrix.os == 'macos-latest' && 'aarch64-apple-darwin' || 'x86_64-unknown-linux-gnu' }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      # ── Linux system libraries ───────────────────────────────────────────────
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      # ── Build ───────────────────────────────────────────────────────────────
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'InferenceBridge ${{ github.ref_name }}'
+          releaseBody: |
+            ## InferenceBridge ${{ github.ref_name }}
+
+            ### Installation
+            - **Windows:** Download and run the `.msi` or `.exe` installer
+            - **macOS:** Download the `.dmg`, open it and drag to Applications
+            - **Linux:** Download the `.deb` (Debian/Ubuntu) or `.AppImage`
+
+            ### First run
+            1. Open the app and go to **Settings → llama-server** → click **Download** to get the inference engine
+            2. Go to **Browse** to find and download a model
+            3. Go to **Models**, click **Load**, then start chatting or connect via the API at `http://localhost:8800/v1`
+
+            See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for full documentation.
+          releaseDraft: true       # creates a draft — review before publishing
+          prerelease: false
+          args: ${{ matrix.args }}
