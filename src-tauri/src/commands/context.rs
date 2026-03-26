@@ -1,5 +1,3 @@
-//! Tauri commands for context/KV management.
-
 use crate::context::tracker;
 use crate::engine::client::LlamaClient;
 use crate::state::SharedState;
@@ -8,17 +6,31 @@ use crate::state::SharedState;
 pub async fn get_context_status(
     state: tauri::State<'_, SharedState>,
 ) -> Result<tracker::ContextStatus, String> {
-    let s = state.read().await;
-    if s.loaded_model.is_none() {
-        return Ok(tracker::ContextStatus::empty());
+    let (loaded, running, port, stored) = {
+        let s = state.read().await;
+        (
+            s.loaded_model.is_some(),
+            matches!(s.process.state(), crate::engine::process::ProcessState::Running),
+            s.process.port(),
+            s.last_context_status.clone(),
+        )
+    };
+
+    if !loaded || !running {
+        return Ok(stored.unwrap_or_else(tracker::ContextStatus::empty));
     }
-    // Only poll if server is actually running
-    if !matches!(
-        s.process.state(),
-        crate::engine::process::ProcessState::Running
-    ) {
-        return Ok(tracker::ContextStatus::empty());
+
+    let client = LlamaClient::new(port);
+    let polled = tracker::poll_context_status(&client).await;
+
+    if let Some(stored) = stored {
+        Ok(polled.with_breakdown(
+            stored.pinned_tokens,
+            stored.rolling_tokens,
+            stored.compressed_tokens,
+            stored.last_compaction_action,
+        ))
+    } else {
+        Ok(polled)
     }
-    let client = LlamaClient::new(s.process.port());
-    Ok(tracker::poll_context_status(&client).await)
 }

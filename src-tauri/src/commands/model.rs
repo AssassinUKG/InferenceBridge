@@ -22,6 +22,39 @@ fn emit_load_progress(
     }
 }
 
+async fn store_launch_preview(state: &SharedState, preview: LaunchPreview) {
+    let mut s = state.write().await;
+    s.last_launch_preview = Some(preview);
+}
+
+fn effective_profile_info_from_state(
+    state: &crate::state::AppState,
+    requested_model: Option<&str>,
+) -> Result<EffectiveProfileInfo, String> {
+    let resolved_model = requested_model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| state.loaded_model.clone())
+        .or_else(|| state.model_registry.list().first().map(|model| model.filename.clone()))
+        .ok_or_else(|| "No model is available to resolve an effective profile".to_string())?;
+
+    Ok(EffectiveProfileInfo {
+        requested_model: requested_model
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        override_entry: effective_override(&resolved_model),
+        profile: detect_effective_profile(&resolved_model),
+        resolved_model: Some(resolved_model),
+    })
+}
+
+pub fn get_effective_profile_for_shared(
+    state: &crate::state::AppState,
+    model_name: Option<&str>,
+) -> Result<EffectiveProfileInfo, String> {
+    effective_profile_info_from_state(state, model_name)
+}
+
 /// Core backend model loading logic, used by both the REST API and headless mode.
 ///
 /// Emits `model-load-progress` Tauri events when an `app_handle` is stored in
@@ -48,7 +81,7 @@ pub async fn backend_load_model(
     );
 
     // Phase 1: Resolve model info (brief lock) + claim loading generation
-    let (config, model_filename, my_generation) = {
+    let (config, model_filename, my_generation, launch_preview) = {
         let model = {
             let s = state.read().await;
             s.model_registry.find_by_name(&model_name).cloned()
@@ -103,6 +136,18 @@ pub async fn backend_load_model(
             rope_freq_scale: s.config.process.rope_freq_scale,
         };
 
+        LlamaProcess::validate_launch_config(&config).map_err(|e| {
+            let msg = format!("Invalid launch configuration: {e}");
+            emit_load_progress(&app_handle, "error", &msg, 0.0, true, Some(msg.clone()));
+            msg
+        })?;
+
+        let preview = s.process.build_args_preview(&config).map_err(|e| {
+            let msg = format!("Could not build launch preview: {e}");
+            emit_load_progress(&app_handle, "error", &msg, 0.0, true, Some(msg.clone()));
+            msg
+        })?;
+
         // Bump generation so older in-flight loads won't overwrite us
         s.loading_generation += 1;
         let gen = s.loading_generation;
@@ -113,8 +158,10 @@ pub async fn backend_load_model(
             "Phase 1: Resolved model (API/backend)"
         );
 
-        (config, model.filename.clone(), gen)
+        (config, model.filename.clone(), gen, preview)
     }; // write lock released
+
+    store_launch_preview(&state, launch_preview.clone()).await;
 
     let ctx = config.context_size;
     let size_info = format!("{} (ctx: {})", model_filename, ctx);
@@ -284,6 +331,8 @@ pub async fn backend_load_model(
         }
         s.loaded_model = Some(model_filename.clone());
         s.process.set_state_running();
+        s.last_known_good_config = Some(launch_preview);
+        s.last_startup_duration_ms = Some(start.elapsed().as_millis() as u64);
     }
 
     crate::context::tracker::reset_slots_warning();
@@ -296,9 +345,10 @@ pub async fn backend_load_model(
 // Tauri commands for model management.
 
 use crate::engine::download;
-use crate::engine::process::{LaunchConfig, LlamaProcess};
+use crate::engine::process::{LaunchConfig, LaunchPreview, LlamaProcess};
+use crate::models::overrides::{detect_effective_profile, effective_override};
 use crate::models::scanner;
-use crate::state::{LoadProgress, SharedState};
+use crate::state::{EffectiveProfileInfo, LoadProgress, SharedState};
 use tauri::Emitter;
 
 fn command_no_window(program: &str) -> std::process::Command {
@@ -322,7 +372,6 @@ pub async fn list_models(state: tauri::State<'_, SharedState>) -> Result<Vec<Mod
             let supports_tools = !matches!(m.profile.tool_call_format, ToolCallFormat::NativeApi)
                 || m.profile.supports_parallel_tools;
             let supports_reasoning = !matches!(m.profile.think_tag_style, ThinkTagStyle::None);
-            let supports_vision = model_supports_vision(&m.filename);
             ModelInfo {
                 filename: m.filename.clone(),
                 path: m.path.to_string_lossy().to_string(),
@@ -330,7 +379,7 @@ pub async fn list_models(state: tauri::State<'_, SharedState>) -> Result<Vec<Mod
                 family: m.profile.family.to_string(),
                 supports_tools,
                 supports_reasoning,
-                supports_vision,
+                supports_vision: m.profile.supports_vision,
                 context_window: m.profile.default_context_window,
                 max_context_window: m.profile.max_context_window,
                 max_output_tokens: m.profile.default_max_output_tokens,
@@ -399,7 +448,7 @@ pub async fn load_model(
 
     // Phase 1: Resolve model info (brief lock) + claim loading generation
     emit("resolving", "Resolving model...", 0.0);
-    let (config, model_filename, my_generation) = {
+    let (config, model_filename, my_generation, launch_preview) = {
         let mut s = state.write().await;
         let model = s
             .model_registry
@@ -435,6 +484,18 @@ pub async fn load_model(
             rope_freq_scale: s.config.process.rope_freq_scale,
         };
 
+        LlamaProcess::validate_launch_config(&config).map_err(|e| {
+            let msg = format!("Invalid launch configuration: {e}");
+            emit_error(&msg);
+            msg
+        })?;
+
+        let preview = s.process.build_args_preview(&config).map_err(|e| {
+            let msg = format!("Could not build launch preview: {e}");
+            emit_error(&msg);
+            msg
+        })?;
+
         // Bump generation so older in-flight loads won't overwrite us
         s.loading_generation += 1;
         let gen = s.loading_generation;
@@ -445,8 +506,10 @@ pub async fn load_model(
             "Phase 1: Resolved model"
         );
 
-        (config, model.filename.clone(), gen)
+        (config, model.filename.clone(), gen, preview)
     }; // write lock released
+
+    store_launch_preview(state.inner(), launch_preview.clone()).await;
 
     let ctx = config.context_size;
     let size_info = format!("{} (ctx: {})", model_filename, ctx);
@@ -772,6 +835,8 @@ pub async fn load_model(
         }
         s.loaded_model = Some(model_filename.clone());
         s.process.set_state_running();
+        s.last_known_good_config = Some(launch_preview);
+        s.last_startup_duration_ms = Some(start.elapsed().as_millis() as u64);
     }
 
     crate::context::tracker::reset_slots_warning();
@@ -812,6 +877,10 @@ pub async fn unload_model(state: tauri::State<'_, SharedState>) -> Result<String
 pub async fn get_process_status(
     state: tauri::State<'_, SharedState>,
 ) -> Result<ProcessStatusInfo, String> {
+    collect_process_status(state.inner().clone()).await
+}
+
+pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusInfo, String> {
     // Extract everything we need from the lock, then drop it before any I/O
     let (
         state_str,
@@ -826,6 +895,9 @@ pub async fn get_process_status(
         api_error,
         api_url,
         api_port,
+        last_launch_preview,
+        startup_duration_ms,
+        parallel_slots,
     ) = {
         let s = state.read().await;
         let server_path = s.process.find_server_binary();
@@ -846,6 +918,9 @@ pub async fn get_process_status(
                 s.config.server.host, s.config.server.port
             ),
             s.config.server.port,
+            s.last_launch_preview.clone(),
+            s.last_startup_duration_ms,
+            Some(s.config.process.parallel_slots),
         )
     }; // read lock released before any async I/O
 
@@ -879,6 +954,13 @@ pub async fn get_process_status(
         None
     };
 
+    let slot_count = if is_running {
+        let client = crate::engine::client::LlamaClient::new(port);
+        client.get_props().await.ok().and_then(|props| props.total_slots)
+    } else {
+        None
+    };
+
     Ok(ProcessStatusInfo {
         state: state_str,
         model: loaded_model,
@@ -891,6 +973,10 @@ pub async fn get_process_status(
         api_error,
         api_url,
         api_port_owner,
+        startup_duration_ms,
+        parallel_slots,
+        slot_count,
+        last_launch_preview,
     })
 }
 
@@ -1244,16 +1330,6 @@ pub struct ModelInfo {
     pub think_tag_style: String,
 }
 
-fn model_supports_vision(filename: &str) -> bool {
-    let name = filename.to_lowercase();
-    name.contains("vision")
-        || name.contains("llava")
-        || name.contains("multimodal")
-        || name.contains("qwen2.5-vl")
-        || name.contains("-vl")
-        || name.contains("_vl")
-}
-
 #[derive(serde::Serialize)]
 pub struct ProcessStatusInfo {
     pub state: String,
@@ -1267,6 +1343,10 @@ pub struct ProcessStatusInfo {
     pub api_error: Option<String>,
     pub api_url: String,
     pub api_port_owner: Option<ApiPortOwnerInfo>,
+    pub startup_duration_ms: Option<u64>,
+    pub parallel_slots: Option<u32>,
+    pub slot_count: Option<u32>,
+    pub last_launch_preview: Option<LaunchPreview>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -1282,6 +1362,40 @@ pub struct ServerInfo {
     pub found: bool,
     pub path: Option<String>,
     pub version: Option<String>,
+}
+
+#[tauri::command]
+pub async fn get_effective_profile(
+    state: tauri::State<'_, SharedState>,
+    model_name: Option<String>,
+) -> Result<EffectiveProfileInfo, String> {
+    let s = state.read().await;
+    effective_profile_info_from_state(&s, model_name.as_deref())
+}
+
+#[tauri::command]
+pub async fn reload_last_known_good(
+    state: tauri::State<'_, SharedState>,
+) -> Result<String, String> {
+    let preview = {
+        let s = state.read().await;
+        s.last_known_good_config.clone()
+    }
+    .ok_or_else(|| "No last known good launch configuration has been recorded yet".to_string())?;
+
+    let model_name = std::path::Path::new(&preview.model_path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .ok_or_else(|| "Last known good config does not contain a valid model path".to_string())?;
+
+    if !std::path::Path::new(&preview.model_path).exists() {
+        return Err(format!(
+            "The last known good model path no longer exists: {}",
+            preview.model_path
+        ));
+    }
+
+    backend_load_model(state.inner().clone(), model_name, None).await
 }
 
 #[tauri::command]

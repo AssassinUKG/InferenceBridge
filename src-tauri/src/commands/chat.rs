@@ -1,11 +1,190 @@
-//! Tauri commands for chat / generation.
-
-use crate::engine::client::{CompletionRequest, ImageData, LlamaClient};
-use crate::engine::streaming;
-use crate::state::SharedState;
-use crate::templates::engine::{render_prompt, ChatMessage};
-use std::sync::atomic::Ordering;
 use tauri::Emitter;
+
+use crate::context::{compressor, strategy, tracker};
+use crate::engine::client::{CompletionRequest, ImageData, LlamaClient};
+use crate::engine::streaming::{self, StreamEvent};
+use crate::state::{GenerationRequest, SharedState};
+use crate::templates::engine::{render_prompt, ChatMessage};
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+fn build_parse_trace(raw: &str, stripped: &str, reasoning: &str) -> String {
+    let (tool_calls, visible_text) = crate::normalize::tool_extract::extract_tool_calls(stripped);
+    serde_json::to_string_pretty(&serde_json::json!({
+        "raw_response": raw,
+        "reasoning_text": reasoning,
+        "stripped_response": stripped,
+        "visible_text": visible_text,
+        "tool_calls": tool_calls,
+    }))
+    .unwrap_or_else(|_| "Failed to serialize parse trace".to_string())
+}
+
+async fn begin_generation(
+    state: &SharedState,
+    source: &str,
+    session_id: Option<String>,
+    model: String,
+) -> tokio_util::sync::CancellationToken {
+    let mut s = state.write().await;
+    s.generation_cancel.cancel();
+    s.generation_cancel = tokio_util::sync::CancellationToken::new();
+    s.active_generation = Some(GenerationRequest {
+        id: uuid::Uuid::new_v4().to_string(),
+        source: source.to_string(),
+        session_id,
+        model,
+        started_at: now_rfc3339(),
+        status: "running".to_string(),
+    });
+    s.generation_cancel.clone()
+}
+
+async fn finish_generation(state: &SharedState, status: &str) {
+    let mut s = state.write().await;
+    if let Some(active) = s.active_generation.as_mut() {
+        active.status = status.to_string();
+    }
+    s.active_generation = None;
+}
+
+async fn schedule_context_follow_up(state: SharedState, session_id: String) {
+    let (loaded, running, port, app_handle) = {
+        let s = state.read().await;
+        (
+            s.loaded_model.is_some(),
+            matches!(s.process.state(), crate::engine::process::ProcessState::Running),
+            s.process.port(),
+            s.app_handle.clone(),
+        )
+    };
+
+    if !loaded || !running {
+        return;
+    }
+
+    let client = LlamaClient::new(port);
+    let mut status = tracker::poll_context_status(&client).await;
+
+    let (messages, latest_snapshot) = {
+        let s = state.read().await;
+        let db = match s.session_db.lock() {
+            Ok(db) => db,
+            Err(_) => return,
+        };
+        let messages = match db.get_messages(&session_id) {
+            Ok(messages) => messages,
+            Err(_) => return,
+        };
+        let latest_snapshot = db.latest_context_snapshot(&session_id).ok().flatten();
+        (messages, latest_snapshot)
+    };
+
+    let rolling_message_count = messages
+        .iter()
+        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+        .count() as u32;
+    let compressed_tokens = latest_snapshot.as_ref().map(|snap| snap.kv_tokens).unwrap_or(0);
+    let rolling_tokens = status.used_tokens.saturating_sub(compressed_tokens);
+
+    let action = strategy::decide_action(status.used_tokens, status.total_tokens, rolling_message_count);
+    let action_label = match action {
+        strategy::ContextAction::NoAction => None,
+        strategy::ContextAction::Compress { message_count } => {
+            Some(format!("Context nearing capacity; compressing {message_count} older messages."))
+        }
+        strategy::ContextAction::Rebuild => Some("Context critically full; a rebuild is recommended.".to_string()),
+    };
+
+    status = status.with_breakdown(0, rolling_tokens, compressed_tokens, action_label.clone());
+
+    {
+        let mut s = state.write().await;
+        s.last_context_status = Some(status.clone());
+    }
+
+    if let Some(handle) = app_handle.clone() {
+        if let Some(action_text) = action_label.clone() {
+            let _ = handle.emit(
+                "context-pressure",
+                serde_json::json!({
+                    "sessionId": session_id,
+                    "fillRatio": status.fill_ratio,
+                    "usedTokens": status.used_tokens,
+                    "totalTokens": status.total_tokens,
+                    "action": action_text,
+                }),
+            );
+        }
+    }
+
+    if let strategy::ContextAction::Compress { message_count } = action {
+        tokio::spawn(async move {
+            let candidates = {
+                let s = state.read().await;
+                let db = match s.session_db.lock() {
+                    Ok(db) => db,
+                    Err(_) => return,
+                };
+                match db.get_messages(&session_id) {
+                    Ok(messages) => messages,
+                    Err(_) => return,
+                }
+            };
+
+            let compressible = candidates
+                .iter()
+                .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+                .take(message_count as usize)
+                .map(|message| {
+                    (
+                        message.role.clone(),
+                        message.content.clone().unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>();
+
+            if compressible.is_empty() {
+                return;
+            }
+
+            let summary = match compressor::summarize_messages_with_model(
+                state.clone(),
+                &session_id,
+                &compressible,
+            )
+            .await
+            {
+                Ok(Some(summary)) => summary,
+                Ok(None) => compressor::compress_messages(&compressible),
+                Err(_) => compressor::compress_messages(&compressible),
+            };
+
+            let summary_tokens = (summary.len() as u32 / 4).max(1);
+            {
+                let s = state.read().await;
+                if let Ok(db) = s.session_db.lock() {
+                    let _ = db.add_context_snapshot(&session_id, &summary, summary_tokens);
+                };
+            }
+
+            let mut s = state.write().await;
+            if let Some(current) = s.last_context_status.clone() {
+                let pinned_tokens = current.pinned_tokens;
+                let rolling_tokens = current.rolling_tokens;
+                let compressed_tokens = current.compressed_tokens;
+                s.last_context_status = Some(current.with_breakdown(
+                    pinned_tokens,
+                    rolling_tokens.saturating_sub(summary_tokens),
+                    compressed_tokens.saturating_add(summary_tokens),
+                    Some(format!("Compressed {message_count} older messages into a memory snapshot.")),
+                ));
+            }
+        });
+    }
+}
 
 #[tauri::command]
 pub async fn send_message(
@@ -19,47 +198,34 @@ pub async fn send_message(
     max_tokens: Option<u32>,
     seed: Option<i64>,
     image_base64: Option<String>,
-    // show_thinking: If Some(true): preserve think tags in response. If Some(false): disable thinking for Qwen models.
-    // If None: default (strip think tags from display, don't modify prompt).
     show_thinking: Option<bool>,
 ) -> Result<String, String> {
     tracing::info!(session = %session_id, content_len = content.len(), "send_message called");
 
-    let s = state.read().await;
+    let (model_name, profile) = {
+        let s = state.read().await;
+        let Some(model_name) = s.loaded_model.clone() else {
+            return Err("No model loaded".to_string());
+        };
+        let profile = crate::models::overrides::detect_effective_profile(&model_name);
+        (model_name, profile)
+    };
 
-    if s.loaded_model.is_none() {
-        tracing::warn!("send_message: No model loaded");
-        return Err("No model loaded".to_string());
-    }
-
-    let model_name = s.loaded_model.as_deref().unwrap_or("");
-    let model_supports_vision = model_name_supports_vision(model_name);
-
-    if image_base64.is_some() && !model_supports_vision {
-        tracing::warn!(
-            model = model_name,
-            "Image was attached but the loaded model does not advertise vision support"
-        );
+    if image_base64.is_some() && !profile.supports_vision {
         return Err(format!(
             "The loaded model `{model_name}` does not advertise vision support. Load a Vision-capable model first."
         ));
     }
 
-    // Save user message to DB, including the pasted image when present.
     {
+        let s = state.read().await;
         let db = s.session_db.lock().map_err(|e| e.to_string())?;
-        let _ = db
-            .add_message(&session_id, "user", &content, 0, image_base64.as_deref())
+        db.add_message(&session_id, "user", &content, 0, image_base64.as_deref())
             .map_err(|e| e.to_string())?;
     }
 
-    // If image is present, log its size (it will be injected into the prompt below)
-    if let Some(ref img) = image_base64 {
-        tracing::info!(len = img.len(), "Received image_base64 for vision model");
-    }
-
-    // Build message history from DB
     let db_messages = {
+        let s = state.read().await;
         let db = s.session_db.lock().map_err(|e| e.to_string())?;
         db.get_messages(&session_id).map_err(|e| e.to_string())?
     };
@@ -68,9 +234,9 @@ pub async fn send_message(
     let mut next_image_id = 1u32;
     let messages: Vec<ChatMessage> = db_messages
         .iter()
-        .map(|m| {
-            let mut message_content = m.content.clone().unwrap_or_default();
-            if let Some(image_uri) = &m.image_base64 {
+        .map(|message| {
+            let mut message_content = message.content.clone().unwrap_or_default();
+            if let Some(image_uri) = &message.image_base64 {
                 let image_id = next_image_id;
                 next_image_id += 1;
                 let marker = format!("[img-{image_id}]");
@@ -88,40 +254,37 @@ pub async fn send_message(
             }
 
             ChatMessage {
-                role: m.role.clone(),
+                role: message.role.clone(),
                 content: message_content,
             }
         })
         .collect();
 
-    let profile = crate::models::profiles::ModelProfile::detect(model_name);
-
-    // For Qwen-style thinking models: inject /think or /no_think into the last
-    // user message before rendering — this controls whether the model reasons.
-    // We modify the in-memory array only; the DB stores the clean original.
     let messages = if profile.has_think_tags() {
-        let mut msgs = messages;
-        if let Some(last) = msgs.last_mut().filter(|m| m.role == "user") {
+        let mut messages = messages;
+        if let Some(last) = messages.last_mut().filter(|message| message.role == "user") {
             match show_thinking {
                 Some(true) => last.content = format!("/think\n{}", last.content),
                 Some(false) => last.content = format!("/no_think\n{}", last.content),
-                None => {} // default: model decides
+                None => {}
             }
         }
-        msgs
+        messages
     } else {
         messages
     };
 
-    // Render prompt using template
     let prompt = render_prompt(&messages, &profile);
+    {
+        let mut s = state.write().await;
+        s.last_prompt = Some(prompt.clone());
+    }
 
-    // Build completion request
     let request = CompletionRequest {
         prompt,
         n_predict: max_tokens
             .or(profile.default_max_output_tokens)
-            .map(|t| t as i32),
+            .map(|value| value as i32),
         temperature: temperature.or(profile.default_temperature),
         top_p: top_p.or(profile.default_top_p),
         top_k: top_k.or(profile.default_top_k),
@@ -136,104 +299,129 @@ pub async fn send_message(
         image_data,
     };
 
-    let port = s.process.port();
+    let cancel = begin_generation(
+        state.inner(),
+        "gui",
+        Some(session_id.clone()),
+        model_name.clone(),
+    )
+    .await;
+
+    let port = {
+        let s = state.read().await;
+        s.process.port()
+    };
     let client = LlamaClient::new(port);
-    // Reset stop flag and clone it for the stream consumer
-    s.generation_stop.store(false, Ordering::Relaxed);
-    let stop_flag = s.generation_stop.clone();
-    drop(s); // Release lock before streaming
+    let response = client
+        .complete_stream(&request)
+        .await
+        .map_err(|e| format!("Completion failed: {e}"))?;
 
-    tracing::info!(
-        port,
-        prompt_len = request.prompt.len(),
-        "Sending completion request to llama-server"
-    );
-
-    // Stream completion
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-    let response = client.complete_stream(&request).await.map_err(|e| {
-        tracing::error!(error = %e, "Completion request failed");
-        format!("Completion failed: {e}")
-    })?;
-
-    tracing::info!(status = %response.status(), "Got streaming response from llama-server");
-
-    // Spawn stream consumer
     tokio::spawn(async move {
-        let _ = streaming::consume_sse_stream(response, tx, stop_flag).await;
+        let _ = streaming::consume_sse_stream(response, tx, cancel).await;
     });
 
-    // Forward events to frontend
     let mut full_text = String::new();
+    let mut reasoning_text = String::new();
+    let mut tokens_predicted = None;
+    let mut tokens_evaluated = None;
+    let mut tokens_per_second = None;
+
     while let Some(event) = rx.recv().await {
         match event {
-            streaming::StreamEvent::Token(token) => {
-                full_text.push_str(&token);
+            StreamEvent::Token(token) => {
                 let _ = app.emit("stream-token", &token);
-                // Yield to the tokio runtime so the WebView IPC queue can flush
-                // before the next token is emitted. Without this, all tokens from
-                // a single TCP chunk are emitted in one burst and arrive at the
-                // frontend together instead of one at a time.
                 tokio::task::yield_now().await;
             }
-            streaming::StreamEvent::Done {
+            StreamEvent::ReasoningDelta(reasoning) => {
+                reasoning_text.push_str(&reasoning);
+                let _ = app.emit("stream-thinking", &reasoning);
+                tokio::task::yield_now().await;
+            }
+            StreamEvent::Done {
                 full_text: text,
-                tokens_per_second,
-                ..
+                tokens_per_second: tps,
+                tokens_predicted: predicted,
+                tokens_evaluated: evaluated,
             } => {
                 full_text = text;
-                let _ = app.emit("stream-done", tokens_per_second);
+                tokens_predicted = Some(predicted);
+                tokens_evaluated = Some(evaluated);
+                tokens_per_second = Some(tps);
+                let _ = app.emit("stream-done", tps);
                 break;
             }
-            streaming::StreamEvent::Error(e) => {
-                let _ = app.emit("stream-error", &e);
-                return Err(e);
+            StreamEvent::Error(error) => {
+                let _ = app.emit("stream-error", &error);
+                finish_generation(state.inner(), "error").await;
+                return Err(error);
             }
         }
     }
 
-    tracing::info!(response_len = full_text.len(), "Generation complete");
-    tracing::debug!(raw_response = %full_text, "Raw llama-server response");
-
-    // Normalize output — strip think tags unless the user wants to see thinking
     let stripped = if profile.has_think_tags() && show_thinking != Some(true) {
         crate::normalize::think_strip::strip_think_tags(&full_text)
     } else {
         full_text.clone()
     };
-    tracing::info!(stripped_len = stripped.len(), "After think-tag stripping");
-
-    if stripped.is_empty() {
-        tracing::warn!(
-            "Model produced empty response after stripping — raw was {} chars",
-            full_text.len()
-        );
+    let parse_trace = build_parse_trace(&full_text, &stripped, &reasoning_text);
+    {
+        let mut s = state.write().await;
+        s.last_parse_trace = Some(parse_trace);
     }
 
-    // Save assistant response to DB
+    let assistant_message_id = {
+        let s = state.read().await;
+        let db = s.session_db.lock().map_err(|e| e.to_string())?;
+        db.add_message(&session_id, "assistant", &stripped, 0, None)
+            .map_err(|e| e.to_string())?
+    };
+
     {
         let s = state.read().await;
         let db = s.session_db.lock().map_err(|e| e.to_string())?;
-        let _ = db.add_message(&session_id, "assistant", &stripped, 0, None);
+        let predicted = tokens_predicted.unwrap_or_else(|| (stripped.len() as u32 / 4).max(1));
+        db.update_message_generation_stats(
+            assistant_message_id,
+            predicted,
+            tokens_evaluated,
+            tokens_predicted,
+        )
+        .map_err(|e| e.to_string())?;
     }
+
+    {
+        let mut s = state.write().await;
+        s.model_stats = Some(crate::state::ModelStats {
+            model: model_name,
+            context_size: s
+                .last_context_status
+                .as_ref()
+                .map(|status| status.total_tokens)
+                .unwrap_or(0),
+            tokens_per_sec: tokens_per_second.unwrap_or(0.0) as f32,
+            memory_mb: 0,
+        });
+    }
+
+    finish_generation(state.inner(), "completed").await;
+    tokio::spawn(schedule_context_follow_up(
+        state.inner().clone(),
+        session_id,
+    ));
 
     Ok(stripped)
 }
 
 #[tauri::command]
 pub async fn stop_generation(state: tauri::State<'_, SharedState>) -> Result<(), String> {
-    let s = state.read().await;
-    s.generation_stop.store(true, Ordering::Relaxed);
-    tracing::info!("stop_generation: cancellation flag set");
+    let cancel = {
+        let s = state.read().await;
+        s.generation_cancel.clone()
+    };
+    cancel.cancel();
+    finish_generation(state.inner(), "cancelled").await;
+    tracing::info!("stop_generation: cancellation token fired");
     Ok(())
-}
-
-fn model_name_supports_vision(model_name: &str) -> bool {
-    let name = model_name.to_lowercase();
-    name.contains("vision")
-        || name.contains("llava")
-        || name.contains("multimodal")
-        || name.contains("qwen2.5-vl")
-        || name.contains("-vl")
-        || name.contains("_vl")
 }

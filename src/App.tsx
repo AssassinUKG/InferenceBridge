@@ -37,8 +37,7 @@ function App() {
   const hasModel = !!model.processStatus?.model;
   const loadedModelName = model.processStatus?.model ?? null;
   const loadedModelSupportsVision = loadedModelName
-    ? model.models.find((entry) => entry.filename === loadedModelName)?.supports_vision ??
-      /vision|llava|multimodal|qwen2\.5-vl|-vl|_vl/i.test(loadedModelName)
+    ? model.models.find((entry) => entry.filename === loadedModelName)?.supports_vision ?? false
     : false;
   const debugApiUrl =
     model.processStatus?.api_url ??
@@ -275,6 +274,7 @@ function App() {
               messages={chat.messages}
               isStreaming={chat.isStreaming}
               streamingText={chat.streamingText}
+              streamingReasoning={chat.streamingReasoning}
               tokensPerSecond={chat.tokensPerSecond}
               error={chat.error}
               hasModel={hasModel}

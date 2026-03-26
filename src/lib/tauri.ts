@@ -5,6 +5,7 @@ import type {
   AppSettings,
   ContextStatus,
   DebugApiResponse,
+  EffectiveProfileInfo,
   GpuStats,
   LlamaServerInfo,
   LogEntry,
@@ -111,6 +112,11 @@ export const getContextStatus = () =>
 export const getRawPrompt = () => invoke<string>("get_raw_prompt");
 
 export const getParseTrace = () => invoke<string>("get_parse_trace");
+
+export const getLaunchPreview = () => invoke<string>("get_launch_preview");
+
+export const getEffectiveProfile = (modelName?: string) =>
+  invoke<EffectiveProfileInfo>("get_effective_profile", { modelName });
 
 export const getLogs = (limit?: number) =>
   invoke<LogEntry[]>("get_logs", { limit });

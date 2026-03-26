@@ -4,92 +4,6 @@ interface Props {
   status: ContextStatus;
 }
 
-export function ContextPanel({ status }: Props) {
-  const pct = Math.round(status.fill_ratio * 100);
-  const barColor =
-    pct > 95
-      ? "bg-red-500"
-      : pct > 80
-        ? "bg-yellow-500"
-        : pct > 50
-          ? "bg-blue-500"
-          : "bg-green-500";
-
-  if (status.total_tokens === 0) {
-    return (
-      <div className="flex items-center justify-center h-full text-gray-500">
-        <div className="text-center">
-          <p className="text-2xl mb-2">Context</p>
-          <p>Load a model to view KV cache status</p>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="p-6 max-w-2xl mx-auto space-y-6">
-      <h2 className="text-lg font-semibold text-gray-200">
-        KV Cache Utilization
-      </h2>
-
-      <div className="space-y-2">
-        <div className="flex justify-between text-sm">
-          <span className="text-gray-400">
-            {status.used_tokens.toLocaleString()} /{" "}
-            {status.total_tokens.toLocaleString()} tokens
-          </span>
-          <span
-            className={`font-mono ${
-              pct > 95
-                ? "text-red-400"
-                : pct > 80
-                  ? "text-yellow-400"
-                  : "text-gray-300"
-            }`}
-          >
-            {pct}%
-          </span>
-        </div>
-        <div className="h-4 bg-gray-700 rounded-full overflow-hidden">
-          <div
-            className={`h-full ${barColor} rounded-full transition-all duration-500`}
-            style={{ width: `${Math.min(pct, 100)}%` }}
-          />
-        </div>
-      </div>
-
-      <div className="grid grid-cols-3 gap-4">
-        <StatCard
-          label="Total"
-          value={status.total_tokens.toLocaleString()}
-          unit="tokens"
-        />
-        <StatCard
-          label="Used"
-          value={status.used_tokens.toLocaleString()}
-          unit="tokens"
-        />
-        <StatCard
-          label="Available"
-          value={(status.total_tokens - status.used_tokens).toLocaleString()}
-          unit="tokens"
-        />
-      </div>
-
-      <div className="space-y-2 text-xs text-gray-500">
-        <p>
-          <span className="inline-block w-2 h-2 rounded bg-yellow-500 mr-2" />
-          80% - Rolling compression triggered
-        </p>
-        <p>
-          <span className="inline-block w-2 h-2 rounded bg-red-500 mr-2" />
-          95% - Aggressive summarization triggered
-        </p>
-      </div>
-    </div>
-  );
-}
-
 function StatCard({
   label,
   value,
@@ -97,13 +11,107 @@ function StatCard({
 }: {
   label: string;
   value: string;
-  unit: string;
+  unit?: string;
 }) {
   return (
-    <div className="p-3 bg-gray-800/60 rounded-lg border border-gray-700/50">
-      <p className="text-xs text-gray-500 uppercase tracking-wider">{label}</p>
-      <p className="text-xl font-mono text-gray-200 mt-1">{value}</p>
-      <p className="text-xs text-gray-600">{unit}</p>
+    <div
+      className="rounded px-4 py-3"
+      style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}
+    >
+      <div className="text-[11px] uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
+        {label}
+      </div>
+      <div className="mt-1 text-lg font-semibold" style={{ color: "var(--text-0)" }}>
+        {value}
+      </div>
+      {unit && (
+        <div className="text-xs" style={{ color: "var(--text-1)" }}>
+          {unit}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function ContextPanel({ status }: Props) {
+  const pct = Math.round(status.fill_ratio * 100);
+  const barColor =
+    pct > 95 ? "#f87171" : pct > 80 ? "#fbbf24" : pct > 50 ? "#38bdf8" : "#34d399";
+
+  if (status.total_tokens === 0) {
+    return (
+      <div className="flex h-full items-center justify-center" style={{ color: "var(--text-1)" }}>
+        <div className="text-center">
+          <p className="text-xl font-semibold" style={{ color: "var(--text-0)" }}>
+            Context
+          </p>
+          <p className="mt-2 text-sm">Load a model to inspect KV cache status and memory pressure.</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mx-auto flex h-full max-w-5xl flex-col gap-4 p-4">
+      <section
+        className="rounded px-4 py-4"
+        style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
+      >
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <div className="text-[11px] uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
+              KV Cache
+            </div>
+            <div className="mt-1 text-lg font-semibold" style={{ color: "var(--text-0)" }}>
+              {status.used_tokens.toLocaleString()} / {status.total_tokens.toLocaleString()} tokens
+            </div>
+          </div>
+          <div className="text-right">
+            <div className="text-xl font-semibold" style={{ color: barColor }}>
+              {pct}%
+            </div>
+            <div className="text-xs" style={{ color: "var(--text-1)" }}>
+              fill ratio
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-3 h-3 overflow-hidden rounded-full" style={{ background: "var(--surface-2)" }}>
+          <div
+            className="h-full rounded-full transition-all duration-500"
+            style={{ width: `${Math.min(pct, 100)}%`, background: barColor }}
+          />
+        </div>
+      </section>
+
+      <section className="grid gap-3 md:grid-cols-3">
+        <StatCard label="Pinned" value={status.pinned_tokens.toLocaleString()} unit="tokens" />
+        <StatCard label="Rolling" value={status.rolling_tokens.toLocaleString()} unit="tokens" />
+        <StatCard label="Compressed" value={status.compressed_tokens.toLocaleString()} unit="tokens" />
+      </section>
+
+      <section className="grid gap-3 md:grid-cols-3">
+        <StatCard label="Total" value={status.total_tokens.toLocaleString()} unit="tokens" />
+        <StatCard label="Used" value={status.used_tokens.toLocaleString()} unit="tokens" />
+        <StatCard
+          label="Available"
+          value={Math.max(status.total_tokens - status.used_tokens, 0).toLocaleString()}
+          unit="tokens"
+        />
+      </section>
+
+      <section
+        className="rounded px-4 py-4"
+        style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
+      >
+        <div className="text-[11px] uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
+          Compaction Log
+        </div>
+        <p className="mt-2 text-sm leading-6" style={{ color: "var(--text-1)" }}>
+          {status.last_compaction_action ??
+            "No compaction action recorded yet. The runtime will emit pressure events once usage crosses strategy thresholds."}
+        </p>
+      </section>
     </div>
   );
 }

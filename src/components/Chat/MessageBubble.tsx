@@ -6,7 +6,6 @@ interface Props {
   message: MessageInfo;
 }
 
-/** Split a message body into think-tag sections and regular text. */
 function parseThinkBlocks(content: string): Array<{ type: "think" | "text"; text: string }> {
   const parts: Array<{ type: "think" | "text"; text: string }> = [];
   const re = /<think>([\s\S]*?)<\/think>/g;
@@ -40,14 +39,13 @@ function ThinkBlock({ text }: { text: string }) {
         className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs"
         style={{ color: "#a78bfa", cursor: "pointer", background: "none", border: "none" }}
       >
-        <span style={{ fontSize: "10px", transition: "transform 0.15s", transform: open ? "rotate(90deg)" : "none" }}>▶</span>
-        💭 Thinking…
+        <span style={{ fontSize: "10px", transition: "transform 0.15s", transform: open ? "rotate(90deg)" : "none" }}>
+          ▶
+        </span>
+        Thinking
       </button>
       {open && (
-        <div
-          className="px-3 pb-3"
-          style={{ borderTop: "1px solid rgba(167,139,250,0.15)" }}
-        >
+        <div className="px-3 pb-3" style={{ borderTop: "1px solid rgba(167,139,250,0.15)" }}>
           <div style={{ color: "rgba(167,139,250,0.8)", fontSize: "12px" }}>
             <MarkdownContent content={text} />
           </div>
@@ -68,46 +66,39 @@ export function MessageBubble({ message }: Props) {
 
   const hasThinkTags = !isUser && textContent.includes("<think>");
   const parts = hasThinkTags ? parseThinkBlocks(textContent) : null;
-
-  // The plain text to copy (strip think tags)
   const plainTextForCopy = textContent.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
 
   return (
-    <div className={`flex gap-3 px-4 py-3 group ${isUser ? "" : "bg-gray-800/30"}`}>
-      {/* Avatar */}
+    <div className={`group flex gap-3 px-4 py-3 ${isUser ? "" : "bg-gray-800/30"}`}>
       <div
-        className={`w-7 h-7 rounded-full flex items-center justify-center text-xs shrink-0 mt-0.5 ${
-          isUser
-            ? "bg-blue-600/30 text-blue-300"
-            : "bg-purple-600/30 text-purple-300"
+        className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs ${
+          isUser ? "bg-blue-600/30 text-blue-300" : "bg-purple-600/30 text-purple-300"
         }`}
       >
         {isUser ? "U" : "AI"}
       </div>
 
-      {/* Content */}
-      <div className="flex-1 min-w-0">
+      <div className="min-w-0 flex-1">
         {hasImage && (
           <img
             src={imageSrc ?? undefined}
             alt="attachment"
-            className="mb-2 max-w-xs max-h-64 rounded border border-gray-700"
+            className="mb-2 max-h-64 max-w-xs rounded border border-gray-700"
           />
         )}
 
         {hasThinkTags && parts ? (
           <div>
-            {parts.map((p, i) =>
-              p.type === "think" ? (
-                <ThinkBlock key={i} text={p.text} />
+            {parts.map((part, index) =>
+              part.type === "think" ? (
+                <ThinkBlock key={index} text={part.text} />
               ) : (
-                <MarkdownContent key={i} content={p.text} />
-              )
+                <MarkdownContent key={index} content={part.text} />
+              ),
             )}
           </div>
         ) : textContent && isUser ? (
-          // User messages: simple text (preserves newlines, no markdown)
-          <p className="text-sm text-gray-300 whitespace-pre-wrap break-words leading-relaxed">
+          <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-gray-300">
             {textContent}
           </p>
         ) : textContent ? (
@@ -115,21 +106,15 @@ export function MessageBubble({ message }: Props) {
         ) : null}
 
         {!hasImage && !textContent && (
-          <p className="text-sm text-gray-500 italic">
-            Empty message
-          </p>
+          <p className="text-sm italic text-gray-500">Empty message</p>
         )}
 
-        {/* Footer row: token count + copy button */}
-        <div className="flex items-center justify-between mt-1 gap-2">
+        <div className="mt-1 flex items-center justify-between gap-2">
           {message.token_count != null && message.token_count > 0 && (
-            <span className="text-xs text-gray-600">
-              {message.token_count} tokens
-            </span>
+            <span className="text-xs text-gray-600">{message.token_count} tokens</span>
           )}
-          {/* Copy button — only on AI messages, shown on hover */}
           {!isUser && plainTextForCopy && (
-            <span className="opacity-0 group-hover:opacity-100 transition-opacity ml-auto">
+            <span className="ml-auto opacity-0 transition-opacity group-hover:opacity-100">
               <CopyButton text={plainTextForCopy} small />
             </span>
           )}

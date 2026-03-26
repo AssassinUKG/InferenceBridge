@@ -1,5 +1,3 @@
-// Shared TypeScript types that mirror Rust serde structs.
-
 export interface ModelInfo {
   filename: string;
   path: string;
@@ -9,12 +7,21 @@ export interface ModelInfo {
   supports_reasoning: boolean;
   supports_vision: boolean;
   context_window: number | null;
-  /** True training context ceiling — used as slider maximum. */
   max_context_window: number | null;
   max_output_tokens: number | null;
   quant: string | null;
   tool_call_format: string;
   think_tag_style: string;
+}
+
+export interface LaunchPreview {
+  server_path: string;
+  model_path: string;
+  mmproj_path: string | null;
+  backend_preference: string;
+  port: number;
+  parallel_slots: number;
+  args: string[];
 }
 
 export interface ProcessStatusInfo {
@@ -29,6 +36,10 @@ export interface ProcessStatusInfo {
   api_error: string | null;
   api_url: string;
   api_port_owner: ApiPortOwnerInfo | null;
+  startup_duration_ms: number | null;
+  parallel_slots: number | null;
+  slot_count: number | null;
+  last_launch_preview: LaunchPreview | null;
 }
 
 export interface ApiPortOwnerInfo {
@@ -45,7 +56,7 @@ export interface ServerInfo {
 }
 
 export interface LoadProgress {
-  stage: string; // resolving | downloading | launching | starting | loading | ready | error
+  stage: string;
   message: string;
   progress: number;
   done: boolean;
@@ -66,6 +77,8 @@ export interface MessageInfo {
   content: string | null;
   image_base64?: string | null;
   token_count: number | null;
+  tokens_evaluated?: number | null;
+  tokens_predicted?: number | null;
   created_at: string;
 }
 
@@ -73,6 +86,10 @@ export interface ContextStatus {
   total_tokens: number;
   used_tokens: number;
   fill_ratio: number;
+  pinned_tokens: number;
+  rolling_tokens: number;
+  compressed_tokens: number;
+  last_compaction_action: string | null;
 }
 
 export interface AppSettings {
@@ -85,9 +102,7 @@ export interface AppSettings {
   backend_preference: string;
   server_host: string;
   server_port: number;
-  /** Directories scanned for .gguf model files. */
   scan_dirs: string[];
-  // llama.cpp inference settings
   batch_size: number;
   ubatch_size: number;
   flash_attn: boolean;
@@ -98,17 +113,14 @@ export interface AppSettings {
   main_gpu: number;
   defrag_thold: number;
   rope_freq_scale: number;
-  /** Bearer token required by the public API. Null / empty = no auth. */
   api_key: string | null;
 }
 
 export interface GpuStats {
   name: string;
   used_mb: number;
-  /** Dedicated on-board VRAM (fast, from nvidia-smi) */
   dedicated_mb: number;
   free_mb: number;
-  /** Total system RAM — shown as the overflow/spill zone */
   system_ram_mb: number;
 }
 
@@ -133,4 +145,56 @@ export interface DebugApiResponse {
   headers: [string, string][];
   body: string;
   transport: string;
+}
+
+export interface ModelProfile {
+  family: string;
+  tool_call_format: string;
+  think_tag_style: string;
+  interleaved_think_tool: boolean;
+  supports_parallel_tools: boolean;
+  supports_vision: boolean;
+  default_max_output_tokens: number | null;
+  default_context_window: number | null;
+  max_context_window: number | null;
+  parser_type: string;
+  renderer_type: string;
+  stop_markers: string[];
+  allow_fallback_extraction: boolean;
+  default_presence_penalty: number | null;
+  default_temperature: number | null;
+  default_top_p: number | null;
+  default_top_k: number | null;
+  default_min_p: number | null;
+  disable_thinking_for_tools: boolean;
+  split_tool_calling: boolean;
+}
+
+export interface ModelProfileOverride {
+  supports_vision?: boolean;
+  tool_call_format?: string;
+  think_tag_style?: string;
+  interleaved_think_tool?: boolean;
+  supports_parallel_tools?: boolean;
+  default_max_output_tokens?: number | null;
+  default_context_window?: number | null;
+  max_context_window?: number | null;
+  parser_type?: string;
+  renderer_type?: string;
+  stop_markers?: string[];
+  allow_fallback_extraction?: boolean;
+  default_presence_penalty?: number | null;
+  default_temperature?: number | null;
+  default_top_p?: number | null;
+  default_top_k?: number | null;
+  default_min_p?: number | null;
+  disable_thinking_for_tools?: boolean;
+  split_tool_calling?: boolean;
+}
+
+export interface EffectiveProfileInfo {
+  requested_model: string | null;
+  resolved_model: string | null;
+  profile: ModelProfile;
+  override_entry: ModelProfileOverride | null;
 }

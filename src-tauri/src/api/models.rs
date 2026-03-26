@@ -367,7 +367,7 @@ fn model_detail_from_scanned(
         family: model.profile.family.to_string(),
         supports_tools,
         supports_reasoning,
-        supports_vision: model_supports_vision(&model.filename),
+        supports_vision: model.profile.supports_vision,
         context_window: model.profile.default_context_window,
         max_output_tokens: model.profile.default_max_output_tokens,
         quant: extract_quant(&model.filename),
@@ -383,14 +383,4 @@ fn extract_quant(filename: &str) -> Option<String> {
     )
     .ok()?;
     re.captures(&upper).map(|c| c[1].to_string())
-}
-
-fn model_supports_vision(filename: &str) -> bool {
-    let name = filename.to_lowercase();
-    name.contains("vision")
-        || name.contains("llava")
-        || name.contains("multimodal")
-        || name.contains("qwen2.5-vl")
-        || name.contains("-vl")
-        || name.contains("_vl")
 }

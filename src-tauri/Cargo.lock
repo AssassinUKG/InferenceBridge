@@ -2080,6 +2080,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-shell",
  "tokio",
+ "tokio-util",
  "toml 0.8.2",
  "tower-http 0.5.2",
  "tracing",

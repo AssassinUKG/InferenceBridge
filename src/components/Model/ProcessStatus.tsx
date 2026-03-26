@@ -6,51 +6,45 @@ interface Props {
 }
 
 function buildServerUrl(settings: AppSettings | null) {
-  if (!settings) {
-    return "http://127.0.0.1:8800/v1";
-  }
-
+  if (!settings) return "http://127.0.0.1:8800/v1";
   return `http://${settings.server_host}:${settings.server_port}/v1`;
 }
 
-function apiTone(state: string) {
-  if (state === "Running") {
-    return "text-emerald-200";
-  }
-  if (state === "Starting") {
-    return "text-amber-200";
-  }
-  if (state === "Error") {
-    return "text-rose-200";
-  }
-  return "text-slate-200";
+function toneForState(state: string) {
+  if (state === "Running") return "#86efac";
+  if (state === "Starting") return "#fde68a";
+  if (state === "Error") return "#fca5a5";
+  return "var(--text-1)";
 }
 
-function statusTone(state: string) {
-  if (state === "Running") {
-    return "text-emerald-200";
-  }
-  if (state === "Starting") {
-    return "text-amber-200";
-  }
-  if (state === "Stopping") {
-    return "text-orange-200";
-  }
-  if (state === "Crashed") {
-    return "text-rose-200";
-  }
-  return "text-slate-200";
+function Stat({
+  label,
+  value,
+}: {
+  label: string;
+  value: string;
+}) {
+  return (
+    <div className="rounded px-4 py-3" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
+      <div className="text-[11px] uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
+        {label}
+      </div>
+      <div className="mt-1 text-sm font-semibold" style={{ color: "var(--text-0)" }}>
+        {value}
+      </div>
+    </div>
+  );
 }
 
 export function ProcessStatus({ status, settings }: Props) {
   if (!status) {
     return (
-      <section className="rounded-[28px] border border-white/10 bg-[linear-gradient(180deg,rgba(15,23,42,0.82),rgba(8,15,29,0.94))] p-5">
-        <h3 className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">
+      <section className="rounded px-4 py-4" style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}>
+        <div className="text-[11px] uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
           Process Status
-        </h3>
-        <p className="mt-3 text-sm text-slate-400">
-          No process information is available yet.
+        </div>
+        <p className="mt-2 text-sm" style={{ color: "var(--text-1)" }}>
+          No runtime information is available yet.
         </p>
       </section>
     );
@@ -59,74 +53,79 @@ export function ProcessStatus({ status, settings }: Props) {
   const apiUrl = status.api_url ?? buildServerUrl(settings);
 
   return (
-    <section className="rounded-[28px] border border-white/10 bg-[linear-gradient(180deg,rgba(15,23,42,0.82),rgba(8,15,29,0.94))] p-5 shadow-[0_12px_40px_rgba(2,6,23,0.28)]">
+    <section className="rounded px-4 py-4" style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}>
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h3 className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">
+          <div className="text-[11px] uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
             Process Status
-          </h3>
-          <p className="mt-2 text-sm text-slate-400">
-            Runtime health, binary, and currently loaded model metadata.
-          </p>
+          </div>
+          <div className="mt-1 text-lg font-semibold" style={{ color: toneForState(status.state) }}>
+            {status.state}
+          </div>
         </div>
-        <span className={`rounded-full border border-white/10 bg-white/5 px-3 py-1 text-sm font-medium ${statusTone(status.state)}`}>
-          {status.state}
-        </span>
+        <div className="text-right">
+          <div className="text-[11px] uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
+            API
+          </div>
+          <div className="mt-1 text-sm font-medium" style={{ color: toneForState(status.api_state) }}>
+            {status.api_state}
+          </div>
+        </div>
       </div>
 
-      <div className="mt-4 grid gap-3 sm:grid-cols-2">
-        <InfoTile label="Current model" value={status.model ?? "None"} />
-        <InfoTile label="Previous model" value={status.previous_model ?? "None"} accent="indigo" />
-        <InfoTile label="Backend" value={status.backend ?? "Unknown"} accent="cyan" />
-        <InfoTile label="llama.cpp version" value={status.server_version ?? "Unknown"} />
-        <InfoTile label="API URL" value={apiUrl} mono />
-        <InfoTile label="API state" value={status.api_state} accent={status.api_state === "Error" ? "rose" : "default"} />
-        <InfoTile label="Crash count" value={String(status.crash_count)} accent={status.crash_count > 0 ? "rose" : "default"} />
+      <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <Stat label="Current Model" value={status.model ?? "None"} />
+        <Stat label="Previous Model" value={status.previous_model ?? "None"} />
+        <Stat label="Backend" value={status.backend ?? "Unknown"} />
+        <Stat label="llama.cpp" value={status.server_version ?? "Unknown"} />
+        <Stat label="API URL" value={apiUrl} />
+        <Stat label="Crash Count" value={String(status.crash_count)} />
+        <Stat
+          label="Startup Time"
+          value={status.startup_duration_ms != null ? `${status.startup_duration_ms} ms` : "Unknown"}
+        />
+        <Stat
+          label="Slots"
+          value={
+            status.slot_count != null
+              ? `${status.slot_count} total / ${status.parallel_slots ?? status.slot_count} configured`
+              : `${status.parallel_slots ?? 0} configured`
+          }
+        />
       </div>
 
       {status.api_error && (
-        <div className="mt-4 rounded-2xl border border-rose-400/20 bg-rose-400/10 px-4 py-3">
-          <p className="text-[11px] uppercase tracking-[0.2em] text-rose-200">API server issue</p>
-          <p className={`mt-1 text-sm ${apiTone("Error")}`}>{status.api_error}</p>
+        <div className="mt-4 rounded px-4 py-3" style={{ background: "rgba(127,29,29,0.28)", border: "1px solid rgba(248,113,113,0.22)" }}>
+          <div className="text-[11px] uppercase tracking-[0.18em]" style={{ color: "#fecaca" }}>
+            API Server Issue
+          </div>
+          <p className="mt-1 text-sm" style={{ color: "#fca5a5" }}>
+            {status.api_error}
+          </p>
+        </div>
+      )}
+
+      {status.last_launch_preview && (
+        <div className="mt-4 rounded px-4 py-3" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
+          <div className="text-[11px] uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
+            Last Launch Preview
+          </div>
+          <pre className="mt-2 overflow-x-auto text-xs" style={{ color: "var(--text-0)" }}>
+            <code>{status.last_launch_preview.args.join(" ")}</code>
+          </pre>
         </div>
       )}
 
       {status.server_path && (
-        <div className="mt-4 rounded-2xl border border-white/8 bg-white/5 px-4 py-3">
-          <p className="text-[11px] uppercase tracking-[0.2em] text-slate-500">Binary path</p>
-          <p className="mt-1 break-all font-mono text-sm text-slate-300">{status.server_path}</p>
+        <div className="mt-4 rounded px-4 py-3" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
+          <div className="text-[11px] uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
+            Binary Path
+          </div>
+          <p className="mt-1 break-all font-mono text-xs" style={{ color: "var(--text-0)" }}>
+            {status.server_path}
+          </p>
         </div>
       )}
     </section>
-  );
-}
-
-function InfoTile({
-  label,
-  value,
-  mono = false,
-  accent = "default",
-}: {
-  label: string;
-  value: string;
-  mono?: boolean;
-  accent?: "default" | "cyan" | "indigo" | "rose";
-}) {
-  const accentClass =
-    accent === "cyan"
-      ? "text-cyan-100"
-      : accent === "indigo"
-        ? "text-indigo-100"
-        : accent === "rose"
-          ? "text-rose-100"
-          : "text-slate-100";
-
-  return (
-    <div className="rounded-2xl border border-white/8 bg-white/5 px-4 py-3">
-      <p className="text-[11px] uppercase tracking-[0.18em] text-slate-500">{label}</p>
-      <p className={`mt-1 text-sm font-semibold ${accentClass} ${mono ? "break-all font-mono" : ""}`}>
-        {value}
-      </p>
-    </div>
   );
 }

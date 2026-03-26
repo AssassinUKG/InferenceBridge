@@ -1,16 +1,12 @@
-//! SQLite session persistence.
-
 use anyhow::Result;
 use rusqlite::Connection;
 use std::path::PathBuf;
 
-/// Session database stores chat sessions, messages, and tool calls.
 pub struct SessionDb {
     conn: Connection,
 }
 
 impl SessionDb {
-    /// Open or create the database at the standard location.
     pub fn open() -> Result<Self> {
         let path = Self::db_path();
         if let Some(parent) = path.parent() {
@@ -38,13 +34,15 @@ impl SessionDb {
             );
 
             CREATE TABLE IF NOT EXISTS messages (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id  TEXT NOT NULL REFERENCES sessions(id),
-                role        TEXT NOT NULL,
-                content     TEXT,
-                image_base64 TEXT,
-                token_count INTEGER DEFAULT 0,
-                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id        TEXT NOT NULL REFERENCES sessions(id),
+                role              TEXT NOT NULL,
+                content           TEXT,
+                image_base64      TEXT,
+                token_count       INTEGER DEFAULT 0,
+                tokens_evaluated  INTEGER,
+                tokens_predicted  INTEGER,
+                created_at        TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
             CREATE TABLE IF NOT EXISTS tool_calls (
@@ -66,26 +64,34 @@ impl SessionDb {
 
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
             CREATE INDEX IF NOT EXISTS idx_tool_calls_message ON tool_calls(message_id);
+            CREATE INDEX IF NOT EXISTS idx_context_snapshots_session ON context_snapshots(session_id);
             ",
         )?;
-        self.ensure_messages_image_column()?;
+        self.ensure_message_columns()?;
         Ok(())
     }
 
-    fn ensure_messages_image_column(&self) -> Result<()> {
+    fn ensure_message_columns(&self) -> Result<()> {
         let mut stmt = self.conn.prepare("PRAGMA table_info(messages)")?;
         let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        let has_image_column = columns
-            .filter_map(|col| col.ok())
-            .any(|col| col == "image_base64");
-        if !has_image_column {
+        let names = columns.filter_map(|col| col.ok()).collect::<Vec<_>>();
+
+        if !names.iter().any(|col| col == "image_base64") {
             self.conn
                 .execute("ALTER TABLE messages ADD COLUMN image_base64 TEXT", [])?;
         }
+        if !names.iter().any(|col| col == "tokens_evaluated") {
+            self.conn
+                .execute("ALTER TABLE messages ADD COLUMN tokens_evaluated INTEGER", [])?;
+        }
+        if !names.iter().any(|col| col == "tokens_predicted") {
+            self.conn
+                .execute("ALTER TABLE messages ADD COLUMN tokens_predicted INTEGER", [])?;
+        }
+
         Ok(())
     }
 
-    /// Create a new session and return its ID.
     pub fn create_session(&self, name: &str, model_id: Option<&str>) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
         self.conn.execute(
@@ -95,7 +101,6 @@ impl SessionDb {
         Ok(id)
     }
 
-    /// List all sessions, newest first.
     pub fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, model_id, created_at, updated_at FROM sessions ORDER BY updated_at DESC",
@@ -109,10 +114,9 @@ impl SessionDb {
                 updated_at: row.get(4)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.filter_map(|row| row.ok()).collect())
     }
 
-    /// Add a message to a session.
     pub fn add_message(
         &self,
         session_id: &str,
@@ -125,18 +129,31 @@ impl SessionDb {
             "INSERT INTO messages (session_id, role, content, image_base64, token_count) VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![session_id, role, content, image_base64, token_count],
         )?;
-        let msg_id = self.conn.last_insert_rowid();
+        let message_id = self.conn.last_insert_rowid();
         self.conn.execute(
             "UPDATE sessions SET updated_at = datetime('now') WHERE id = ?1",
             rusqlite::params![session_id],
         )?;
-        Ok(msg_id)
+        Ok(message_id)
     }
 
-    /// Get all messages for a session, in order.
+    pub fn update_message_generation_stats(
+        &self,
+        message_id: i64,
+        token_count: u32,
+        tokens_evaluated: Option<u32>,
+        tokens_predicted: Option<u32>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE messages SET token_count = ?2, tokens_evaluated = ?3, tokens_predicted = ?4 WHERE id = ?1",
+            rusqlite::params![message_id, token_count, tokens_evaluated, tokens_predicted],
+        )?;
+        Ok(())
+    }
+
     pub fn get_messages(&self, session_id: &str) -> Result<Vec<MessageInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, role, content, image_base64, token_count, created_at FROM messages WHERE session_id = ?1 ORDER BY id",
+            "SELECT id, role, content, image_base64, token_count, tokens_evaluated, tokens_predicted, created_at FROM messages WHERE session_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map(rusqlite::params![session_id], |row| {
             Ok(MessageInfo {
@@ -145,13 +162,14 @@ impl SessionDb {
                 content: row.get(2)?,
                 image_base64: row.get(3)?,
                 token_count: row.get(4)?,
-                created_at: row.get(5)?,
+                tokens_evaluated: row.get(5)?,
+                tokens_predicted: row.get(6)?,
+                created_at: row.get(7)?,
             })
         })?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        Ok(rows.filter_map(|row| row.ok()).collect())
     }
 
-    /// Add a tool call to a message.
     pub fn add_tool_call(
         &self,
         message_id: i64,
@@ -166,7 +184,31 @@ impl SessionDb {
         Ok(self.conn.last_insert_rowid())
     }
 
-    /// Delete a session and all its messages/tool calls.
+    pub fn add_context_snapshot(&self, session_id: &str, snapshot: &str, kv_tokens: u32) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO context_snapshots (session_id, snapshot, kv_tokens) VALUES (?1, ?2, ?3)",
+            rusqlite::params![session_id, snapshot, kv_tokens],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn latest_context_snapshot(&self, session_id: &str) -> Result<Option<ContextSnapshotInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, snapshot, kv_tokens, created_at FROM context_snapshots WHERE session_id = ?1 ORDER BY id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![session_id])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(ContextSnapshotInfo {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                snapshot: row.get(2)?,
+                kv_tokens: row.get(3)?,
+                created_at: row.get(4)?,
+            }));
+        }
+        Ok(None)
+    }
+
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
         self.conn.execute_batch(&format!(
             "DELETE FROM tool_calls WHERE message_id IN (SELECT id FROM messages WHERE session_id = '{}');
@@ -195,5 +237,16 @@ pub struct MessageInfo {
     pub content: Option<String>,
     pub image_base64: Option<String>,
     pub token_count: Option<u32>,
+    pub tokens_evaluated: Option<u32>,
+    pub tokens_predicted: Option<u32>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ContextSnapshotInfo {
+    pub id: i64,
+    pub session_id: String,
+    pub snapshot: String,
+    pub kv_tokens: u32,
     pub created_at: String,
 }

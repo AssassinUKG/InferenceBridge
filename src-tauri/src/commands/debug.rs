@@ -1,5 +1,3 @@
-//! Tauri commands for debug inspector.
-
 use axum::body::to_bytes;
 use axum::extract::Path;
 use axum::extract::State as AxumState;
@@ -69,6 +67,39 @@ pub async fn debug_api_request(
         crate::api::extensions::context_status(AxumState(shared))
             .await
             .into_response()
+    } else if method == "GET" && path == "/v1/runtime/status" {
+        match crate::api::extensions::runtime_status(AxumState(shared)).await {
+            Ok(json) => json.into_response(),
+            Err(status) => status.into_response(),
+        }
+    } else if method == "GET" && path.starts_with("/v1/debug/profile") {
+        let query = path
+            .split_once('?')
+            .map(|(_, query)| query)
+            .unwrap_or_default();
+        let model = query
+            .split('&')
+            .find_map(|pair| {
+                let (key, value) = pair.split_once('=')?;
+                if key == "model" {
+                    Some(
+                        percent_decode_str(value)
+                            .decode_utf8_lossy()
+                            .into_owned(),
+                    )
+                } else {
+                    None
+                }
+            });
+        match crate::api::extensions::debug_profile(
+            AxumState(shared),
+            axum::extract::Query(crate::api::extensions::DebugProfileQuery { model }),
+        )
+        .await
+        {
+            Ok(json) => json.into_response(),
+            Err(status) => status.into_response(),
+        }
     } else if method == "GET" && path == "/v1/sessions" {
         match crate::api::extensions::list_sessions(AxumState(shared)).await {
             Ok(json) => json.into_response(),
@@ -109,51 +140,25 @@ pub async fn debug_api_request(
                     Err(status) => status.into_response(),
                 }
             } else {
-                return Ok(DebugApiResponse {
-                    status: 404,
-                    headers: vec![(
-                        "content-type".to_string(),
-                        "text/plain; charset=utf-8".to_string(),
-                    )],
-                    body: format!("No internal debug route for {method} {path}"),
-                    transport: "direct".to_string(),
-                });
+                not_found_response(&method, &path)
             }
         } else {
-            return Ok(DebugApiResponse {
-                status: 404,
-                headers: vec![(
-                    "content-type".to_string(),
-                    "text/plain; charset=utf-8".to_string(),
-                )],
-                body: format!("No internal debug route for {method} {path}"),
-                transport: "direct".to_string(),
-            });
+            not_found_response(&method, &path)
         }
     } else {
-        return Ok(DebugApiResponse {
-            status: 404,
-            headers: vec![(
-                "content-type".to_string(),
-                "text/plain; charset=utf-8".to_string(),
-            )],
-            body: format!("No internal debug route for {method} {path}"),
-            transport: "direct".to_string(),
-        });
+        not_found_response(&method, &path)
     };
 
     let status = response.status().as_u16();
     let headers = response
         .headers()
         .iter()
-        .map(
-            |(key, value): (&axum::http::header::HeaderName, &axum::http::HeaderValue)| {
-                (
-                    key.as_str().to_string(),
-                    value.to_str().unwrap_or_default().to_string(),
-                )
-            },
-        )
+        .map(|(key, value)| {
+            (
+                key.as_str().to_string(),
+                value.to_str().unwrap_or_default().to_string(),
+            )
+        })
         .collect::<Vec<_>>();
     let bytes = to_bytes(response.into_body(), 2 * 1024 * 1024)
         .await
@@ -168,14 +173,37 @@ pub async fn debug_api_request(
     })
 }
 
-#[tauri::command]
-pub async fn get_raw_prompt() -> Result<String, String> {
-    // TODO: store last prompt sent to llama-server
-    Ok("No prompt captured yet".to_string())
+fn not_found_response(method: &str, path: &str) -> axum::response::Response {
+    (
+        axum::http::StatusCode::NOT_FOUND,
+        [("content-type", "text/plain; charset=utf-8")],
+        format!("No internal debug route for {method} {path}"),
+    )
+        .into_response()
 }
 
 #[tauri::command]
-pub async fn get_parse_trace() -> Result<String, String> {
-    // TODO: store last normalization pipeline trace
-    Ok("No parse trace captured yet".to_string())
+pub async fn get_raw_prompt(state: tauri::State<'_, SharedState>) -> Result<String, String> {
+    let s = state.read().await;
+    Ok(s.last_prompt
+        .clone()
+        .unwrap_or_else(|| "No prompt captured yet".to_string()))
+}
+
+#[tauri::command]
+pub async fn get_parse_trace(state: tauri::State<'_, SharedState>) -> Result<String, String> {
+    let s = state.read().await;
+    Ok(s.last_parse_trace
+        .clone()
+        .unwrap_or_else(|| "No parse trace captured yet".to_string()))
+}
+
+#[tauri::command]
+pub async fn get_launch_preview(state: tauri::State<'_, SharedState>) -> Result<String, String> {
+    let s = state.read().await;
+    let preview = s
+        .last_launch_preview
+        .clone()
+        .ok_or_else(|| "No launch preview captured yet".to_string())?;
+    serde_json::to_string_pretty(&preview).map_err(|e| e.to_string())
 }

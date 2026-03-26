@@ -9,6 +9,7 @@ interface ChatState {
   messages: MessageInfo[];
   isStreaming: boolean;
   streamingText: string;
+  streamingReasoning: string;
   tokensPerSecond: number | null;
   error: string | null;
 }
@@ -18,23 +19,22 @@ export function useChat(sessionId: string | null) {
     messages: [],
     isStreaming: false,
     streamingText: "",
+    streamingReasoning: "",
     tokensPerSecond: null,
     error: null,
   });
 
   useEffect(() => {
     if (!sessionId) {
-      setState((s) => ({ ...s, messages: [] }));
+      setState((current) => ({ ...current, messages: [] }));
       return;
     }
+
     api.getSessionMessages(sessionId).then(
-      (msgs) => setState((s) => ({ ...s, messages: msgs, error: null })),
-      (err) => setState((s) => ({ ...s, error: String(err) }))
+      (messages) => setState((current) => ({ ...current, messages, error: null })),
+      (error) => setState((current) => ({ ...current, error: String(error) }))
     );
   }, [sessionId]);
-
-  // Note: stream-error is handled per-message inside sendMessage to avoid
-  // duplicate listeners and stale-closure bugs. No persistent global listener needed.
 
   const sendMessage = useCallback(
     async (
@@ -44,67 +44,77 @@ export function useChat(sessionId: string | null) {
       showThinking?: boolean | null
     ) => {
       if (!sessionId || state.isStreaming) return;
-      setState((s) => ({
-        ...s,
+
+      setState((current) => ({
+        ...current,
         isStreaming: true,
         streamingText: "",
+        streamingReasoning: "",
         tokensPerSecond: null,
         error: null,
       }));
 
-      const cleanups: (() => void)[] = [];
+      const cleanups: Array<() => void> = [];
 
       try {
-        // Set up event listeners before invoking the command so we do not miss early tokens.
-        const tokenUnsub = await listen<string>("stream-token", (e) => {
-          // flushSync forces React to render immediately after each token rather
-          // than batching multiple tokens into a single render (React 18 behaviour).
-          // This gives true per-token streaming instead of chunk-bursts.
+        const tokenUnsub = await listen<string>("stream-token", (event) => {
           flushSync(() => {
-            setState((s) => ({
-              ...s,
-              streamingText: s.streamingText + e.payload,
+            setState((current) => ({
+              ...current,
+              streamingText: current.streamingText + event.payload,
             }));
           });
         });
         cleanups.push(tokenUnsub);
 
-        const doneUnsub = await listen<number>("stream-done", (e) => {
-          setState((s) => ({
-            ...s,
-            tokensPerSecond: e.payload,
+        const thinkingUnsub = await listen<string>("stream-thinking", (event) => {
+          flushSync(() => {
+            setState((current) => ({
+              ...current,
+              streamingReasoning: current.streamingReasoning + event.payload,
+            }));
+          });
+        });
+        cleanups.push(thinkingUnsub);
+
+        const doneUnsub = await listen<number>("stream-done", (event) => {
+          setState((current) => ({
+            ...current,
+            tokensPerSecond: event.payload,
           }));
         });
         cleanups.push(doneUnsub);
 
-        const errorUnsub = await listen<string>("stream-error", (e) => {
-          setState((s) => ({
-            ...s,
+        const errorUnsub = await listen<string>("stream-error", (event) => {
+          setState((current) => ({
+            ...current,
             isStreaming: false,
-            error: e.payload,
+            error: event.payload,
             streamingText: "",
+            streamingReasoning: "",
           }));
         });
         cleanups.push(errorUnsub);
 
         await api.sendMessage(sessionId, content, sampling, imageBase64, showThinking);
-        // Command completed - refresh the full message list.
-        const msgs = await api.getSessionMessages(sessionId);
-        setState((s) => ({
-          ...s,
-          messages: msgs,
+        const messages = await api.getSessionMessages(sessionId);
+        setState((current) => ({
+          ...current,
+          messages,
           streamingText: "",
+          streamingReasoning: "",
           isStreaming: false,
         }));
-      } catch (err) {
-        setState((s) => ({
-          ...s,
+      } catch (error) {
+        setState((current) => ({
+          ...current,
           isStreaming: false,
-          error: String(err),
+          error: String(error),
           streamingText: "",
+          streamingReasoning: "",
         }));
       } finally {
-        cleanups.forEach((u) => u());
+        cleanups.forEach((cleanup) => cleanup());
       }
     },
     [sessionId, state.isStreaming]
@@ -112,7 +122,12 @@ export function useChat(sessionId: string | null) {
 
   const stopGeneration = useCallback(async () => {
     await api.stopGeneration();
-    setState((s) => ({ ...s, isStreaming: false }));
+    setState((current) => ({
+      ...current,
+      isStreaming: false,
+      streamingText: "",
+      streamingReasoning: "",
+    }));
   }, []);
 
   return { ...state, sendMessage, stopGeneration };

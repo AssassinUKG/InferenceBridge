@@ -9,6 +9,7 @@ interface Props {
   messages: MessageInfo[];
   isStreaming: boolean;
   streamingText: string;
+  streamingReasoning: string;
   tokensPerSecond: number | null;
   error: string | null;
   hasModel: boolean;
@@ -29,6 +30,7 @@ export function ChatPanel({
   messages,
   isStreaming,
   streamingText,
+  streamingReasoning,
   tokensPerSecond,
   error,
   hasModel,
@@ -153,7 +155,7 @@ export function ChatPanel({
         {messages.map((msg) => (
           <MessageBubble key={msg.id} message={msg} />
         ))}
-        {isStreaming && <StreamingText text={streamingText} />}
+        {isStreaming && <StreamingText text={streamingText} reasoning={streamingReasoning} />}
         <div ref={bottomRef} />
       </div>
 

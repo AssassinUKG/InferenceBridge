@@ -53,7 +53,7 @@ fn scan_recursive(dir: &Path, models: &mut Vec<ScannedModel>) {
 fn parse_model_file(path: &Path) -> Option<ScannedModel> {
     let filename = path.file_name()?.to_string_lossy().to_string();
     let metadata = std::fs::metadata(path).ok()?;
-    let profile = ModelProfile::detect(&filename);
+    let profile = super::overrides::detect_effective_profile(&filename);
     Some(ScannedModel {
         path: path.to_path_buf(),
         filename,

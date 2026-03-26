@@ -27,7 +27,11 @@ pub async fn test_model(
     seed: Option<i64>,
 ) -> anyhow::Result<ModelTestStats> {
     // 1. Find model in registry
-    let (model, profile, model_path) = {
+    let (model, profile, model_path): (
+        crate::models::scanner::ScannedModel,
+        crate::models::profiles::ModelProfile,
+        std::path::PathBuf,
+    ) = {
         let state = shared_state.read().await;
         let model = state
             .model_registry

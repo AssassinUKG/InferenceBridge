@@ -25,12 +25,7 @@ fn filename_supports_vision(path: &Path) -> bool {
         .file_name()
         .map(|name| name.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    name.contains("vision")
-        || name.contains("llava")
-        || name.contains("multimodal")
-        || name.contains("qwen2.5-vl")
-        || name.contains("-vl")
-        || name.contains("_vl")
+    crate::models::overrides::detect_effective_profile(&name).supports_vision
 }
 
 fn is_mmproj_candidate(path: &Path) -> bool {
@@ -123,6 +118,17 @@ pub struct LaunchConfig {
     pub rope_freq_scale: f32,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LaunchPreview {
+    pub server_path: String,
+    pub model_path: String,
+    pub mmproj_path: Option<String>,
+    pub backend_preference: String,
+    pub port: u16,
+    pub parallel_slots: u32,
+    pub args: Vec<String>,
+}
+
 /// Manages the llama-server child process.
 pub struct LlamaProcess {
     child: Option<Child>,
@@ -142,6 +148,121 @@ pub struct LlamaProcess {
 }
 
 impl LlamaProcess {
+    pub fn validate_launch_config(config: &LaunchConfig) -> anyhow::Result<()> {
+        if !config.model_path.exists() {
+            anyhow::bail!("Model file does not exist: {}", config.model_path.display());
+        }
+        if config.context_size == 0 {
+            anyhow::bail!("Context size must be greater than 0");
+        }
+        if config.parallel_slots == 0 {
+            anyhow::bail!("Parallel slots must be at least 1");
+        }
+        if config.port == 0 {
+            anyhow::bail!("Port must be greater than 0");
+        }
+        if config.main_gpu < 0 {
+            anyhow::bail!("Main GPU index cannot be negative");
+        }
+        if config.defrag_thold < 0.0 {
+            anyhow::bail!("Defrag threshold cannot be negative");
+        }
+        if config.rope_freq_scale < 0.0 {
+            anyhow::bail!("RoPE frequency scale cannot be negative");
+        }
+        Ok(())
+    }
+
+    pub fn build_args_preview(&self, config: &LaunchConfig) -> anyhow::Result<LaunchPreview> {
+        Self::validate_launch_config(config)?;
+
+        let server_path = self
+            .find_server_binary_with_preference(&config.backend_preference)
+            .ok_or_else(|| anyhow::anyhow!("llama-server binary not found"))?;
+
+        let mmproj_path = if filename_supports_vision(&config.model_path) {
+            find_mmproj_for_model(&config.model_path)
+        } else {
+            None
+        };
+
+        let mut args = vec![
+            "--model".to_string(),
+            config.model_path.to_string_lossy().to_string(),
+            "--ctx-size".to_string(),
+            config.context_size.to_string(),
+            "--port".to_string(),
+            config.port.to_string(),
+            "--parallel".to_string(),
+            config.parallel_slots.max(1).to_string(),
+            "--slots".to_string(),
+        ];
+
+        if let Some(mmproj) = &mmproj_path {
+            args.push("--mmproj".to_string());
+            args.push(mmproj.to_string_lossy().to_string());
+        }
+
+        if config.gpu_layers != 0 {
+            args.push("--n-gpu-layers".to_string());
+            args.push(if config.gpu_layers < 0 {
+                "999".to_string()
+            } else {
+                config.gpu_layers.to_string()
+            });
+        }
+        if config.threads > 0 {
+            args.push("--threads".to_string());
+            args.push(config.threads.to_string());
+        }
+        if config.threads_batch > 0 {
+            args.push("--threads-batch".to_string());
+            args.push(config.threads_batch.to_string());
+        }
+        if config.batch_size > 0 {
+            args.push("--batch-size".to_string());
+            args.push(config.batch_size.to_string());
+        }
+        if config.ubatch_size > 0 {
+            args.push("--ubatch-size".to_string());
+            args.push(config.ubatch_size.to_string());
+        }
+        if config.flash_attn {
+            args.push("--flash-attn".to_string());
+        }
+        if !config.use_mmap {
+            args.push("--no-mmap".to_string());
+        }
+        if config.use_mlock {
+            args.push("--mlock".to_string());
+        }
+        if config.cont_batching {
+            args.push("--cont-batching".to_string());
+        }
+        if config.main_gpu != 0 {
+            args.push("--main-gpu".to_string());
+            args.push(config.main_gpu.to_string());
+        }
+        if config.defrag_thold > 0.0 {
+            args.push("--defrag-thold".to_string());
+            args.push(format!("{:.4}", config.defrag_thold));
+        }
+        if config.rope_freq_scale > 0.0 {
+            args.push("--rope-freq-scale".to_string());
+            args.push(format!("{:.6}", config.rope_freq_scale));
+        }
+
+        Ok(LaunchPreview {
+            server_path: server_path.to_string_lossy().to_string(),
+            model_path: config.model_path.to_string_lossy().to_string(),
+            mmproj_path: mmproj_path.map(|path| path.to_string_lossy().to_string()),
+            backend_preference: config.backend_preference.clone(),
+            port: config.port,
+            parallel_slots: config.parallel_slots.max(1),
+            args,
+        })
+    }
+
     fn path_looks_cuda(path: &Path) -> bool {
         let path_lower = path.to_string_lossy().to_lowercase();
         if path_lower.contains("cuda") {
@@ -332,96 +453,30 @@ impl LlamaProcess {
 
     /// Launch llama-server with the given configuration.
     pub async fn launch(&mut self, config: LaunchConfig) -> anyhow::Result<()> {
+        Self::validate_launch_config(&config)?;
         // Shutdown any existing process first
         self.shutdown().await?;
 
-        let server_path = self
-            .find_server_binary_with_preference(&config.backend_preference)
-            .ok_or_else(|| anyhow::anyhow!("llama-server binary not found"))?;
+        let preview = self.build_args_preview(&config)?;
+        let server_path = PathBuf::from(&preview.server_path);
 
         self.current_port = config.port;
         self.set_state(ProcessState::Starting);
 
         let mut cmd = Command::new(&server_path);
-        cmd.arg("--model")
-            .arg(&config.model_path)
-            .arg("--ctx-size")
-            .arg(config.context_size.to_string())
-            .arg("--port")
-            .arg(config.port.to_string())
-            .arg("--parallel")
-            .arg(config.parallel_slots.max(1).to_string())
-            .arg("--slots"); // Enable /slots endpoint for KV cache monitoring
+        cmd.args(&preview.args);
 
-        if filename_supports_vision(&config.model_path) {
-            if let Some(mmproj_path) = find_mmproj_for_model(&config.model_path) {
-                tracing::info!(
-                    model = %config.model_path.display(),
-                    mmproj = %mmproj_path.display(),
-                    "Using multimodal projection sidecar for vision model"
-                );
-                cmd.arg("--mmproj").arg(mmproj_path);
-            } else {
-                tracing::warn!(
-                    model = %config.model_path.display(),
-                    "Vision-capable model detected but no mmproj sidecar was found nearby; image understanding may fail"
-                );
-            }
-        }
-
-        if config.gpu_layers != 0 {
-            cmd.arg("--n-gpu-layers").arg(if config.gpu_layers < 0 {
-                "999".to_string()
-            } else {
-                config.gpu_layers.to_string()
-            });
-        }
-
-        if config.threads > 0 {
-            cmd.arg("--threads").arg(config.threads.to_string());
-        }
-
-        if config.threads_batch > 0 {
-            cmd.arg("--threads-batch")
-                .arg(config.threads_batch.to_string());
-        }
-
-        if config.batch_size > 0 {
-            cmd.arg("--batch-size").arg(config.batch_size.to_string());
-        }
-
-        if config.ubatch_size > 0 {
-            cmd.arg("--ubatch-size").arg(config.ubatch_size.to_string());
-        }
-
-        if config.flash_attn {
-            cmd.arg("--flash-attn");
-        }
-
-        if !config.use_mmap {
-            cmd.arg("--no-mmap");
-        }
-
-        if config.use_mlock {
-            cmd.arg("--mlock");
-        }
-
-        if config.cont_batching {
-            cmd.arg("--cont-batching");
-        }
-
-        if config.main_gpu != 0 {
-            cmd.arg("--main-gpu").arg(config.main_gpu.to_string());
-        }
-
-        if config.defrag_thold > 0.0 {
-            cmd.arg("--defrag-thold")
-                .arg(format!("{:.4}", config.defrag_thold));
-        }
-
-        if config.rope_freq_scale > 0.0 {
-            cmd.arg("--rope-freq-scale")
-                .arg(format!("{:.6}", config.rope_freq_scale));
+        if let Some(mmproj_path) = &preview.mmproj_path {
+            tracing::info!(
+                model = %config.model_path.display(),
+                mmproj = %mmproj_path,
+                "Using multimodal projection sidecar for vision model"
+            );
+        } else if filename_supports_vision(&config.model_path) {
+            tracing::warn!(
+                model = %config.model_path.display(),
+                "Vision-capable model detected but no mmproj sidecar was found nearby; image understanding may fail"
+            );
         }
 
         // Suppress console window on Windows
@@ -446,6 +501,7 @@ impl LlamaProcess {
             ctx = config.context_size,
             port = config.port,
             gpu_layers = config.gpu_layers,
+            args = ?preview.args,
             "Launching llama-server"
         );
 

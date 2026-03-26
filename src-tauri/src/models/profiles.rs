@@ -1,11 +1,5 @@
-//! Model capability profiles — ported from HelixClaw's model_profiles.rs.
-//!
-//! Maps model families to their tool-call format, think-tag support,
-//! parser type, and other behavioral flags.
-
 use serde::{Deserialize, Serialize};
 
-/// Coarse model family, detected from the model name string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ModelFamily {
     Qwen3_5,
@@ -15,21 +9,17 @@ pub enum ModelFamily {
     Llama3,
     Phi,
     Mistral,
+    Gemma,
     Generic,
 }
 
-/// How the model emits tool calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolCallFormat {
-    /// Model uses the provider's native tool_calls API field.
     NativeApi,
-    /// Hermes-style XML: `<tool_call>{json}</tool_call>`.
     HermesXml,
-    /// Qwen-specific: may emit tool calls in text, possibly inside think blocks.
     QwenXml,
 }
 
-/// How the model emits chain-of-thought / reasoning blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThinkTagStyle {
     None,
@@ -37,7 +27,6 @@ pub enum ThinkTagStyle {
     Qwen,
 }
 
-/// Which parser to use for output normalization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParserType {
     NativeApi,
@@ -45,15 +34,14 @@ pub enum ParserType {
     QwenStateMachine,
 }
 
-/// Which template renderer to use for chat formatting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RendererType {
     ChatML,
     QwenChat,
     Llama3Chat,
+    GemmaChat,
 }
 
-/// Complete capability profile for a model family.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelProfile {
     pub family: ModelFamily,
@@ -61,6 +49,7 @@ pub struct ModelProfile {
     pub think_tag_style: ThinkTagStyle,
     pub interleaved_think_tool: bool,
     pub supports_parallel_tools: bool,
+    pub supports_vision: bool,
     pub default_max_output_tokens: Option<u32>,
     pub default_context_window: Option<u32>,
     pub max_context_window: Option<u32>,
@@ -78,41 +67,55 @@ pub struct ModelProfile {
 }
 
 impl ModelProfile {
-    /// Detect model family and return a complete capability profile.
     pub fn detect(model_name: &str) -> Self {
-        let m = model_name.to_lowercase();
+        let lower = model_name.to_lowercase();
+        let supports_vision = Self::infer_vision_support(&lower);
 
-        if m.contains("qwen3.5") {
-            return Self::qwen3_5(&m);
-        }
-        if m.contains("qwen3") {
-            return Self::qwen3(&m);
-        }
-        if m.contains("qwen2.5") {
-            return Self::qwen2_5();
-        }
-        if m.contains("deepseek") && (m.contains("r1") || m.contains("reasoning")) {
-            return Self::deepseek_r1();
-        }
-        if m.contains("llama") && (m.contains("3.") || m.contains("3-") || m.contains("3:")) {
-            return Self::llama3();
-        }
-        if m.contains("phi-3") || m.contains("phi-4") || m.contains("phi3") || m.contains("phi4") {
-            return Self::phi();
-        }
-        if m.contains("mistral") || m.contains("mixtral") || m.contains("nemo") {
-            return Self::mistral();
-        }
-        Self::generic()
+        let mut profile = if lower.contains("qwen3.5") {
+            Self::qwen3_5()
+        } else if lower.contains("qwen3") {
+            Self::qwen3(&lower)
+        } else if lower.contains("qwen2.5") {
+            Self::qwen2_5()
+        } else if lower.contains("deepseek") && (lower.contains("r1") || lower.contains("reasoning")) {
+            Self::deepseek_r1()
+        } else if lower.contains("gemma") {
+            Self::gemma()
+        } else if lower.contains("llama") && (lower.contains("3.") || lower.contains("3-") || lower.contains("3:")) {
+            Self::llama3()
+        } else if lower.contains("phi-3")
+            || lower.contains("phi-4")
+            || lower.contains("phi3")
+            || lower.contains("phi4")
+        {
+            Self::phi()
+        } else if lower.contains("mistral") || lower.contains("mixtral") || lower.contains("nemo") {
+            Self::mistral()
+        } else {
+            Self::generic()
+        };
+
+        profile.supports_vision = supports_vision;
+        profile
     }
 
-    fn qwen3_5(_m: &str) -> Self {
+    fn infer_vision_support(model_name: &str) -> bool {
+        model_name.contains("vision")
+            || model_name.contains("llava")
+            || model_name.contains("multimodal")
+            || model_name.contains("qwen2.5-vl")
+            || model_name.contains("-vl")
+            || model_name.contains("_vl")
+    }
+
+    fn qwen3_5() -> Self {
         Self {
             family: ModelFamily::Qwen3_5,
             tool_call_format: ToolCallFormat::QwenXml,
             think_tag_style: ThinkTagStyle::Qwen,
             interleaved_think_tool: true,
             supports_parallel_tools: true,
+            supports_vision: false,
             default_max_output_tokens: Some(8192),
             default_context_window: Some(8192),
             max_context_window: Some(262144),
@@ -130,13 +133,16 @@ impl ModelProfile {
         }
     }
 
-    fn qwen3(m: &str) -> Self {
+    fn qwen3(model_name: &str) -> Self {
         Self {
             family: ModelFamily::Qwen3,
             tool_call_format: ToolCallFormat::QwenXml,
             think_tag_style: ThinkTagStyle::Standard,
             interleaved_think_tool: true,
-            supports_parallel_tools: m.contains("14b") || m.contains("30b") || m.contains("32b"),
+            supports_parallel_tools: model_name.contains("14b")
+                || model_name.contains("30b")
+                || model_name.contains("32b"),
+            supports_vision: false,
             default_max_output_tokens: Some(8192),
             default_context_window: Some(8192),
             max_context_window: Some(131072),
@@ -161,6 +167,7 @@ impl ModelProfile {
             think_tag_style: ThinkTagStyle::None,
             interleaved_think_tool: false,
             supports_parallel_tools: false,
+            supports_vision: false,
             default_max_output_tokens: Some(4096),
             default_context_window: Some(8192),
             max_context_window: Some(32768),
@@ -168,7 +175,6 @@ impl ModelProfile {
             renderer_type: RendererType::ChatML,
             stop_markers: vec![],
             allow_fallback_extraction: false,
-            // Alibaba recommended non-thinking config for Qwen2.5 chat
             default_presence_penalty: Some(1.05),
             default_temperature: Some(0.7),
             default_top_p: Some(0.8),
@@ -186,15 +192,14 @@ impl ModelProfile {
             think_tag_style: ThinkTagStyle::Standard,
             interleaved_think_tool: false,
             supports_parallel_tools: true,
+            supports_vision: false,
             default_max_output_tokens: Some(8192),
             default_context_window: None,
             max_context_window: Some(131072),
             parser_type: ParserType::NativeApi,
             renderer_type: RendererType::ChatML,
-            stop_markers: vec![], // Let model finish reasoning naturally
+            stop_markers: vec![],
             allow_fallback_extraction: false,
-            // DeepSeek R1 always reasons; official recommended: temp=0.6, top_p=0.95
-            // top_k deliberately disabled — limits hurt long reasoning chains
             default_presence_penalty: None,
             default_temperature: Some(0.6),
             default_top_p: Some(0.95),
@@ -212,6 +217,7 @@ impl ModelProfile {
             think_tag_style: ThinkTagStyle::None,
             interleaved_think_tool: false,
             supports_parallel_tools: true,
+            supports_vision: false,
             default_max_output_tokens: Some(4096),
             default_context_window: None,
             max_context_window: Some(131072),
@@ -219,8 +225,6 @@ impl ModelProfile {
             renderer_type: RendererType::Llama3Chat,
             stop_markers: vec![],
             allow_fallback_extraction: false,
-            // Meta recommended for Llama 3: temp=0.6, top_p=0.9
-            // Presence penalty 1.05 helps avoid repetition
             default_presence_penalty: Some(1.05),
             default_temperature: Some(0.6),
             default_top_p: Some(0.9),
@@ -238,6 +242,7 @@ impl ModelProfile {
             think_tag_style: ThinkTagStyle::None,
             interleaved_think_tool: false,
             supports_parallel_tools: false,
+            supports_vision: false,
             default_max_output_tokens: Some(4096),
             default_context_window: None,
             max_context_window: Some(131072),
@@ -245,7 +250,6 @@ impl ModelProfile {
             renderer_type: RendererType::ChatML,
             stop_markers: vec![],
             allow_fallback_extraction: false,
-            // Phi-3/4 recommended: temp=0.7, top_p=0.9 for balanced chat
             default_presence_penalty: None,
             default_temperature: Some(0.7),
             default_top_p: Some(0.9),
@@ -263,6 +267,7 @@ impl ModelProfile {
             think_tag_style: ThinkTagStyle::None,
             interleaved_think_tool: false,
             supports_parallel_tools: true,
+            supports_vision: false,
             default_max_output_tokens: Some(4096),
             default_context_window: None,
             max_context_window: Some(32768),
@@ -270,9 +275,32 @@ impl ModelProfile {
             renderer_type: RendererType::ChatML,
             stop_markers: vec![],
             allow_fallback_extraction: false,
-            // Mistral recommended: temp=0.7, top_p=0.9
-            // Presence penalty 1.05 reduces repetition in longer outputs
             default_presence_penalty: Some(1.05),
+            default_temperature: Some(0.7),
+            default_top_p: Some(0.9),
+            default_top_k: Some(-1),
+            default_min_p: None,
+            disable_thinking_for_tools: false,
+            split_tool_calling: false,
+        }
+    }
+
+    fn gemma() -> Self {
+        Self {
+            family: ModelFamily::Gemma,
+            tool_call_format: ToolCallFormat::NativeApi,
+            think_tag_style: ThinkTagStyle::None,
+            interleaved_think_tool: false,
+            supports_parallel_tools: false,
+            supports_vision: false,
+            default_max_output_tokens: Some(4096),
+            default_context_window: Some(8192),
+            max_context_window: Some(131072),
+            parser_type: ParserType::NativeApi,
+            renderer_type: RendererType::GemmaChat,
+            stop_markers: vec![],
+            allow_fallback_extraction: false,
+            default_presence_penalty: Some(1.0),
             default_temperature: Some(0.7),
             default_top_p: Some(0.9),
             default_top_k: Some(-1),
@@ -289,6 +317,7 @@ impl ModelProfile {
             think_tag_style: ThinkTagStyle::None,
             interleaved_think_tool: false,
             supports_parallel_tools: true,
+            supports_vision: false,
             default_max_output_tokens: None,
             default_context_window: None,
             max_context_window: Some(131072),
@@ -296,7 +325,6 @@ impl ModelProfile {
             renderer_type: RendererType::ChatML,
             stop_markers: vec![],
             allow_fallback_extraction: false,
-            // Conservative defaults that work well across most GGUF models
             default_presence_penalty: None,
             default_temperature: Some(0.7),
             default_top_p: Some(0.9),
@@ -307,19 +335,17 @@ impl ModelProfile {
         }
     }
 
-    /// Returns true if this model uses think tags (any style).
     pub fn has_think_tags(&self) -> bool {
         !matches!(self.think_tag_style, ThinkTagStyle::None)
     }
 
-    /// Returns a system-prompt suffix for think-tag guidance.
     pub fn think_guidance_suffix(&self) -> Option<&'static str> {
         match self.family {
             ModelFamily::Qwen3_5 | ModelFamily::Qwen3 => Some(
                 "\n\n# Output Format (STRICT)\n\
                 - You MUST produce a tool call OR a text response on EVERY turn\n\
                 - If you reason in <think> tags, you MUST ALWAYS follow the closing </think> with either a tool call or a text answer\n\
-                - NEVER stop after </think> — there must ALWAYS be content after it\n\
+                - NEVER stop after </think>; there must ALWAYS be content after it\n\
                 - An empty response after reasoning is NEVER acceptable",
             ),
             _ => None,
@@ -337,6 +363,7 @@ impl std::fmt::Display for ModelFamily {
             Self::Llama3 => write!(f, "Llama3"),
             Self::Phi => write!(f, "Phi"),
             Self::Mistral => write!(f, "Mistral"),
+            Self::Gemma => write!(f, "Gemma"),
             Self::Generic => write!(f, "Generic"),
         }
     }
@@ -348,15 +375,22 @@ mod tests {
 
     #[test]
     fn detect_qwen3_5() {
-        let p = ModelProfile::detect("qwen3.5-35b-q4_k_m");
-        assert_eq!(p.family, ModelFamily::Qwen3_5);
-        assert_eq!(p.parser_type, ParserType::QwenStateMachine);
-        assert!(p.disable_thinking_for_tools);
+        let profile = ModelProfile::detect("qwen3.5-35b-q4_k_m");
+        assert_eq!(profile.family, ModelFamily::Qwen3_5);
+        assert_eq!(profile.parser_type, ParserType::QwenStateMachine);
+        assert!(profile.disable_thinking_for_tools);
     }
 
     #[test]
-    fn detect_generic() {
-        let p = ModelProfile::detect("unknown-model-v2");
-        assert_eq!(p.family, ModelFamily::Generic);
+    fn detect_gemma() {
+        let profile = ModelProfile::detect("gemma-3-12b-it-q4_k_m.gguf");
+        assert_eq!(profile.family, ModelFamily::Gemma);
+        assert_eq!(profile.renderer_type, RendererType::GemmaChat);
+    }
+
+    #[test]
+    fn detect_vision_support() {
+        let profile = ModelProfile::detect("qwen2.5-vl-7b-instruct-q4.gguf");
+        assert!(profile.supports_vision);
     }
 }

@@ -204,6 +204,14 @@ fn api_routes() -> Router<SharedState> {
             axum::routing::get(super::extensions::context_status),
         )
         .route(
+            "/runtime/status",
+            axum::routing::get(super::extensions::runtime_status),
+        )
+        .route(
+            "/debug/profile",
+            axum::routing::get(super::extensions::debug_profile),
+        )
+        .route(
             "/sessions",
             axum::routing::get(super::extensions::list_sessions)
                 .post(super::extensions::create_session),
