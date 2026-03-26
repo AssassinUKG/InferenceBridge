@@ -877,6 +877,7 @@ pub fn run_one_shot(
             stream: false,
             stop: profile.stop_markers.clone(),
             special: true,
+            image_data: vec![],
         };
 
         let client = engine::client::LlamaClient::new(s.process.port());

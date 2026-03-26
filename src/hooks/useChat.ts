@@ -1,4 +1,5 @@
 import { useState, useCallback, useEffect } from "react";
+import { flushSync } from "react-dom";
 import { listen } from "@tauri-apps/api/event";
 import type { MessageInfo } from "../lib/types";
 import * as api from "../lib/tauri";
@@ -56,10 +57,15 @@ export function useChat(sessionId: string | null) {
       try {
         // Set up event listeners before invoking the command so we do not miss early tokens.
         const tokenUnsub = await listen<string>("stream-token", (e) => {
-          setState((s) => ({
-            ...s,
-            streamingText: s.streamingText + e.payload,
-          }));
+          // flushSync forces React to render immediately after each token rather
+          // than batching multiple tokens into a single render (React 18 behaviour).
+          // This gives true per-token streaming instead of chunk-bursts.
+          flushSync(() => {
+            setState((s) => ({
+              ...s,
+              streamingText: s.streamingText + e.payload,
+            }));
+          });
         });
         cleanups.push(tokenUnsub);
 

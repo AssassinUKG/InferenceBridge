@@ -182,6 +182,7 @@ pub async fn chat_completions(
         stream: req.stream,
         stop,
         special: true,
+        image_data: vec![],
     };
 
     let client = LlamaClient::new(s.process.port());
@@ -462,6 +463,7 @@ pub async fn text_completions(
         stream: false, // text completions: non-streaming for now
         stop,
         special: true,
+        image_data: vec![],
     };
 
     let client = LlamaClient::new(s.process.port());

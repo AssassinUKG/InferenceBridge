@@ -3,6 +3,15 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+/// Image attached to a completion request (for vision models).
+/// llama-server expects base64-encoded image data (no data-URI prefix) plus an
+/// integer id that is referenced in the prompt as `[img-{id}]`.
+#[derive(Debug, Serialize)]
+pub struct ImageData {
+    pub data: String, // raw base64, no "data:image/...;base64," prefix
+    pub id: u32,
+}
+
 /// Request to llama-server's /completion endpoint.
 #[derive(Debug, Serialize)]
 pub struct CompletionRequest {
@@ -31,6 +40,10 @@ pub struct CompletionRequest {
     /// Enable parsing of special tokens (e.g. <|im_start|>) in the prompt text.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub special: bool,
+    /// Images to include (vision models). Each entry contains raw base64 data
+    /// and an id that must appear as `[img-{id}]` somewhere in the prompt.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub image_data: Vec<ImageData>,
 }
 
 /// Response from llama-server's /completion endpoint (non-streaming).

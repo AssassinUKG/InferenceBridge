@@ -84,6 +84,7 @@ pub async fn test_model(
         stream: false,
         stop: profile.stop_markers.clone(),
         special: true,
+        image_data: vec![],
     };
     let port = {
         let state = shared_state.read().await;

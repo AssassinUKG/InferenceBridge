@@ -1,6 +1,6 @@
 //! Tauri commands for chat / generation.
 
-use crate::engine::client::{CompletionRequest, LlamaClient};
+use crate::engine::client::{CompletionRequest, ImageData, LlamaClient};
 use crate::engine::streaming;
 use crate::state::SharedState;
 use crate::templates::engine::{render_prompt, ChatMessage};
@@ -40,13 +40,12 @@ pub async fn send_message(
             .map_err(|e| e.to_string())?;
     }
 
-    // If image is present, log its presence (future: store/process as needed)
+    // If image is present, log its size (it will be injected into the prompt below)
     if let Some(ref img) = image_base64 {
         tracing::info!(
             len = img.len(),
-            "Received image_base64 for vision model (not yet processed)"
+            "Received image_base64 for vision model"
         );
-        // TODO: Store image, attach to prompt, or pass to model if supported
     }
 
     // Build message history from DB
@@ -66,6 +65,18 @@ pub async fn send_message(
     // Detect model profile
     let model_name = s.loaded_model.as_deref().unwrap_or("");
     let profile = crate::models::profiles::ModelProfile::detect(model_name);
+
+    // If an image was attached, prepend [img-1] to the last user message so the
+    // vision model knows where to find the image.  DB always stores clean text.
+    let messages = if let Some(_) = &image_base64 {
+        let mut msgs = messages;
+        if let Some(last) = msgs.last_mut().filter(|m| m.role == "user") {
+            last.content = format!("[img-1]\n{}", last.content);
+        }
+        msgs
+    } else {
+        messages
+    };
 
     // For Qwen-style thinking models: inject /think or /no_think into the last
     // user message before rendering — this controls whether the model reasons.
@@ -104,6 +115,15 @@ pub async fn send_message(
         stream: true,
         stop: profile.stop_markers.clone(),
         special: true,
+        // Strip the data-URI prefix (data:image/jpeg;base64,<data>) so
+        // llama-server receives the raw base64 bytes.
+        image_data: image_base64
+            .as_deref()
+            .map(|uri| {
+                let raw = uri.split(',').nth(1).unwrap_or(uri);
+                vec![ImageData { data: raw.to_string(), id: 1 }]
+            })
+            .unwrap_or_default(),
     };
 
     let port = s.process.port();
@@ -140,6 +160,11 @@ pub async fn send_message(
             streaming::StreamEvent::Token(token) => {
                 full_text.push_str(&token);
                 let _ = app.emit("stream-token", &token);
+                // Yield to the tokio runtime so the WebView IPC queue can flush
+                // before the next token is emitted. Without this, all tokens from
+                // a single TCP chunk are emitted in one burst and arrive at the
+                // frontend together instead of one at a time.
+                tokio::task::yield_now().await;
             }
             streaming::StreamEvent::Done {
                 full_text: text,

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import type { ModelInfo } from "../../lib/types";
 import type { HubModel, HubQuant, DownloadProgress } from "../../lib/tauri";
 import * as api from "../../lib/tauri";
@@ -56,6 +56,8 @@ export function ModelBrowser({ models, onRefresh }: Props) {
   const [hfOffset, setHfOffset] = useState(0);
   const [hfHasMore, setHfHasMore] = useState(false);
   const PAGE_SIZE = 20;
+  // Sentinel element at the bottom of search results; observed to trigger auto-load
+  const sentinelRef = useRef<HTMLDivElement>(null);
 
   // Load hub catalog
   useEffect(() => {
@@ -149,8 +151,8 @@ export function ModelBrowser({ models, onRefresh }: Props) {
     }
   }
 
-  async function handleLoadMore() {
-    if (!hfQuery.trim() || hfLoadingMore) return;
+  const handleLoadMore = useCallback(async () => {
+    if (!hfQuery.trim() || hfLoadingMore || !hfHasMore) return;
     setHfLoadingMore(true);
     try {
       const more = await api.searchHubModels(hfQuery.trim(), hfOffset);
@@ -162,7 +164,19 @@ export function ModelBrowser({ models, onRefresh }: Props) {
     } finally {
       setHfLoadingMore(false);
     }
-  }
+  }, [hfQuery, hfOffset, hfLoadingMore, hfHasMore]);
+
+  // Auto-load more when the sentinel scrolls into view
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el || !hfHasMore || hfLoadingMore) return;
+    const obs = new IntersectionObserver(
+      (entries) => { if (entries[0].isIntersecting) handleLoadMore(); },
+      { threshold: 0.1 }
+    );
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, [hfHasMore, hfLoadingMore, handleLoadMore]);
 
   async function handleDelete(model: ModelInfo) {
     try {
@@ -387,27 +401,18 @@ export function ModelBrowser({ models, onRefresh }: Props) {
               </div>
             )}
 
-            {/* Load more / end-of-results */}
+            {/* Infinite scroll sentinel + status */}
             {hfResults.length > 0 && (
-              <div className="mt-4 flex items-center justify-center gap-3">
-                {hfHasMore ? (
-                  <button
-                    onClick={handleLoadMore}
-                    disabled={hfLoadingMore}
-                    className="rounded px-5 py-2 text-sm font-medium transition"
-                    style={{
-                      background: "var(--surface-1)",
-                      border: "1px solid var(--border)",
-                      color: hfLoadingMore ? "var(--text-2)" : "var(--text-0)",
-                      cursor: hfLoadingMore ? "not-allowed" : "pointer",
-                    }}
-                    onMouseEnter={(e) => { if (!hfLoadingMore) (e.currentTarget as HTMLButtonElement).style.borderColor = "rgba(34,211,238,0.4)"; }}
-                    onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.borderColor = "var(--border)"; }}
-                  >
-                    {hfLoadingMore ? "Loading…" : `Load 20 more  (showing ${hfResults.length})`}
-                  </button>
-                ) : (
+              <div className="mt-4 flex flex-col items-center gap-2">
+                {hfLoadingMore && (
                   <span className="text-xs" style={{ color: "var(--text-2)" }}>
+                    Loading more…
+                  </span>
+                )}
+                {/* Sentinel div — IntersectionObserver fires handleLoadMore when visible */}
+                <div ref={sentinelRef} className="h-4 w-full" />
+                {!hfHasMore && (
+                  <span className="text-xs pb-2" style={{ color: "var(--text-2)" }}>
                     All {hfResults.length} results shown
                   </span>
                 )}
