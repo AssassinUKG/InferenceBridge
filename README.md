@@ -25,7 +25,7 @@ Built with Tauri (Rust) + React. Wraps `llama-server` from [llama.cpp](https://g
   <figcaption>API window</figcaption>
 <img src="docs/screenshots/api.png" width=50% height=50%>
   </figure>
----
+
 
 ## Download
 
