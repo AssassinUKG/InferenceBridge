@@ -9,7 +9,7 @@ host = "127.0.0.1"
 [models]
 # Point at your LM Studio models cache and any additional model directories
 scan_dirs = [
-    "C:\\Users\\richa\\.cache\\lm-studio\\models",
+    "C:\\Users\\USER\\.cache\\lm-studio\\models",
 ]
 default_context = 8192
 
