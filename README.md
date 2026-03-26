@@ -9,22 +9,29 @@ Built with Tauri (Rust) + React. Wraps `llama-server` from [llama.cpp](https://g
 ## Screenshots
 
 <!-- Chat interface with streaming response -->
-<figure>
-  <figcaption>Chat window</figcaption>
-<img src="docs/screenshots/chat.png" width=50% height=50%>
-</figure>
-<figure>
-  <figcaption>Browse HF window</figcaption>
-<img src="docs/screenshots/browse.png" width=50% height=50%>
-</figure>
-<figure>
-  <figcaption>Models window</figcaption>
-<img src="docs/screenshots/models.png" width=50% height=50%>
+<div style="display: flex; gap: 20px; margin-bottom: 20px;">
+  <figure style="flex: 1; text-align: center;">
+    <figcaption>Chat window</figcaption>
+    <img src="docs/screenshots/chat.png" style="width: 100%;">
   </figure>
-<figure>
-  <figcaption>API window</figcaption>
-<img src="docs/screenshots/api.png" width=50% height=50%>
+
+  <figure style="flex: 1; text-align: center;">
+    <figcaption>Browse HF window</figcaption>
+    <img src="docs/screenshots/browse.png" style="width: 100%;">
   </figure>
+</div>
+
+<div style="display: flex; gap: 20px;">
+  <figure style="flex: 1; text-align: center;">
+    <figcaption>Models window</figcaption>
+    <img src="docs/screenshots/models.png" style="width: 100%;">
+  </figure>
+
+  <figure style="flex: 1; text-align: center;">
+    <figcaption>API window</figcaption>
+    <img src="docs/screenshots/api.png" style="width: 100%;">
+  </figure>
+</div>
 
 
 ## Download
