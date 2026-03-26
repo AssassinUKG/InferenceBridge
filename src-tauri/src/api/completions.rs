@@ -1,6 +1,8 @@
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
+use base64::Engine as _;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 use crate::api::errors::ApiErrorResponse;
@@ -8,6 +10,8 @@ use crate::engine::client::{CompletionRequest, ImageData, LlamaClient};
 use crate::engine::streaming::{self, StreamEvent};
 use crate::models::profiles::ModelProfile;
 use crate::state::{GenerationRequest, SharedState};
+
+const MAX_REMOTE_IMAGE_BYTES: usize = 15 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -210,7 +214,94 @@ async fn resolve_loaded_model(
     s.loaded_model.clone().ok_or_else(ApiErrorResponse::no_model)
 }
 
-fn normalize_image_payload(value: &str) -> Result<String, ApiErrorResponse> {
+async fn fetch_remote_image_as_base64(url: &str) -> Result<String, ApiErrorResponse> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| {
+        ApiErrorResponse::bad_request(format!("Invalid image URL: {url}"))
+    })?;
+
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(ApiErrorResponse::bad_request(format!(
+            "Unsupported image URL scheme '{}'. Only http/https URLs are supported.",
+            parsed.scheme()
+        )));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("InferenceBridge/1.0")
+        .build()
+        .map_err(|e| ApiErrorResponse::service_unavailable(format!(
+            "Could not initialize remote image fetch client: {e}"
+        )))?;
+
+    let response = client
+        .get(parsed.clone())
+        .header(reqwest::header::ACCEPT, "image/*,application/octet-stream;q=0.9,*/*;q=0.1")
+        .send()
+        .await
+        .map_err(|e| {
+            ApiErrorResponse::bad_request(format!(
+                "Could not fetch remote image URL '{url}': {e}"
+            ))
+        })?;
+
+    if !response.status().is_success() {
+        return Err(ApiErrorResponse::bad_request(format!(
+            "Remote image URL '{url}' returned HTTP {}.",
+            response.status()
+        )));
+    }
+
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    if !content_type.is_empty()
+        && !content_type.starts_with("image/")
+        && !content_type.starts_with("application/octet-stream")
+    {
+        return Err(ApiErrorResponse::bad_request(format!(
+            "Remote image URL '{url}' returned unsupported content type '{content_type}'."
+        )));
+    }
+
+    if let Some(content_length) = response.content_length() {
+        if content_length as usize > MAX_REMOTE_IMAGE_BYTES {
+            return Err(ApiErrorResponse::bad_request(format!(
+                "Remote image URL '{url}' is too large ({content_length} bytes). Max allowed is {MAX_REMOTE_IMAGE_BYTES} bytes."
+            )));
+        }
+    }
+
+    let mut bytes = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            ApiErrorResponse::bad_request(format!(
+                "Failed while downloading remote image URL '{url}': {e}"
+            ))
+        })?;
+        if bytes.len() + chunk.len() > MAX_REMOTE_IMAGE_BYTES {
+            return Err(ApiErrorResponse::bad_request(format!(
+                "Remote image URL '{url}' exceeded the max allowed size of {MAX_REMOTE_IMAGE_BYTES} bytes."
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+
+    if bytes.is_empty() {
+        return Err(ApiErrorResponse::bad_request(format!(
+            "Remote image URL '{url}' returned an empty body."
+        )));
+    }
+
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+async fn normalize_image_payload(value: &str) -> Result<String, ApiErrorResponse> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(ApiErrorResponse::bad_request(
@@ -230,15 +321,13 @@ fn normalize_image_payload(value: &str) -> Result<String, ApiErrorResponse> {
     }
 
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        return Err(ApiErrorResponse::bad_request(
-            "Remote image URLs are not supported yet. Send image_url as a base64 data URL or raw base64.",
-        ));
+        return fetch_remote_image_as_base64(trimmed).await;
     }
 
     Ok(trimmed.to_string())
 }
 
-fn normalize_api_messages(
+async fn normalize_api_messages(
     messages: &[ApiMessage],
 ) -> Result<(Vec<crate::templates::engine::ChatMessage>, Vec<ImageData>), ApiErrorResponse> {
     let mut normalized = Vec::with_capacity(messages.len());
@@ -268,7 +357,7 @@ fn normalize_api_messages(
                             next_image_id += 1;
                             content_parts.push(format!("[img-{image_id}]"));
                             image_data.push(ImageData {
-                                data: normalize_image_payload(&image_url.into_url())?,
+                                data: normalize_image_payload(&image_url.into_url()).await?,
                                 id: image_id,
                             });
                         }
@@ -277,9 +366,9 @@ fn normalize_api_messages(
                             image_base64,
                         } => {
                             let raw = if let Some(image_base64) = image_base64 {
-                                normalize_image_payload(&image_base64)?
+                                normalize_image_payload(&image_base64).await?
                             } else if let Some(image_url) = image_url {
-                                normalize_image_payload(&image_url.into_url())?
+                                normalize_image_payload(&image_url.into_url()).await?
                             } else {
                                 return Err(ApiErrorResponse::bad_request(
                                     "input_image parts require image_url or image_base64.",
@@ -346,12 +435,12 @@ fn prepend_tool_schema_message(
     );
 }
 
-fn build_chat_request(
+async fn build_chat_request(
     profile: &ModelProfile,
     req: ChatCompletionRequest,
     server_defaults: (&Option<f32>, &Option<f32>, &Option<i32>, &Option<u32>),
 ) -> Result<CompletionRequest, ApiErrorResponse> {
-    let (mut messages, image_data) = normalize_api_messages(&req.messages)?;
+    let (mut messages, image_data) = normalize_api_messages(&req.messages).await?;
     prepend_tool_schema_message(&mut messages, req.tools.as_ref());
 
     let mut stop = profile.stop_markers.clone();
@@ -412,7 +501,8 @@ pub async fn chat_completions(
             &server_defaults.2,
             &server_defaults.3,
         ),
-    )?;
+    )
+    .await?;
 
     if !request.image_data.is_empty() && !profile.supports_vision {
         return Err(ApiErrorResponse::bad_request(format!(
@@ -756,8 +846,8 @@ mod tests {
         assert_eq!(request.messages.len(), 1);
     }
 
-    #[test]
-    fn deserializes_array_message_content() {
+    #[tokio::test]
+    async fn deserializes_array_message_content() {
         let request: ChatCompletionRequest = serde_json::from_str(
             r#"{
                 "messages": [
@@ -773,7 +863,7 @@ mod tests {
         )
         .expect("request should deserialize");
 
-        let (messages, image_data) = match normalize_api_messages(&request.messages) {
+        let (messages, image_data) = match normalize_api_messages(&request.messages).await {
             Ok(value) => value,
             Err(_) => panic!("messages should normalize"),
         };
@@ -781,8 +871,8 @@ mod tests {
         assert!(image_data.is_empty());
     }
 
-    #[test]
-    fn normalizes_data_url_images() {
+    #[tokio::test]
+    async fn normalizes_data_url_images() {
         let messages = vec![ApiMessage {
             role: "user".to_string(),
             content: Some(serde_json::from_str(
@@ -798,7 +888,7 @@ mod tests {
             refusal: None,
         }];
 
-        let (normalized, image_data) = match normalize_api_messages(&messages) {
+        let (normalized, image_data) = match normalize_api_messages(&messages).await {
             Ok(value) => value,
             Err(_) => panic!("messages should normalize"),
         };
@@ -822,8 +912,8 @@ mod tests {
         assert_eq!(request.max_tokens, Some(321));
     }
 
-    #[test]
-    fn preserves_tool_metadata_in_message_history() {
+    #[tokio::test]
+    async fn preserves_tool_metadata_in_message_history() {
         let messages = vec![ApiMessage {
             role: "assistant".to_string(),
             content: None,
@@ -840,7 +930,7 @@ mod tests {
             refusal: None,
         }];
 
-        let (normalized, _) = match normalize_api_messages(&messages) {
+        let (normalized, _) = match normalize_api_messages(&messages).await {
             Ok(value) => value,
             Err(_) => panic!("messages should normalize"),
         };
