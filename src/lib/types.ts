@@ -117,6 +117,13 @@ export interface AppSettings {
   api_key: string | null;
 }
 
+export interface ApiAccessInfo {
+  bind_host: string;
+  loopback_url: string;
+  lan_host: string | null;
+  lan_url: string | null;
+}
+
 export interface GpuStats {
   name: string;
   used_mb: number;

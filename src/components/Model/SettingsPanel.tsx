@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
-import type { AppSettings, LlamaServerInfo, ProcessStatusInfo } from "../../lib/types";
+import type { ApiAccessInfo, AppSettings, LlamaServerInfo, ProcessStatusInfo } from "../../lib/types";
 import * as api from "../../lib/tauri";
 
 interface Props {
@@ -309,6 +309,7 @@ function ApiKeyRow({ value, onChange }: { value: string; onChange: (v: string) =
 export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }: Props) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [persistedSettings, setPersistedSettings] = useState<AppSettings | null>(null);
+  const [accessInfo, setAccessInfo] = useState<ApiAccessInfo | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
@@ -327,6 +328,14 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
     }
   }, []);
 
+  const loadApiAccessInfo = useCallback(async () => {
+    try {
+      setAccessInfo(await api.getApiAccessInfo());
+    } catch {
+      // Non-critical; LAN preview can be omitted.
+    }
+  }, []);
+
   const loadLlamaInfo = useCallback(async () => {
     setLlamaLoading(true);
     try {
@@ -340,8 +349,9 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
 
   useEffect(() => {
     loadSettings();
+    loadApiAccessInfo();
     loadLlamaInfo();
-  }, [loadSettings, loadLlamaInfo]);
+  }, [loadSettings, loadApiAccessInfo, loadLlamaInfo]);
 
   const saveSettings = useCallback(async (nextSettings?: AppSettings) => {
     const settingsToSave = nextSettings ?? settings;
@@ -353,6 +363,7 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
       setSaved(true);
       setError(null);
       setPersistedSettings(settingsToSave);
+      await loadApiAccessInfo();
       onSaved?.(settingsToSave);
       setTimeout(() => setSaved(false), 2000);
       return true;
@@ -362,7 +373,7 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
     } finally {
       setSaving(false);
     }
-  }, [settings, onSaved]);
+  }, [settings, loadApiAccessInfo, onSaved]);
 
   const handleDownload = async (backend: string) => {
     setDownloadStatus(`Downloading ${backend} build…`);
@@ -405,6 +416,9 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
   const apiRunning = apiState === "Running" && apiReachable;
   const apiStarting = apiState === "Starting";
   const apiError = processStatus?.api_error ?? null;
+  const isLanMode = settings.server_host === "0.0.0.0";
+  const lanUrl =
+    accessInfo?.lan_host ? `http://${accessInfo.lan_host}:${settings.server_port}/v1` : null;
   const apiConfigDirty =
     !!persistedSettings &&
     (persistedSettings.server_host !== settings.server_host ||
@@ -441,6 +455,15 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
     }
   };
 
+  const applyNetworkMode = async (host: string) => {
+    const nextSettings = { ...settings, server_host: host };
+    setSettings(nextSettings);
+    const saved = await saveSettings(nextSettings);
+    if (!saved) {
+      return;
+    }
+  };
+
   return (
     <div className="h-full overflow-y-auto">
       <div className="p-3 flex flex-col gap-3">
@@ -450,11 +473,35 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
           <SectionHeader title="API Surface" description="OpenAI-compatible endpoint for external clients. The desktop UI talks to InferenceBridge directly. Save API changes before starting or retrying the public endpoint." />
 
           <FieldRow label="Host">
-            <FlatInput
-              value={settings.server_host}
-              onChange={(v) => setSettings({ ...settings, server_host: v })}
-              placeholder="127.0.0.1"
-            />
+            <div className="flex flex-col gap-2">
+              <FlatInput
+                value={settings.server_host}
+                onChange={(v) => setSettings({ ...settings, server_host: v })}
+                placeholder="127.0.0.1"
+              />
+              <div className="flex flex-wrap items-center gap-2">
+                <FlatBtn
+                  label="Local only"
+                  onClick={() => {
+                    void applyNetworkMode("127.0.0.1");
+                  }}
+                  disabled={saving || settings.server_host === "127.0.0.1"}
+                />
+                <FlatBtn
+                  label="Local network"
+                  onClick={() => {
+                    void applyNetworkMode("0.0.0.0");
+                  }}
+                  disabled={saving || isLanMode}
+                  primary
+                />
+                <span className="text-xs" style={{ color: "var(--text-2)" }}>
+                  {isLanMode
+                    ? "Binding on all interfaces so other devices on your LAN can reach the API."
+                    : "Local network mode binds the API on 0.0.0.0 for other devices on your LAN."}
+                </span>
+              </div>
+            </div>
           </FieldRow>
           <Divider />
           <FieldRow label="Port">
@@ -515,6 +562,19 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
                   Current saved endpoint
                 </span>
                 <span className="font-mono text-xs" style={{ color: "var(--text-1)" }}>{persistedServerUrl}</span>
+              </div>
+            </>
+          )}
+          {isLanMode && (
+            <>
+              <Divider />
+              <div className="flex items-center gap-2 px-4 py-2.5" style={{ background: "rgba(34,211,238,0.05)" }}>
+                <span className="text-xs" style={{ color: "var(--text-2)" }}>
+                  LAN URL
+                </span>
+                <span className="font-mono text-xs" style={{ color: "#22d3ee" }}>
+                  {lanUrl ?? `http://<your-lan-ip>:${settings.server_port}/v1`}
+                </span>
               </div>
             </>
           )}

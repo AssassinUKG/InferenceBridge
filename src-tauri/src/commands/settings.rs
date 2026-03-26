@@ -2,6 +2,7 @@ use crate::engine::download;
 use crate::engine::process::LlamaProcess;
 use crate::state::SharedState;
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, UdpSocket};
 
 /// Settings exposed to the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +31,14 @@ pub struct AppSettings {
     pub rope_freq_scale: f32,
     /// API key for Bearer token auth. None / empty string = no auth required.
     pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiAccessInfo {
+    pub bind_host: String,
+    pub loopback_url: String,
+    pub lan_host: Option<String>,
+    pub lan_url: Option<String>,
 }
 
 #[tauri::command]
@@ -63,6 +72,27 @@ pub async fn get_settings(state: tauri::State<'_, SharedState>) -> Result<AppSet
         defrag_thold: s.config.process.defrag_thold,
         rope_freq_scale: s.config.process.rope_freq_scale,
         api_key: s.config.server.api_key.clone(),
+    })
+}
+
+#[tauri::command]
+pub async fn get_api_access_info(
+    state: tauri::State<'_, SharedState>,
+) -> Result<ApiAccessInfo, String> {
+    let s = state.read().await;
+    let bind_host = s.config.server.host.clone();
+    let port = s.config.server.port;
+    let loopback_url = format!("http://127.0.0.1:{port}/v1");
+    let lan_host = detect_primary_lan_ipv4();
+    let lan_url = lan_host
+        .as_ref()
+        .map(|host| format!("http://{host}:{port}/v1"));
+
+    Ok(ApiAccessInfo {
+        bind_host,
+        loopback_url,
+        lan_host,
+        lan_url,
     })
 }
 
@@ -204,6 +234,15 @@ pub async fn set_api_server_running(
         } else {
             Ok("API server already stopped".to_string())
         }
+    }
+}
+
+fn detect_primary_lan_ipv4() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    match socket.local_addr().ok()?.ip() {
+        IpAddr::V4(ip) if !ip.is_loopback() => Some(ip.to_string()),
+        _ => None,
     }
 }
 

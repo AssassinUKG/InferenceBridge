@@ -198,6 +198,7 @@ pub fn run() {
             commands::debug::clear_logs,
             commands::debug::debug_api_request,
             commands::settings::get_settings,
+            commands::settings::get_api_access_info,
             commands::settings::update_settings,
             commands::settings::set_api_server_running,
             commands::settings::get_llama_info,

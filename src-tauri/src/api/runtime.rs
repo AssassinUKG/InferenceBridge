@@ -33,13 +33,38 @@ pub fn start_managed(state: SharedState, host: String, port: u16, source: &'stat
 
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let handle = tauri::async_runtime::spawn(async move {
+        let (effective_host, effective_port) = if should_try_startup_port_fallback(source, &host, port)
+        {
+            match reserve_startup_api_port(state.clone(), &host, port).await {
+                Ok((fallback_host, fallback_port)) => (fallback_host, fallback_port),
+                Err(error) => {
+                    tracing::warn!(
+                        source,
+                        host = %host,
+                        port,
+                        error = %error,
+                        "Could not preflight startup API port; continuing with configured endpoint"
+                    );
+                    (host.clone(), port)
+                }
+            }
+        } else {
+            (host.clone(), port)
+        };
+
         if source == "gui" {
             // Give a previous instance a brief moment to finish releasing the socket
             // during app restarts before we try to bind the public API again.
             tokio::time::sleep(Duration::from_millis(900)).await;
         }
         if let Err(error) =
-            crate::api::server::start_api_server_with_shutdown(state, &host, port, source, stop_rx)
+            crate::api::server::start_api_server_with_shutdown(
+                state,
+                &effective_host,
+                effective_port,
+                source,
+                stop_rx,
+            )
                 .await
         {
             tracing::error!(error = %error, source, "Managed API server task exited with error");
@@ -82,4 +107,47 @@ pub async fn stop_managed(state: SharedState) -> bool {
     app_state.api_server_state = ApiServerState::Idle;
     app_state.api_server_error = None;
     true
+}
+
+fn should_try_startup_port_fallback(source: &'static str, host: &str, port: u16) -> bool {
+    source == "gui" && host == "127.0.0.1" && port == 8800
+}
+
+async fn reserve_startup_api_port(
+    state: SharedState,
+    host: &str,
+    port: u16,
+) -> Result<(String, u16), String> {
+    if tokio::net::TcpListener::bind(format!("{host}:{port}")).await.is_ok() {
+        return Ok((host.to_string(), port));
+    }
+
+    for candidate in 8802..=8810 {
+        if tokio::net::TcpListener::bind(format!("{host}:{candidate}"))
+            .await
+            .is_ok()
+        {
+            {
+                let mut app_state = state.write().await;
+                app_state.config.server.port = candidate;
+                app_state
+                    .config
+                    .save()
+                    .map_err(|e| format!("Failed to persist fallback API port {candidate}: {e}"))?;
+            }
+
+            tracing::warn!(
+                requested_port = port,
+                fallback_port = candidate,
+                host = %host,
+                "Default public API port was unavailable on startup; switched to fallback port"
+            );
+
+            return Ok((host.to_string(), candidate));
+        }
+    }
+
+    Err(format!(
+        "No fallback public API port was free in the startup range 8802-8810 for {host}:{port}"
+    ))
 }

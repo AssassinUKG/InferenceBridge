@@ -3,6 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AppSettings,
+  ApiAccessInfo,
   ContextStatus,
   DebugApiResponse,
   EffectiveProfileInfo,
@@ -51,6 +52,8 @@ export const downloadLlamaBuild = (backend: string) =>
 // Settings
 
 export const getSettings = () => invoke<AppSettings>("get_settings");
+
+export const getApiAccessInfo = () => invoke<ApiAccessInfo>("get_api_access_info");
 
 export const updateSettings = (settings: AppSettings) =>
   invoke<void>("update_settings", { settings });
