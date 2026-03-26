@@ -152,6 +152,7 @@ export interface HubModel {
   params: string;
   description: string;
   tags: string[];
+  supports_vision: boolean;
   quants: HubQuant[];
 }
 
@@ -173,8 +174,15 @@ export const searchHubModels = (query: string, offset: number = 0) =>
 export const showInFolder = (path: string) =>
   invoke<void>("show_in_folder", { path });
 
-export const downloadHubModel = (url: string, filename: string) =>
-  invoke<string>("download_hub_model", { url, filename });
+export const downloadHubModel = (
+  url: string,
+  filename: string,
+  supportsVision?: boolean
+) => invoke<string>("download_hub_model", {
+  url,
+  filename,
+  supportsVision,
+});
 
 export const listDownloads = () =>
   invoke<DownloadProgress[]>("list_downloads");

@@ -120,6 +120,20 @@ fn overrides_path() -> PathBuf {
     crate::config::app_support_dir().join("model-overrides.json")
 }
 
+fn save_overrides(store: &ModelOverrideStore) -> Result<(), String> {
+    let path = overrides_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
+    }
+
+    let contents = serde_json::to_string_pretty(store)
+        .map_err(|error| format!("Failed to serialize model overrides: {error}"))?;
+    std::fs::write(&path, contents)
+        .map_err(|error| format!("Failed to write {}: {error}", path.display()))?;
+    Ok(())
+}
+
 pub fn load_overrides() -> ModelOverrideStore {
     let path = overrides_path();
     let contents = match std::fs::read_to_string(&path) {
@@ -146,4 +160,19 @@ pub fn detect_effective_profile(model_name: &str) -> ModelProfile {
 
 pub fn effective_override(model_name: &str) -> Option<ModelProfileOverride> {
     load_overrides().matching_override(model_name).cloned()
+}
+
+pub fn set_model_supports_vision_override(
+    model_name: &str,
+    supports_vision: bool,
+) -> Result<(), String> {
+    let normalized_name = model_name.trim().to_lowercase();
+    if normalized_name.is_empty() {
+        return Err("Model name cannot be empty when saving overrides".to_string());
+    }
+
+    let mut store = load_overrides();
+    let entry = store.models.entry(normalized_name).or_default();
+    entry.supports_vision = Some(supports_vision);
+    save_overrides(&store)
 }

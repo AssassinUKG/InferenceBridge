@@ -100,12 +100,16 @@ impl ModelProfile {
     }
 
     fn infer_vision_support(model_name: &str) -> bool {
+        let normalized = model_name.replace('_', "-");
         model_name.contains("vision")
             || model_name.contains("llava")
             || model_name.contains("multimodal")
             || model_name.contains("qwen2.5-vl")
             || model_name.contains("-vl")
             || model_name.contains("_vl")
+            // Qwen3.5 35B-A3B multimodal variants are commonly published as plain GGUF
+            // filenames without an explicit `vision` or `-vl` marker.
+            || normalized.contains("qwen3.5-35b-a3b")
     }
 
     fn qwen3_5() -> Self {
@@ -391,6 +395,19 @@ mod tests {
     #[test]
     fn detect_vision_support() {
         let profile = ModelProfile::detect("qwen2.5-vl-7b-instruct-q4.gguf");
+        assert!(profile.supports_vision);
+    }
+
+    #[test]
+    fn detect_qwen3_5_35b_a3b_as_vision_capable() {
+        let profile = ModelProfile::detect("Qwen3.5-35B-A3B-Q4_K_M.gguf");
+        assert!(profile.supports_vision);
+    }
+
+    #[test]
+    fn detect_qwen3_5_35b_a3b_with_repo_style_tokens_as_vision_capable() {
+        let profile =
+            ModelProfile::detect("HauhauCS/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive");
         assert!(profile.supports_vision);
     }
 }

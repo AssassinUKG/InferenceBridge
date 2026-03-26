@@ -138,10 +138,10 @@ export function ModelBrowser({ models, onRefresh }: Props) {
     return () => observer.disconnect();
   }, [hasMore, loadingMore, offset, query, runSearch]);
 
-  async function handleDownload(quant: HubQuant) {
+  async function handleDownload(model: HubModel, quant: HubQuant) {
     const id = quant.url;
     setDownloads((prev) => ({ ...prev, [id]: prev[id] ?? { id, filename: quant.filename, dest_path: null, downloaded_bytes: 0, total_bytes: 0, percent: 0, done: false, status: "Starting", error: null } }));
-    void api.downloadHubModel(quant.url, quant.filename).catch((downloadError) => {
+    void api.downloadHubModel(quant.url, quant.filename, model.supports_vision).catch((downloadError) => {
       const message = String(downloadError);
       if (message.toLowerCase().includes("cancelled")) return;
       setDownloads((prev) => ({ ...prev, [id]: { id, filename: quant.filename, dest_path: prev[id]?.dest_path ?? null, downloaded_bytes: prev[id]?.downloaded_bytes ?? 0, total_bytes: prev[id]?.total_bytes ?? 0, percent: prev[id]?.percent ?? 0, done: true, status: "Failed", error: message } }));
@@ -304,7 +304,7 @@ export function ModelBrowser({ models, onRefresh }: Props) {
                                 ) : isInstalled(quant) ? (
                                   <span className="text-xs font-medium" style={{ color: "#22d3ee" }}>Installed</span>
                                 ) : (
-                                  <button onClick={() => void handleDownload(quant)} className="rounded px-3 py-1 text-xs font-medium transition" style={{ background: "#22d3ee", color: "#041014", border: "none", cursor: "pointer" }}>Download</button>
+                                  <button onClick={() => void handleDownload(model, quant)} className="rounded px-3 py-1 text-xs font-medium transition" style={{ background: "#22d3ee", color: "#041014", border: "none", cursor: "pointer" }}>Download</button>
                                 )}
                               </div>
                             );

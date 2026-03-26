@@ -29,6 +29,7 @@ pub struct HubModel {
     pub params: String,
     pub description: String,
     pub tags: Vec<String>,
+    pub supports_vision: bool,
     pub quants: Vec<HubQuant>,
 }
 
@@ -47,6 +48,8 @@ struct HfApiModel {
     model_id: String,
     #[serde(default)]
     downloads: u64,
+    #[serde(default)]
+    pipeline_tag: Option<String>,
     #[serde(default)]
     tags: Vec<String>,
     #[serde(default)]
@@ -127,6 +130,29 @@ fn is_hf_featured_candidate(model: &HfApiModel) -> bool {
     })
 }
 
+fn hf_supports_vision(model: &HfApiModel) -> bool {
+    let pipeline = model
+        .pipeline_tag
+        .as_deref()
+        .unwrap_or_default()
+        .to_lowercase();
+
+    if matches!(
+        pipeline.as_str(),
+        "image-text-to-text" | "image-to-text" | "visual-question-answering"
+    ) {
+        return true;
+    }
+
+    model.tags.iter().any(|tag| {
+        let lowered = tag.to_lowercase();
+        matches!(
+            lowered.as_str(),
+            "vision" | "multimodal" | "image-text-to-text" | "image-to-text"
+        )
+    })
+}
+
 fn hf_api_to_hub(m: HfApiModel) -> Option<HubModel> {
     if !is_hf_downloadable(&m) {
         return None;
@@ -159,13 +185,17 @@ fn hf_api_to_hub(m: HfApiModel) -> Option<HubModel> {
     let owner = parts.next().unwrap_or("HuggingFace");
     let repo_name = parts.next().unwrap_or(&m.model_id);
     let name = repo_name.replace('-', " ").replace('_', " ");
+    let supports_vision = hf_supports_vision(&m);
 
-    let tags: Vec<String> = m
+    let mut tags: Vec<String> = m
         .tags
         .into_iter()
         .filter(|t| !t.contains(':') && !t.starts_with("base_model") && t.len() < 24)
         .take(5)
         .collect();
+    if supports_vision && !tags.iter().any(|tag| tag.eq_ignore_ascii_case("vision")) {
+        tags.insert(0, "vision".to_string());
+    }
 
     Some(HubModel {
         id: m.model_id.clone(),
@@ -174,6 +204,7 @@ fn hf_api_to_hub(m: HfApiModel) -> Option<HubModel> {
         params: String::new(),
         description: format!("{} downloads | {}", format_downloads(m.downloads), m.model_id),
         tags,
+        supports_vision,
         quants,
     })
 }
@@ -396,6 +427,7 @@ pub async fn download_hub_model(
     state: tauri::State<'_, SharedState>,
     url: String,
     filename: String,
+    supports_vision: Option<bool>,
 ) -> Result<String, String> {
     let relative_path = sanitize_download_subpath(&filename)?;
     let download_id = url.clone();
@@ -556,6 +588,25 @@ pub async fn download_hub_model(
             .map_err(|e| format!("Flush error: {e}"))?;
         drop(file);
 
+        if let (Some(value), Some(model_filename)) = (
+            supports_vision,
+            relative_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(str::to_string),
+        ) {
+            if let Err(error) =
+                crate::models::overrides::set_model_supports_vision_override(&model_filename, value)
+            {
+                tracing::warn!(
+                    model = %model_filename,
+                    supports_vision = value,
+                    error = %error,
+                    "Failed to persist Hugging Face vision capability override"
+                );
+            }
+        }
+
         {
             let s = state.read().await;
             let dirs = s.config.models.scan_dirs.clone();
@@ -651,7 +702,7 @@ pub async fn delete_model_file(
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_download_subpath;
+    use super::{hf_supports_vision, sanitize_download_subpath, HfApiModel};
     use std::path::PathBuf;
 
     #[test]
@@ -666,6 +717,38 @@ mod tests {
     #[test]
     fn rejects_parent_traversal() {
         assert!(sanitize_download_subpath("../escape.gguf").is_err());
+    }
+
+    #[test]
+    fn detects_vision_from_hugging_face_pipeline_tag() {
+        let model = HfApiModel {
+            model_id: "Qwen/Qwen3.5-35B-A3B".to_string(),
+            downloads: 0,
+            pipeline_tag: Some("image-text-to-text".to_string()),
+            tags: vec!["gguf".to_string()],
+            private: false,
+            disabled: false,
+            gated: None,
+            siblings: vec![],
+        };
+
+        assert!(hf_supports_vision(&model));
+    }
+
+    #[test]
+    fn detects_vision_from_hugging_face_tags() {
+        let model = HfApiModel {
+            model_id: "HauhauCS/Qwen3.5-35B-A3B-Uncensored".to_string(),
+            downloads: 0,
+            pipeline_tag: None,
+            tags: vec!["gguf".to_string(), "vision".to_string(), "multimodal".to_string()],
+            private: false,
+            disabled: false,
+            gated: None,
+            siblings: vec![],
+        };
+
+        assert!(hf_supports_vision(&model));
     }
 }
 
