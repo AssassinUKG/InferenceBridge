@@ -71,55 +71,107 @@ pub async fn update_settings(
     state: tauri::State<'_, SharedState>,
     settings: AppSettings,
 ) -> Result<(), String> {
-    let mut s = state.write().await;
-    s.config.server.autostart = settings.api_autostart;
-    s.config.process.kill_on_exit = settings.kill_on_exit;
-    s.config.process.gpu_layers = settings.gpu_layers;
-    s.config.process.threads = settings.threads;
-    s.config.process.threads_batch = settings.threads_batch;
-    s.config.ui.theme = settings.theme;
-    s.config.process.backend_preference = settings.backend_preference;
+    let shared = state.inner().clone();
     let host = settings.server_host.clone();
-    s.config.server.host = host.clone();
-    s.config.server.port = settings.server_port;
-    // Update model scan directories (deduplicate, filter non-empty paths).
-    s.config.models.scan_dirs = settings
-        .scan_dirs
-        .iter()
-        .filter(|p| !p.trim().is_empty())
-        .map(std::path::PathBuf::from)
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    // Force a re-scan so the new dirs are reflected immediately.
-    let rescan_dirs = s.config.models.scan_dirs.clone();
-    let scanned = crate::models::scanner::scan_all(&rescan_dirs);
-    let count = scanned.len();
-    s.model_registry.update(scanned);
-    tracing::info!(count, "Re-scanned models after scan_dirs update");
-    s.config.process.batch_size = settings.batch_size;
-    s.config.process.ubatch_size = settings.ubatch_size;
-    s.config.process.flash_attn = settings.flash_attn;
-    s.config.process.use_mmap = settings.use_mmap;
-    s.config.process.use_mlock = settings.use_mlock;
-    s.config.process.cont_batching = settings.cont_batching;
-    s.config.process.parallel_slots = settings.parallel_slots;
-    s.config.process.main_gpu = settings.main_gpu;
-    s.config.process.defrag_thold = settings.defrag_thold;
-    s.config.process.rope_freq_scale = settings.rope_freq_scale;
-    // Normalise the API key: treat empty string as "no key"
-    s.config.server.api_key = settings.api_key.filter(|k| !k.trim().is_empty());
+    let normalized_api_key = settings.api_key.clone().filter(|k| !k.trim().is_empty());
+    let (
+        should_restart_api,
+        should_start_api,
+        previous_host,
+        previous_port,
+        previous_api_key,
+    ) = {
+        let mut s = shared.write().await;
+        let previous_host = s.config.server.host.clone();
+        let previous_port = s.config.server.port;
+        let previous_api_key = s.config.server.api_key.clone();
+        let previous_autostart = s.config.server.autostart;
+        let previous_api_state = s.api_server_state.clone();
 
-    // Persist to disk.
-    s.config
-        .save()
-        .map_err(|e| format!("Failed to save settings: {e}"))?;
+        s.config.server.autostart = settings.api_autostart;
+        s.config.process.kill_on_exit = settings.kill_on_exit;
+        s.config.process.gpu_layers = settings.gpu_layers;
+        s.config.process.threads = settings.threads;
+        s.config.process.threads_batch = settings.threads_batch;
+        s.config.ui.theme = settings.theme;
+        s.config.process.backend_preference = settings.backend_preference;
+        s.config.server.host = host.clone();
+        s.config.server.port = settings.server_port;
+        // Update model scan directories (deduplicate, filter non-empty paths).
+        s.config.models.scan_dirs = settings
+            .scan_dirs
+            .iter()
+            .filter(|p| !p.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        // Force a re-scan so the new dirs are reflected immediately.
+        let rescan_dirs = s.config.models.scan_dirs.clone();
+        let scanned = crate::models::scanner::scan_all(&rescan_dirs);
+        let count = scanned.len();
+        s.model_registry.update(scanned);
+        tracing::info!(count, "Re-scanned models after scan_dirs update");
+        s.config.process.batch_size = settings.batch_size;
+        s.config.process.ubatch_size = settings.ubatch_size;
+        s.config.process.flash_attn = settings.flash_attn;
+        s.config.process.use_mmap = settings.use_mmap;
+        s.config.process.use_mlock = settings.use_mlock;
+        s.config.process.cont_batching = settings.cont_batching;
+        s.config.process.parallel_slots = settings.parallel_slots;
+        s.config.process.main_gpu = settings.main_gpu;
+        s.config.process.defrag_thold = settings.defrag_thold;
+        s.config.process.rope_freq_scale = settings.rope_freq_scale;
+        s.config.server.api_key = normalized_api_key.clone();
+
+        // Persist to disk.
+        s.config
+            .save()
+            .map_err(|e| format!("Failed to save settings: {e}"))?;
+
+        let api_settings_changed = previous_host != host
+            || previous_port != settings.server_port
+            || previous_api_key != normalized_api_key;
+        let api_was_active = !matches!(previous_api_state, crate::state::ApiServerState::Idle);
+        let should_restart_api = api_settings_changed && (api_was_active || previous_autostart);
+        let should_start_api = settings.api_autostart || api_was_active;
+
+        (
+            should_restart_api,
+            should_start_api,
+            previous_host,
+            previous_port,
+            previous_api_key,
+        )
+    };
+
+    if should_restart_api {
+        tracing::info!(
+            previous_host = %previous_host,
+            previous_port,
+            host = %host,
+            port = settings.server_port,
+            "API settings changed; restarting managed API server"
+        );
+        let _ = crate::api::runtime::stop_managed(shared.clone()).await;
+        if should_start_api {
+            crate::api::runtime::start_managed(
+                shared.clone(),
+                host.clone(),
+                settings.server_port,
+                "settings-save",
+            );
+        }
+    }
 
     tracing::info!(
         kill_on_exit = settings.kill_on_exit,
         api_autostart = settings.api_autostart,
         host = %host,
         port = settings.server_port,
+        previous_host = %previous_host,
+        previous_port,
+        api_key_changed = previous_api_key != normalized_api_key,
         "Settings updated"
     );
     Ok(())

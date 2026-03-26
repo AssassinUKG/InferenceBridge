@@ -5,7 +5,7 @@ import * as api from "../../lib/tauri";
 interface Props {
   onSaved?: (settings: AppSettings) => void;
   processStatus: ProcessStatusInfo | null;
-  onSetApiServerRunning: (running: boolean) => void;
+  onSetApiServerRunning: (running: boolean) => void | Promise<void>;
 }
 
 // ─── Shared primitives ────────────────────────────────────────────────────────
@@ -308,6 +308,7 @@ function ApiKeyRow({ value, onChange }: { value: string; onChange: (v: string) =
 
 export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }: Props) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [persistedSettings, setPersistedSettings] = useState<AppSettings | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
@@ -319,6 +320,7 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
     try {
       const s = await api.getSettings();
       setSettings(s);
+      setPersistedSettings(s);
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -341,22 +343,26 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
     loadLlamaInfo();
   }, [loadSettings, loadLlamaInfo]);
 
-  const saveSettings = async () => {
-    if (!settings) return;
+  const saveSettings = useCallback(async (nextSettings?: AppSettings) => {
+    const settingsToSave = nextSettings ?? settings;
+    if (!settingsToSave) return false;
     setSaving(true);
     setSaved(false);
     try {
-      await api.updateSettings(settings);
+      await api.updateSettings(settingsToSave);
       setSaved(true);
       setError(null);
-      onSaved?.(settings);
+      setPersistedSettings(settingsToSave);
+      onSaved?.(settingsToSave);
       setTimeout(() => setSaved(false), 2000);
+      return true;
     } catch (e) {
       setError(String(e));
+      return false;
     } finally {
       setSaving(false);
     }
-  };
+  }, [settings, onSaved]);
 
   const handleDownload = async (backend: string) => {
     setDownloadStatus(`Downloading ${backend} build…`);
@@ -391,11 +397,49 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
   }
 
   const serverUrl = `http://${settings.server_host}:${settings.server_port}/v1`;
+  const persistedServerUrl = persistedSettings
+    ? `http://${persistedSettings.server_host}:${persistedSettings.server_port}/v1`
+    : processStatus?.api_url ?? serverUrl;
   const apiState = processStatus?.api_state ?? "Idle";
   const apiReachable = processStatus?.api_reachable ?? false;
   const apiRunning = apiState === "Running" && apiReachable;
   const apiStarting = apiState === "Starting";
   const apiError = processStatus?.api_error ?? null;
+  const apiConfigDirty =
+    !!persistedSettings &&
+    (persistedSettings.server_host !== settings.server_host ||
+      persistedSettings.server_port !== settings.server_port ||
+      (persistedSettings.api_key ?? "") !== (settings.api_key ?? ""));
+  const statusMessage = apiConfigDirty
+    ? `Unsaved API changes: ${serverUrl} will not be used until you save. Current saved endpoint is ${persistedServerUrl}.`
+    : apiRunning
+      ? `Public API reachable on ${serverUrl}`
+      : apiStarting
+        ? `Public API is starting on ${serverUrl}`
+        : apiState === "Error"
+          ? apiError ?? `Public API is not reachable on ${serverUrl}.`
+          : "Public API is currently off.";
+  const apiActionLabel = apiRunning || apiStarting
+    ? "Stop API"
+    : apiState === "Error"
+      ? apiConfigDirty ? "Save & Retry API" : "Retry API"
+      : apiConfigDirty ? "Save & Start API" : "Start API";
+
+  const handleApiServerToggle = async () => {
+    const shouldStart = !(apiRunning || apiStarting);
+    if (shouldStart && apiConfigDirty) {
+      const saved = await saveSettings(settings);
+      if (!saved) {
+        return;
+      }
+    }
+
+    try {
+      await onSetApiServerRunning(shouldStart);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
 
   return (
     <div className="h-full overflow-y-auto">
@@ -403,7 +447,7 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
 
         {/* ── API Surface ── */}
         <SectionPanel>
-          <SectionHeader title="API Surface" description="OpenAI-compatible endpoint for external clients. The desktop UI talks to InferenceBridge directly. Restart the app after changing host or port." />
+          <SectionHeader title="API Surface" description="OpenAI-compatible endpoint for external clients. The desktop UI talks to InferenceBridge directly. Save API changes before starting or retrying the public endpoint." />
 
           <FieldRow label="Host">
             <FlatInput
@@ -434,28 +478,22 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
                 Server Status
               </p>
               <p className="mt-0.5 text-xs" style={{ color: apiRunning ? "#34d399" : apiStarting ? "#fde68a" : apiState === "Error" ? "#f87171" : "var(--text-2)" }}>
-                {apiRunning
-                  ? `Public API reachable on ${serverUrl}`
-                  : apiStarting
-                    ? `Public API is starting on ${serverUrl}`
-                    : apiState === "Error"
-                      ? apiError ?? `Public API is not reachable on ${serverUrl}.`
-                      : "Public API is currently off."}
+                {statusMessage}
               </p>
             </div>
             <div className="flex items-center gap-2">
               <FlatBtn
-                label={apiRunning || apiStarting ? "Stop API" : apiState === "Error" ? "Retry API" : "Start API"}
-                onClick={() => onSetApiServerRunning(apiRunning || apiStarting ? false : true)}
+                label={apiActionLabel}
+                onClick={handleApiServerToggle}
                 primary
               />
             </div>
           </div>
-          {apiError && (
+          {(apiError || apiConfigDirty) && (
             <>
               <Divider />
               <div className="px-4 py-2.5 text-xs" style={{ color: "#fca5a5", background: "rgba(248,113,113,0.06)" }}>
-                {apiError}
+                {apiConfigDirty ? statusMessage : apiError}
               </div>
             </>
           )}
@@ -465,10 +503,21 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
             style={{ background: apiReachable ? "rgba(52,211,153,0.04)" : "rgba(255,255,255,0.03)" }}
           >
             <span className="text-xs" style={{ color: "var(--text-1)" }}>
-              {apiReachable ? "Reachable at" : "Configured endpoint"}
+              {apiReachable ? "Reachable at" : apiConfigDirty ? "Edited endpoint" : "Configured endpoint"}
             </span>
             <span className="font-mono text-xs" style={{ color: apiReachable ? "#34d399" : "var(--text-1)" }}>{serverUrl}</span>
           </div>
+          {apiConfigDirty && (
+            <>
+              <Divider />
+              <div className="flex items-center gap-2 px-4 py-2.5" style={{ background: "rgba(255,255,255,0.02)" }}>
+                <span className="text-xs" style={{ color: "var(--text-2)" }}>
+                  Current saved endpoint
+                </span>
+                <span className="font-mono text-xs" style={{ color: "var(--text-1)" }}>{persistedServerUrl}</span>
+              </div>
+            </>
+          )}
           <Divider />
           <div className="flex items-center justify-between px-4 py-3">
             <div>
@@ -803,7 +852,9 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
         <div className="flex items-center gap-3 pb-2">
           <FlatBtn
             label={saving ? "Saving…" : "Save Settings"}
-            onClick={saveSettings}
+            onClick={() => {
+              void saveSettings();
+            }}
             disabled={saving}
             primary
           />
