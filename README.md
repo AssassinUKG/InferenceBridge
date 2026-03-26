@@ -192,6 +192,38 @@ For development:
 npm run tauri dev
 ```
 
+## GitHub Actions
+
+This repo uses three GitHub Actions workflows:
+
+- `CI`
+  runs quick validation on pushes and pull requests
+  includes `npm run build` and `cargo check`
+- `Build`
+  builds desktop artifacts on pushes and by manual trigger from the Actions tab
+  uploads build artifacts to the workflow run
+- `Release`
+  creates a draft GitHub Release when you push a version tag like `v0.1.0`
+
+### Trigger a normal build
+
+Push your branch:
+
+```bash
+git push origin master
+```
+
+Or open the `Actions` tab on GitHub and run the `Build` workflow manually.
+
+### Trigger a release build
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+That will run the `Release` workflow and create a draft release with platform installers.
+
 ## Project Docs
 
 - [docs/01-migration-design-note.md](docs/01-migration-design-note.md)
