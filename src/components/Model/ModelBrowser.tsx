@@ -39,9 +39,28 @@ function formatBytes(bytes: number) {
   return `${mb.toFixed(0)} MB`;
 }
 
+function basename(path: string) {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  return (parts[parts.length - 1] ?? path).toLowerCase();
+}
+
+function downloadTone(status: string, error?: string | null) {
+  if (error || status === "Failed") {
+    return "#f87171";
+  }
+  if (status === "Completed") {
+    return "#34d399";
+  }
+  if (status === "Cancelled") {
+    return "#fbbf24";
+  }
+  return "#22d3ee";
+}
+
 export function ModelBrowser({ models, onRefresh }: Props) {
   const [hubModels, setHubModels] = useState<HubModel[]>([]);
   const [loading, setLoading] = useState(true);
+  const [catalogError, setCatalogError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -55,16 +74,34 @@ export function ModelBrowser({ models, onRefresh }: Props) {
   const [hfError, setHfError] = useState<string | null>(null);
   const [hfOffset, setHfOffset] = useState(0);
   const [hfHasMore, setHfHasMore] = useState(false);
+  const [downloadsOpen, setDownloadsOpen] = useState(false);
   const PAGE_SIZE = 20;
   // Sentinel element at the bottom of search results; observed to trigger auto-load
   const sentinelRef = useRef<HTMLDivElement>(null);
+  const downloadsMenuRef = useRef<HTMLDivElement>(null);
 
   // Load hub catalog
   useEffect(() => {
     api.listHubModels()
-      .then(setHubModels)
-      .catch(() => setHubModels([]))
+      .then((models) => {
+        setHubModels(models);
+        setCatalogError(null);
+      })
+      .catch((error) => {
+        setHubModels([]);
+        setCatalogError(String(error));
+      })
       .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    api.listDownloads()
+      .then((items) => {
+        setDownloads(Object.fromEntries(items.map((item) => [item.id, item])));
+      })
+      .catch(() => {
+        // ignore startup download manager errors
+      });
   }, []);
 
   // Listen for download progress events
@@ -73,28 +110,35 @@ export function ModelBrowser({ models, onRefresh }: Props) {
       const prog = event.payload;
       setDownloads((prev) => ({
         ...prev,
-        [prog.filename]: prog,
+        [prog.id]: prog,
       }));
-      if (prog.done && !prog.error) {
+      if (prog.done && !prog.error && prog.status === "Completed") {
         onRefresh();
-        // Clear after 3s
-        setTimeout(() => {
-          setDownloads((prev) => {
-            const next = { ...prev };
-            delete next[prog.filename];
-            return next;
-          });
-        }, 3000);
       }
     });
     return () => { unlisten.then((fn) => fn()); };
   }, [onRefresh]);
 
+  useEffect(() => {
+    function handlePointerDown(event: MouseEvent) {
+      if (!downloadsMenuRef.current?.contains(event.target as Node)) {
+        setDownloadsOpen(false);
+      }
+    }
+
+    if (downloadsOpen) {
+      window.addEventListener("mousedown", handlePointerDown);
+      return () => window.removeEventListener("mousedown", handlePointerDown);
+    }
+
+    return undefined;
+  }, [downloadsOpen]);
+
   // Installed model filenames (lowercase for comparison)
-  const installedFilenames = new Set(models.map((m) => m.filename.toLowerCase()));
+  const installedFilenames = new Set(models.map((m) => basename(m.filename)));
 
   function isInstalled(quant: HubQuant) {
-    return installedFilenames.has(quant.filename.toLowerCase());
+    return installedFilenames.has(basename(quant.filename));
   }
 
   function anyInstalled(model: HubModel) {
@@ -113,23 +157,83 @@ export function ModelBrowser({ models, onRefresh }: Props) {
 
   // Group by family
   const families = Array.from(new Set(filteredModels.map((m) => m.family)));
+  const downloadEntries = Object.values(downloads).sort((left, right) => {
+    if (left.done !== right.done) {
+      return left.done ? 1 : -1;
+    }
+    return left.filename.localeCompare(right.filename);
+  });
+  const activeDownloadCount = downloadEntries.filter((entry) => !entry.done).length;
+  const completedDownloadCount = downloadEntries.filter((entry) => entry.done).length;
 
   async function handleDownload(quant: HubQuant) {
-    try {
-      await api.downloadHubModel(quant.url, quant.filename);
-    } catch (e) {
+    const id = quant.url;
+    setDownloads((prev) => ({
+      ...prev,
+      [id]: prev[id] ?? {
+        id,
+        filename: quant.filename,
+        dest_path: null,
+        downloaded_bytes: 0,
+        total_bytes: 0,
+        percent: 0,
+        done: false,
+        status: "Starting",
+        error: null,
+      },
+    }));
+    void api.downloadHubModel(quant.url, quant.filename).catch((error) => {
+      const message = String(error);
+      if (message.toLowerCase().includes("cancelled")) {
+        return;
+      }
       setDownloads((prev) => ({
         ...prev,
-        [quant.filename]: {
+        [id]: {
+          id,
           filename: quant.filename,
-          downloaded_bytes: 0,
-          total_bytes: 0,
-          percent: 0,
+          dest_path: prev[id]?.dest_path ?? null,
+          downloaded_bytes: prev[id]?.downloaded_bytes ?? 0,
+          total_bytes: prev[id]?.total_bytes ?? 0,
+          percent: prev[id]?.percent ?? 0,
           done: true,
-          error: String(e),
+          status: "Failed",
+          error: message,
         },
       }));
+    });
+  }
+
+  async function handleCancelDownload(id: string) {
+    try {
+      await api.cancelDownload(id);
+    } catch (error) {
+      const message = String(error);
+      setDownloads((prev) => {
+        const existing = prev[id];
+        if (!existing) {
+          return prev;
+        }
+        return {
+          ...prev,
+          [id]: {
+            ...existing,
+            done: true,
+            status: "Failed",
+            error: message,
+          },
+        };
+      });
     }
+  }
+
+  async function handleClearCompletedDownloads() {
+    await api.clearCompletedDownloads();
+    setDownloads((prev) =>
+      Object.fromEntries(
+        Object.entries(prev).filter(([, entry]) => !entry.done)
+      )
+    );
   }
 
   async function handleHfSearch() {
@@ -207,7 +311,7 @@ export function ModelBrowser({ models, onRefresh }: Props) {
               cursor: "pointer",
             }}
           >
-            Browse Models
+            Popular HF
           </button>
           <button
             onClick={() => setActiveSection("search")}
@@ -250,7 +354,7 @@ export function ModelBrowser({ models, onRefresh }: Props) {
               type="text"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Filter featured models…"
+              placeholder="Filter popular Hugging Face models..."
               className="min-w-[200px] flex-1 rounded px-3 py-1.5 text-sm outline-none"
               style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-0)" }}
             />
@@ -303,6 +407,167 @@ export function ModelBrowser({ models, onRefresh }: Props) {
             </button>
           </form>
         )}
+
+        <div className="relative ml-auto" ref={downloadsMenuRef}>
+          <button
+            onClick={() => setDownloadsOpen((open) => !open)}
+            className="flex items-center gap-2 rounded px-3 py-1.5 text-xs font-medium transition"
+            style={{
+              background: downloadsOpen ? "rgba(34,211,238,0.12)" : "var(--surface-2)",
+              border: downloadsOpen ? "1px solid rgba(34,211,238,0.24)" : "1px solid var(--border)",
+              color: downloadsOpen ? "#22d3ee" : "var(--text-1)",
+              cursor: "pointer",
+            }}
+          >
+            <span>Downloads</span>
+            {(activeDownloadCount > 0 || completedDownloadCount > 0) && (
+              <span
+                className="rounded px-1.5 py-0.5 text-[10px] font-semibold"
+                style={{
+                  background: activeDownloadCount > 0 ? "rgba(34,211,238,0.18)" : "rgba(255,255,255,0.08)",
+                  color: activeDownloadCount > 0 ? "#22d3ee" : "var(--text-1)",
+                }}
+              >
+                {activeDownloadCount > 0 ? activeDownloadCount : completedDownloadCount}
+              </span>
+            )}
+          </button>
+
+          {downloadsOpen && (
+            <div
+              className="absolute right-0 top-full z-20 mt-2 w-[380px] overflow-hidden rounded"
+              style={{
+                background: "var(--surface-1)",
+                border: "1px solid var(--border)",
+                boxShadow: "0 14px 40px rgba(0,0,0,0.35)",
+              }}
+            >
+              <div
+                className="flex items-center justify-between border-b px-3 py-2"
+                style={{ borderColor: "var(--border)" }}
+              >
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
+                    Download Manager
+                  </div>
+                  <div className="mt-1 text-xs" style={{ color: "var(--text-1)" }}>
+                    {activeDownloadCount > 0
+                      ? `${activeDownloadCount} active`
+                      : completedDownloadCount > 0
+                        ? `${completedDownloadCount} recent`
+                        : "No downloads yet"}
+                  </div>
+                </div>
+                {completedDownloadCount > 0 && (
+                  <button
+                    onClick={() => void handleClearCompletedDownloads()}
+                    className="rounded px-2 py-1 text-[11px] font-medium transition"
+                    style={{
+                      background: "transparent",
+                      border: "1px solid var(--border)",
+                      color: "var(--text-1)",
+                      cursor: "pointer",
+                    }}
+                  >
+                    Clear Done
+                  </button>
+                )}
+              </div>
+
+              <div className="max-h-[420px] overflow-y-auto">
+                {downloadEntries.length === 0 ? (
+                  <div className="px-3 py-6 text-sm" style={{ color: "var(--text-2)" }}>
+                    Start a model download and it will show up here with progress and cancel controls.
+                  </div>
+                ) : (
+                  downloadEntries.map((entry) => {
+                    const tone = downloadTone(entry.status, entry.error);
+                    const isActive = !entry.done;
+                    const shortName = entry.filename.split(/[\\/]/).filter(Boolean).pop() ?? entry.filename;
+                    return (
+                      <div
+                        key={entry.id}
+                        className="border-b px-3 py-3 last:border-b-0"
+                        style={{ borderColor: "var(--border)" }}
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-sm font-medium" style={{ color: "var(--text-0)" }}>
+                              {shortName}
+                            </div>
+                            {entry.filename !== shortName && (
+                              <div className="mt-0.5 truncate font-mono text-[11px]" style={{ color: "var(--text-2)" }}>
+                                {entry.filename}
+                              </div>
+                            )}
+                          </div>
+                          <span className="shrink-0 text-[11px] font-medium" style={{ color: tone }}>
+                            {entry.status}
+                          </span>
+                        </div>
+
+                        {(isActive || entry.downloaded_bytes > 0 || entry.total_bytes > 0) && (
+                          <div className="mt-2">
+                            <div className="h-1.5 overflow-hidden rounded" style={{ background: "rgba(255,255,255,0.08)" }}>
+                              <div
+                                className="h-full rounded transition-all"
+                                style={{
+                                  width: `${Math.max(4, Math.round(entry.percent * 100))}%`,
+                                  background: tone,
+                                }}
+                              />
+                            </div>
+                            <div className="mt-1 text-[11px]" style={{ color: "var(--text-2)" }}>
+                              {formatBytes(entry.downloaded_bytes)} / {formatBytes(entry.total_bytes)} ({Math.round(entry.percent * 100)}%)
+                            </div>
+                          </div>
+                        )}
+
+                        {entry.error && (
+                          <div className="mt-2 text-[11px]" style={{ color: "#f87171" }}>
+                            {entry.error}
+                          </div>
+                        )}
+
+                        <div className="mt-3 flex items-center gap-2">
+                          {!entry.done ? (
+                            <button
+                              onClick={() => void handleCancelDownload(entry.id)}
+                              disabled={entry.status === "Cancelling"}
+                              className="rounded px-2.5 py-1 text-[11px] font-medium transition"
+                              style={{
+                                background: "rgba(248,113,113,0.12)",
+                                border: "1px solid rgba(248,113,113,0.24)",
+                                color: "#f87171",
+                                cursor: entry.status === "Cancelling" ? "not-allowed" : "pointer",
+                                opacity: entry.status === "Cancelling" ? 0.7 : 1,
+                              }}
+                            >
+                              {entry.status === "Cancelling" ? "Cancelling..." : "Cancel"}
+                            </button>
+                          ) : entry.dest_path ? (
+                            <button
+                              onClick={() => void api.showInFolder(entry.dest_path!)}
+                              className="rounded px-2.5 py-1 text-[11px] font-medium transition"
+                              style={{
+                                background: "transparent",
+                                border: "1px solid var(--border)",
+                                color: "var(--text-1)",
+                                cursor: "pointer",
+                              }}
+                            >
+                              Open Folder
+                            </button>
+                          ) : null}
+                        </div>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
+            </div>
+          )}
+        </div>
       </div>
 
       <div className="flex-1 overflow-y-auto p-4">
@@ -355,23 +620,37 @@ export function ModelBrowser({ models, onRefresh }: Props) {
                       {expanded && (
                         <div style={{ borderTop: "1px solid var(--border)" }}>
                           {model.quants.map((quant) => {
-                            const prog = downloads[quant.filename];
+                            const prog = downloads[quant.url];
                             const alreadyInstalled = isInstalled(quant);
                             const isDownloading = prog && !prog.done;
-                            const justDone = prog?.done && !prog?.error;
+                            const justDone = prog?.done && prog.status === "Completed" && !prog?.error;
                             return (
                               <div key={quant.filename} className="flex flex-wrap items-center gap-3 px-4 py-2.5" style={{ borderTop: "1px solid var(--border)" }}>
                                 <span className="text-xs font-semibold" style={{ color: "#fbbf24" }}>{quant.quant}</span>
                                 {quant.size_gb > 0 && <span className="text-xs" style={{ color: "var(--text-1)" }}>{quant.size_gb.toFixed(2)} GB</span>}
                                 <span className="text-xs truncate flex-1 font-mono" style={{ color: "var(--text-2)" }}>{quant.filename}</span>
                                 {isDownloading ? (
-                                  <div className="flex items-center gap-2 min-w-[200px]">
+                                  <div className="flex items-center gap-2 min-w-[240px]">
                                     <div className="flex-1 h-1.5 rounded overflow-hidden" style={{ background: "rgba(255,255,255,0.08)" }}>
                                       <div className="h-full rounded transition-all" style={{ width: `${Math.round(prog.percent * 100)}%`, background: "#22d3ee" }} />
                                     </div>
                                     <span className="text-xs whitespace-nowrap" style={{ color: "var(--text-1)" }}>
                                       {formatBytes(prog.downloaded_bytes)} / {formatBytes(prog.total_bytes)} ({Math.round(prog.percent * 100)}%)
                                     </span>
+                                    <button
+                                      onClick={() => void handleCancelDownload(prog.id)}
+                                      disabled={prog.status === "Cancelling"}
+                                      className="rounded px-2 py-1 text-[11px] font-medium transition"
+                                      style={{
+                                        background: "rgba(248,113,113,0.12)",
+                                        border: "1px solid rgba(248,113,113,0.24)",
+                                        color: "#f87171",
+                                        cursor: prog.status === "Cancelling" ? "not-allowed" : "pointer",
+                                        opacity: prog.status === "Cancelling" ? 0.7 : 1,
+                                      }}
+                                    >
+                                      {prog.status === "Cancelling" ? "Cancelling..." : "Cancel"}
+                                    </button>
                                   </div>
                                 ) : justDone ? (
                                   <span className="text-xs" style={{ color: "#34d399" }}>Downloaded</span>
@@ -491,11 +770,15 @@ export function ModelBrowser({ models, onRefresh }: Props) {
           <>
             {loading ? (
               <div className="flex items-center justify-center py-16 text-sm" style={{ color: "var(--text-2)" }}>
-                Loading catalog…
+                Loading Hugging Face models...
+              </div>
+            ) : catalogError ? (
+              <div className="rounded px-4 py-3 text-sm" style={{ background: "rgba(248,113,113,0.1)", border: "1px solid rgba(248,113,113,0.25)", color: "#f87171" }}>
+                {catalogError}
               </div>
             ) : filteredModels.length === 0 ? (
               <div className="flex items-center justify-center py-16 text-sm" style={{ color: "var(--text-2)" }}>
-                No models match your search.
+                No downloadable Hugging Face GGUF models matched your filter.
               </div>
             ) : (
               families.map((family) => (
@@ -547,10 +830,10 @@ export function ModelBrowser({ models, onRefresh }: Props) {
                             {expanded && (
                               <div style={{ borderTop: "1px solid var(--border)" }}>
                                 {model.quants.map((quant) => {
-                                  const prog = downloads[quant.filename];
+                                  const prog = downloads[quant.url];
                                   const alreadyInstalled = isInstalled(quant);
                                   const isDownloading = prog && !prog.done;
-                                  const justDone = prog?.done && !prog?.error;
+                                  const justDone = prog?.done && prog.status === "Completed" && !prog?.error;
 
                                   return (
                                     <div
@@ -563,7 +846,7 @@ export function ModelBrowser({ models, onRefresh }: Props) {
                                       <span className="text-xs truncate flex-1 font-mono" style={{ color: "var(--text-2)" }}>{quant.filename}</span>
 
                                       {isDownloading ? (
-                                        <div className="flex items-center gap-2 min-w-[200px]">
+                                        <div className="flex items-center gap-2 min-w-[240px]">
                                           <div className="flex-1 h-1.5 rounded overflow-hidden" style={{ background: "rgba(255,255,255,0.08)" }}>
                                             <div
                                               className="h-full rounded transition-all"
@@ -573,6 +856,20 @@ export function ModelBrowser({ models, onRefresh }: Props) {
                                           <span className="text-xs whitespace-nowrap" style={{ color: "var(--text-1)" }}>
                                             {formatBytes(prog.downloaded_bytes)} / {formatBytes(prog.total_bytes)} ({Math.round(prog.percent * 100)}%)
                                           </span>
+                                          <button
+                                            onClick={() => void handleCancelDownload(prog.id)}
+                                            disabled={prog.status === "Cancelling"}
+                                            className="rounded px-2 py-1 text-[11px] font-medium transition"
+                                            style={{
+                                              background: "rgba(248,113,113,0.12)",
+                                              border: "1px solid rgba(248,113,113,0.24)",
+                                              color: "#f87171",
+                                              cursor: prog.status === "Cancelling" ? "not-allowed" : "pointer",
+                                              opacity: prog.status === "Cancelling" ? 0.7 : 1,
+                                            }}
+                                          >
+                                            {prog.status === "Cancelling" ? "Cancelling..." : "Cancel"}
+                                          </button>
                                         </div>
                                       ) : justDone ? (
                                         <span className="text-xs" style={{ color: "#34d399" }}>Downloaded</span>

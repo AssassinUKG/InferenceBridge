@@ -153,11 +153,14 @@ export interface HubModel {
 }
 
 export interface DownloadProgress {
+  id: string;
   filename: string;
+  dest_path: string | null;
   downloaded_bytes: number;
   total_bytes: number;
   percent: number;
   done: boolean;
+  status: string;
   error: string | null;
 }
 
@@ -171,6 +174,15 @@ export const showInFolder = (path: string) =>
 
 export const downloadHubModel = (url: string, filename: string) =>
   invoke<string>("download_hub_model", { url, filename });
+
+export const listDownloads = () =>
+  invoke<DownloadProgress[]>("list_downloads");
+
+export const cancelDownload = (id: string) =>
+  invoke<void>("cancel_download", { id });
+
+export const clearCompletedDownloads = () =>
+  invoke<void>("clear_completed_downloads");
 
 export const deleteModelFile = (path: string) =>
   invoke<void>("delete_model_file", { path });

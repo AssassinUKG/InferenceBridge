@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -11,6 +12,7 @@ use crate::models::overrides::ModelProfileOverride;
 use crate::models::profiles::ModelProfile;
 use crate::models::registry::ModelRegistry;
 use crate::session::db::SessionDb;
+use crate::commands::browse::DownloadProgress;
 
 #[derive(Clone, serde::Serialize)]
 pub enum ModelLoadState {
@@ -63,6 +65,12 @@ pub struct EffectiveProfileInfo {
     pub override_entry: Option<ModelProfileOverride>,
 }
 
+#[derive(Clone)]
+pub struct ActiveDownload {
+    pub progress: DownloadProgress,
+    pub cancel_token: CancellationToken,
+}
+
 pub struct AppState {
     pub config: AppConfig,
     pub process: LlamaProcess,
@@ -85,6 +93,7 @@ pub struct AppState {
     pub api_server_state: ApiServerState,
     pub api_server_error: Option<String>,
     pub app_handle: Option<tauri::AppHandle>,
+    pub active_downloads: HashMap<String, ActiveDownload>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -114,6 +123,7 @@ impl AppState {
             api_server_state: ApiServerState::Idle,
             api_server_error: None,
             app_handle: None,
+            active_downloads: HashMap::new(),
         })
     }
 }

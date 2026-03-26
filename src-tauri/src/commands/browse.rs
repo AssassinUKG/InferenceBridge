@@ -1,13 +1,17 @@
-//! Model browser — curated catalog of popular GGUF models with download/delete support.
+//! Model browser commands backed by live Hugging Face GGUF search and downloads.
+
+use std::path::{Component, PathBuf};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 use tokio::io::AsyncWriteExt;
+use tokio_util::sync::CancellationToken;
 
 use crate::state::SharedState;
 
-// ─── Catalog types ────────────────────────────────────────────────────────────
+
+// Shared model browser types used by the UI and HF search results.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HubQuant {
@@ -28,317 +32,7 @@ pub struct HubModel {
     pub quants: Vec<HubQuant>,
 }
 
-fn bw(repo: &str, filename: &str, quant: &str, size_gb: f32) -> HubQuant {
-    HubQuant {
-        quant: quant.to_string(),
-        size_gb,
-        url: format!(
-            "https://huggingface.co/bartowski/{}/resolve/main/{}",
-            repo, filename
-        ),
-        filename: filename.to_string(),
-    }
-}
-
-pub fn catalog() -> Vec<HubModel> {
-    vec![
-        // ── Qwen3.5 ──────────────────────────────────────────────────────────
-        HubModel {
-            id: "qwen3.5-0.6b".into(),
-            name: "Qwen3.5-0.6B".into(),
-            family: "Qwen3.5".into(),
-            params: "0.6B".into(),
-            description: "Alibaba's latest reasoning model. 262K context, thinking mode, tool use. Smallest variant.".into(),
-            tags: vec!["reasoning".into(), "tools".into(), "thinking".into()],
-            quants: vec![
-                bw("Qwen3.5-0.6B-GGUF", "Qwen3.5-0.6B-Q4_K_M.gguf", "Q4_K_M", 0.52),
-                bw("Qwen3.5-0.6B-GGUF", "Qwen3.5-0.6B-Q8_0.gguf", "Q8_0", 0.72),
-            ],
-        },
-        HubModel {
-            id: "qwen3.5-1.7b".into(),
-            name: "Qwen3.5-1.7B".into(),
-            family: "Qwen3.5".into(),
-            params: "1.7B".into(),
-            description: "Qwen3.5 1.7B — 262K context, thinking mode, tool use. Excellent quality/speed for edge devices.".into(),
-            tags: vec!["reasoning".into(), "tools".into(), "thinking".into()],
-            quants: vec![
-                bw("Qwen3.5-1.7B-GGUF", "Qwen3.5-1.7B-Q4_K_M.gguf", "Q4_K_M", 1.1),
-                bw("Qwen3.5-1.7B-GGUF", "Qwen3.5-1.7B-Q8_0.gguf", "Q8_0", 1.9),
-            ],
-        },
-        HubModel {
-            id: "qwen3.5-4b".into(),
-            name: "Qwen3.5-4B".into(),
-            family: "Qwen3.5".into(),
-            params: "4B".into(),
-            description: "Qwen3.5 4B — great quality/speed balance. 262K context, thinking mode optional.".into(),
-            tags: vec!["reasoning".into(), "tools".into(), "thinking".into()],
-            quants: vec![
-                bw("Qwen3.5-4B-GGUF", "Qwen3.5-4B-Q4_K_M.gguf", "Q4_K_M", 2.5),
-                bw("Qwen3.5-4B-GGUF", "Qwen3.5-4B-Q8_0.gguf", "Q8_0", 4.3),
-            ],
-        },
-        HubModel {
-            id: "qwen3.5-8b".into(),
-            name: "Qwen3.5-8B".into(),
-            family: "Qwen3.5".into(),
-            params: "8B".into(),
-            description: "Qwen3.5 8B — strong reasoning, coding, multilingual. Recommended daily driver for 8GB+ VRAM.".into(),
-            tags: vec!["reasoning".into(), "tools".into(), "thinking".into()],
-            quants: vec![
-                bw("Qwen3.5-8B-GGUF", "Qwen3.5-8B-Q4_K_M.gguf", "Q4_K_M", 4.9),
-                bw("Qwen3.5-8B-GGUF", "Qwen3.5-8B-Q8_0.gguf", "Q8_0", 8.5),
-            ],
-        },
-        HubModel {
-            id: "qwen3.5-14b".into(),
-            name: "Qwen3.5-14B".into(),
-            family: "Qwen3.5".into(),
-            params: "14B".into(),
-            description: "Qwen3.5 14B — near-frontier quality for coding, reasoning, and agentic tasks. Needs 12GB+ VRAM.".into(),
-            tags: vec!["reasoning".into(), "tools".into(), "thinking".into()],
-            quants: vec![
-                bw("Qwen3.5-14B-GGUF", "Qwen3.5-14B-Q4_K_M.gguf", "Q4_K_M", 8.6),
-                bw("Qwen3.5-14B-GGUF", "Qwen3.5-14B-Q8_0.gguf", "Q8_0", 14.7),
-            ],
-        },
-        HubModel {
-            id: "qwen3.5-32b".into(),
-            name: "Qwen3.5-32B".into(),
-            family: "Qwen3.5".into(),
-            params: "32B".into(),
-            description: "Qwen3.5 32B — flagship dense model. Exceptional coding and reasoning. Needs 24GB+ VRAM.".into(),
-            tags: vec!["reasoning".into(), "tools".into(), "thinking".into()],
-            quants: vec![
-                bw("Qwen3.5-32B-GGUF", "Qwen3.5-32B-Q4_K_M.gguf", "Q4_K_M", 19.4),
-                bw("Qwen3.5-32B-GGUF", "Qwen3.5-32B-IQ4_XS.gguf", "IQ4_XS", 17.0),
-            ],
-        },
-        HubModel {
-            id: "qwen3.5-30b-a3b".into(),
-            name: "Qwen3.5-30B-A3B".into(),
-            family: "Qwen3.5".into(),
-            params: "30B MoE (3.5B active)".into(),
-            description: "Qwen3.5 MoE — 30B total, 3.5B active. Near 30B quality at ~4B inference cost. 262K context.".into(),
-            tags: vec!["reasoning".into(), "tools".into(), "thinking".into(), "moe".into()],
-            quants: vec![
-                bw("Qwen3.5-30B-A3B-GGUF", "Qwen3.5-30B-A3B-Q4_K_M.gguf", "Q4_K_M", 17.5),
-                bw("Qwen3.5-30B-A3B-GGUF", "Qwen3.5-30B-A3B-IQ4_XS.gguf", "IQ4_XS", 15.0),
-            ],
-        },
-        // ── Qwen3 ────────────────────────────────────────────────────────────
-        HubModel {
-            id: "qwen3-0.6b".into(),
-            name: "Qwen3-0.6B".into(),
-            family: "Qwen3".into(),
-            params: "0.6B".into(),
-            description: "Qwen3 0.6B — tiny reasoning model with thinking mode. Ideal for constrained environments.".into(),
-            tags: vec!["reasoning".into(), "tools".into(), "thinking".into()],
-            quants: vec![
-                bw("Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q4_K_M.gguf", "Q4_K_M", 0.52),
-                bw("Qwen3-0.6B-GGUF", "Qwen3-0.6B-Q8_0.gguf", "Q8_0", 0.72),
-            ],
-        },
-        HubModel {
-            id: "qwen3-4b".into(),
-            name: "Qwen3-4B".into(),
-            family: "Qwen3".into(),
-            params: "4B".into(),
-            description: "Qwen3 4B — punches above its weight for coding and reasoning. Popular daily driver.".into(),
-            tags: vec!["reasoning".into(), "tools".into(), "thinking".into()],
-            quants: vec![
-                bw("Qwen3-4B-GGUF", "Qwen3-4B-Q4_K_M.gguf", "Q4_K_M", 2.5),
-                bw("Qwen3-4B-GGUF", "Qwen3-4B-Q8_0.gguf", "Q8_0", 4.3),
-            ],
-        },
-        HubModel {
-            id: "qwen3-8b".into(),
-            name: "Qwen3-8B".into(),
-            family: "Qwen3".into(),
-            params: "8B".into(),
-            description: "Qwen3 8B — best-in-class 8B reasoning model. Highly recommended for 8GB VRAM.".into(),
-            tags: vec!["reasoning".into(), "tools".into(), "thinking".into()],
-            quants: vec![
-                bw("Qwen3-8B-GGUF", "Qwen3-8B-Q4_K_M.gguf", "Q4_K_M", 5.2),
-                bw("Qwen3-8B-GGUF", "Qwen3-8B-Q8_0.gguf", "Q8_0", 8.5),
-            ],
-        },
-        HubModel {
-            id: "qwen3-14b".into(),
-            name: "Qwen3-14B".into(),
-            family: "Qwen3".into(),
-            params: "14B".into(),
-            description: "Qwen3 14B — excellent instruction following, coding, and multilingual capabilities.".into(),
-            tags: vec!["reasoning".into(), "tools".into(), "thinking".into()],
-            quants: vec![
-                bw("Qwen3-14B-GGUF", "Qwen3-14B-Q4_K_M.gguf", "Q4_K_M", 8.6),
-                bw("Qwen3-14B-GGUF", "Qwen3-14B-Q8_0.gguf", "Q8_0", 14.7),
-            ],
-        },
-        HubModel {
-            id: "qwen3-32b".into(),
-            name: "Qwen3-32B".into(),
-            family: "Qwen3".into(),
-            params: "32B".into(),
-            description: "Qwen3 32B — top open-source reasoning model. Matches frontier models on coding benchmarks.".into(),
-            tags: vec!["reasoning".into(), "tools".into(), "thinking".into()],
-            quants: vec![
-                bw("Qwen3-32B-GGUF", "Qwen3-32B-Q4_K_M.gguf", "Q4_K_M", 19.4),
-                bw("Qwen3-32B-GGUF", "Qwen3-32B-IQ4_XS.gguf", "IQ4_XS", 17.0),
-            ],
-        },
-        HubModel {
-            id: "qwen3-30b-a3b".into(),
-            name: "Qwen3-30B-A3B".into(),
-            family: "Qwen3".into(),
-            params: "30B MoE (3B active)".into(),
-            description: "Qwen3 MoE — 30B parameters, 3B active. Best efficiency for reasoning at low inference cost.".into(),
-            tags: vec!["reasoning".into(), "tools".into(), "thinking".into(), "moe".into()],
-            quants: vec![
-                bw("Qwen3-30B-A3B-GGUF", "Qwen3-30B-A3B-Q4_K_M.gguf", "Q4_K_M", 17.5),
-            ],
-        },
-        // ── Llama 3.x ────────────────────────────────────────────────────────
-        HubModel {
-            id: "llama-3.2-1b".into(),
-            name: "Llama 3.2 1B".into(),
-            family: "Llama3".into(),
-            params: "1B".into(),
-            description: "Meta's smallest Llama 3.2. 128K context. Fast and lightweight for simple tasks.".into(),
-            tags: vec!["chat".into()],
-            quants: vec![
-                bw("Llama-3.2-1B-Instruct-GGUF", "Llama-3.2-1B-Instruct-Q4_K_M.gguf", "Q4_K_M", 0.77),
-                bw("Llama-3.2-1B-Instruct-GGUF", "Llama-3.2-1B-Instruct-Q8_0.gguf", "Q8_0", 1.32),
-            ],
-        },
-        HubModel {
-            id: "llama-3.2-3b".into(),
-            name: "Llama 3.2 3B".into(),
-            family: "Llama3".into(),
-            params: "3B".into(),
-            description: "Meta's Llama 3.2 3B. 128K context. Strong instruction following and tool use for its size.".into(),
-            tags: vec!["chat".into(), "tools".into()],
-            quants: vec![
-                bw("Llama-3.2-3B-Instruct-GGUF", "Llama-3.2-3B-Instruct-Q4_K_M.gguf", "Q4_K_M", 1.9),
-                bw("Llama-3.2-3B-Instruct-GGUF", "Llama-3.2-3B-Instruct-Q8_0.gguf", "Q8_0", 3.2),
-            ],
-        },
-        HubModel {
-            id: "llama-3.1-8b".into(),
-            name: "Llama 3.1 8B".into(),
-            family: "Llama3".into(),
-            params: "8B".into(),
-            description: "Meta's Llama 3.1 8B Instruct. 128K context. Excellent for chat, coding, and function calling.".into(),
-            tags: vec!["chat".into(), "tools".into()],
-            quants: vec![
-                bw("Meta-Llama-3.1-8B-Instruct-GGUF", "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf", "Q4_K_M", 4.9),
-                bw("Meta-Llama-3.1-8B-Instruct-GGUF", "Meta-Llama-3.1-8B-Instruct-Q8_0.gguf", "Q8_0", 8.5),
-            ],
-        },
-        HubModel {
-            id: "llama-3.3-70b".into(),
-            name: "Llama 3.3 70B".into(),
-            family: "Llama3".into(),
-            params: "70B".into(),
-            description: "Meta's best open Llama. 128K context. Competitive with GPT-4 class models. Needs 40GB+ VRAM.".into(),
-            tags: vec!["chat".into(), "tools".into()],
-            quants: vec![
-                bw("Llama-3.3-70B-Instruct-GGUF", "Llama-3.3-70B-Instruct-Q4_K_M.gguf", "Q4_K_M", 42.5),
-                bw("Llama-3.3-70B-Instruct-GGUF", "Llama-3.3-70B-Instruct-IQ4_XS.gguf", "IQ4_XS", 37.0),
-            ],
-        },
-        // ── DeepSeek R1 ──────────────────────────────────────────────────────
-        HubModel {
-            id: "deepseek-r1-distill-7b".into(),
-            name: "DeepSeek-R1 Distill 7B".into(),
-            family: "DeepSeekR1".into(),
-            params: "7B".into(),
-            description: "DeepSeek R1 distilled into Qwen 7B. Always reasons before answering. Exceptional for math, coding, and logic.".into(),
-            tags: vec!["reasoning".into(), "thinking".into(), "math".into()],
-            quants: vec![
-                bw("DeepSeek-R1-Distill-Qwen-7B-GGUF", "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf", "Q4_K_M", 4.7),
-                bw("DeepSeek-R1-Distill-Qwen-7B-GGUF", "DeepSeek-R1-Distill-Qwen-7B-Q8_0.gguf", "Q8_0", 7.9),
-            ],
-        },
-        HubModel {
-            id: "deepseek-r1-distill-14b".into(),
-            name: "DeepSeek-R1 Distill 14B".into(),
-            family: "DeepSeekR1".into(),
-            params: "14B".into(),
-            description: "DeepSeek R1 distilled into Qwen 14B. Best-in-class 14B reasoning. Outstanding for math and proofs.".into(),
-            tags: vec!["reasoning".into(), "thinking".into(), "math".into()],
-            quants: vec![
-                bw("DeepSeek-R1-Distill-Qwen-14B-GGUF", "DeepSeek-R1-Distill-Qwen-14B-Q4_K_M.gguf", "Q4_K_M", 8.9),
-                bw("DeepSeek-R1-Distill-Qwen-14B-GGUF", "DeepSeek-R1-Distill-Qwen-14B-Q8_0.gguf", "Q8_0", 15.1),
-            ],
-        },
-        HubModel {
-            id: "deepseek-r1-distill-32b".into(),
-            name: "DeepSeek-R1 Distill 32B".into(),
-            family: "DeepSeekR1".into(),
-            params: "32B".into(),
-            description: "DeepSeek R1 distilled into Qwen 32B. Near full R1 quality. Needs 24GB VRAM.".into(),
-            tags: vec!["reasoning".into(), "thinking".into(), "math".into()],
-            quants: vec![
-                bw("DeepSeek-R1-Distill-Qwen-32B-GGUF", "DeepSeek-R1-Distill-Qwen-32B-Q4_K_M.gguf", "Q4_K_M", 19.4),
-                bw("DeepSeek-R1-Distill-Qwen-32B-GGUF", "DeepSeek-R1-Distill-Qwen-32B-IQ4_XS.gguf", "IQ4_XS", 17.0),
-            ],
-        },
-        // ── Phi ──────────────────────────────────────────────────────────────
-        HubModel {
-            id: "phi-4".into(),
-            name: "Phi-4".into(),
-            family: "Phi".into(),
-            params: "14B".into(),
-            description: "Microsoft's Phi-4. 128K context. Exceptional reasoning per parameter. Best Phi yet.".into(),
-            tags: vec!["reasoning".into(), "chat".into(), "tools".into()],
-            quants: vec![
-                bw("phi-4-GGUF", "phi-4-Q4_K_M.gguf", "Q4_K_M", 8.5),
-                bw("phi-4-GGUF", "phi-4-Q8_0.gguf", "Q8_0", 14.7),
-            ],
-        },
-        HubModel {
-            id: "phi-4-mini".into(),
-            name: "Phi-4 Mini".into(),
-            family: "Phi".into(),
-            params: "3.8B".into(),
-            description: "Microsoft's compact Phi-4 Mini. 128K context. Impressive reasoning for a 4B scale model.".into(),
-            tags: vec!["reasoning".into(), "chat".into()],
-            quants: vec![
-                bw("Phi-4-mini-instruct-GGUF", "Phi-4-mini-instruct-Q4_K_M.gguf", "Q4_K_M", 2.3),
-                bw("Phi-4-mini-instruct-GGUF", "Phi-4-mini-instruct-Q8_0.gguf", "Q8_0", 4.0),
-            ],
-        },
-        // ── Mistral ──────────────────────────────────────────────────────────
-        HubModel {
-            id: "mistral-7b-v0.3".into(),
-            name: "Mistral 7B v0.3".into(),
-            family: "Mistral".into(),
-            params: "7B".into(),
-            description: "Mistral's classic 7B instruct. 32K context. Fast, reliable, great for tool use.".into(),
-            tags: vec!["chat".into(), "tools".into()],
-            quants: vec![
-                bw("Mistral-7B-Instruct-v0.3-GGUF", "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf", "Q4_K_M", 4.4),
-                bw("Mistral-7B-Instruct-v0.3-GGUF", "Mistral-7B-Instruct-v0.3-Q8_0.gguf", "Q8_0", 7.7),
-            ],
-        },
-        HubModel {
-            id: "mistral-nemo".into(),
-            name: "Mistral Nemo 12B".into(),
-            family: "Mistral".into(),
-            params: "12B".into(),
-            description: "Mistral Nemo 12B. 128K context. Best Mistral instruct — strong coding and chat.".into(),
-            tags: vec!["chat".into(), "tools".into()],
-            quants: vec![
-                bw("Mistral-Nemo-Instruct-2407-GGUF", "Mistral-Nemo-Instruct-2407-Q4_K_M.gguf", "Q4_K_M", 7.1),
-                bw("Mistral-Nemo-Instruct-2407-GGUF", "Mistral-Nemo-Instruct-2407-Q8_0.gguf", "Q8_0", 12.3),
-            ],
-        },
-    ]
-}
-
-// ─── HuggingFace live search ──────────────────────────────────────────────────
+// Hugging Face live search metadata returned by the public model API.
 
 #[derive(Debug, serde::Deserialize)]
 struct HfSibling {
@@ -355,6 +49,12 @@ struct HfApiModel {
     downloads: u64,
     #[serde(default)]
     tags: Vec<String>,
+    #[serde(default)]
+    private: bool,
+    #[serde(default)]
+    disabled: bool,
+    #[serde(default)]
+    gated: Option<serde_json::Value>,
     #[serde(default)]
     siblings: Vec<HfSibling>,
 }
@@ -379,7 +79,59 @@ fn extract_quant(filename: &str) -> String {
         .to_uppercase()
 }
 
+fn format_downloads(downloads: u64) -> String {
+    let value = downloads.to_string();
+    let mut grouped = String::with_capacity(value.len() + value.len() / 3);
+
+    for (index, ch) in value.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+
+    grouped.chars().rev().collect()
+}
+
+fn is_hf_downloadable(model: &HfApiModel) -> bool {
+    if model.private || model.disabled {
+        return false;
+    }
+
+    match &model.gated {
+        None => true,
+        Some(serde_json::Value::Bool(false)) => true,
+        Some(serde_json::Value::Null) => true,
+        _ => false,
+    }
+}
+
+fn is_hf_featured_candidate(model: &HfApiModel) -> bool {
+    let id = model.model_id.to_lowercase();
+    if id.contains("models-moved") || id.contains("embed") || id.contains("embedding") {
+        return false;
+    }
+
+    let blocked_tags = [
+        "sentence-transformers",
+        "bert",
+        "feature-extraction",
+        "onnx",
+        "openvino",
+        "reranker",
+    ];
+
+    !model.tags.iter().any(|tag| {
+        let lowered = tag.to_lowercase();
+        blocked_tags.contains(&lowered.as_str())
+    })
+}
+
 fn hf_api_to_hub(m: HfApiModel) -> Option<HubModel> {
+    if !is_hf_downloadable(&m) {
+        return None;
+    }
+
     let gguf_files: Vec<&HfSibling> = m
         .siblings
         .iter()
@@ -389,7 +141,7 @@ fn hf_api_to_hub(m: HfApiModel) -> Option<HubModel> {
         return None;
     }
 
-    let quants: Vec<HubQuant> = gguf_files
+    let mut quants: Vec<HubQuant> = gguf_files
         .iter()
         .map(|s| HubQuant {
             quant: extract_quant(&s.rfilename),
@@ -401,14 +153,12 @@ fn hf_api_to_hub(m: HfApiModel) -> Option<HubModel> {
             filename: s.rfilename.clone(),
         })
         .collect();
+    quants.sort_by(|left, right| left.size_gb.total_cmp(&right.size_gb));
 
-    let name = m
-        .model_id
-        .split('/')
-        .last()
-        .unwrap_or(&m.model_id)
-        .replace('-', " ")
-        .replace('_', " ");
+    let mut parts = m.model_id.split('/');
+    let owner = parts.next().unwrap_or("HuggingFace");
+    let repo_name = parts.next().unwrap_or(&m.model_id);
+    let name = repo_name.replace('-', " ").replace('_', " ");
 
     let tags: Vec<String> = m
         .tags
@@ -420,36 +170,40 @@ fn hf_api_to_hub(m: HfApiModel) -> Option<HubModel> {
     Some(HubModel {
         id: m.model_id.clone(),
         name,
-        family: "HuggingFace".into(),
+        family: owner.to_string(),
         params: String::new(),
-        description: format!("{:>10} downloads · {}", m.downloads, m.model_id),
+        description: format!("{} downloads | {}", format_downloads(m.downloads), m.model_id),
         tags,
         quants,
     })
 }
 
-/// Search HuggingFace for GGUF models. Returns up to 20 results sorted by downloads.
-/// `offset` is the number of results to skip (for pagination).
-#[tauri::command]
-pub async fn search_hub_models(query: String, offset: u32) -> Result<Vec<HubModel>, String> {
+async fn fetch_hub_models(
+    query: Option<&str>,
+    offset: u32,
+    limit: u32,
+    featured_only: bool,
+) -> Result<Vec<HubModel>, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("InferenceBridge/1.0")
         .build()
         .map_err(|e| e.to_string())?;
 
-    let offset_str = offset.to_string();
-    let resp = client
-        .get("https://huggingface.co/api/models")
-        .query(&[
-            ("filter", "gguf"),
-            ("search", query.as_str()),
-            ("sort", "downloads"),
-            ("direction", "-1"),
-            ("limit", "20"),
-            ("offset", offset_str.as_str()),
-            ("full", "true"),
-        ])
+    let mut req = client.get("https://huggingface.co/api/models").query(&[
+        ("filter", "gguf".to_string()),
+        ("sort", "downloads".to_string()),
+        ("direction", "-1".to_string()),
+        ("limit", limit.to_string()),
+        ("offset", offset.to_string()),
+        ("full", "true".to_string()),
+    ]);
+
+    if let Some(query) = query.map(str::trim).filter(|value| !value.is_empty()) {
+        req = req.query(&[("search", query.to_string())]);
+    }
+
+    let resp = req
         .send()
         .await
         .map_err(|e| format!("HuggingFace request failed: {e}"))?;
@@ -463,22 +217,91 @@ pub async fn search_hub_models(query: String, offset: u32) -> Result<Vec<HubMode
         .await
         .map_err(|e| format!("Failed to parse HuggingFace response: {e}"))?;
 
-    Ok(models.into_iter().filter_map(hf_api_to_hub).collect())
+    Ok(models
+        .into_iter()
+        .filter(|model| !featured_only || is_hf_featured_candidate(model))
+        .filter_map(hf_api_to_hub)
+        .collect())
 }
 
-// ─── Download progress event ──────────────────────────────────────────────────
+/// Search HuggingFace for GGUF models. Returns up to 20 results sorted by downloads.
+/// `offset` is the number of results to skip (for pagination).
+#[tauri::command]
+pub async fn search_hub_models(query: String, offset: u32) -> Result<Vec<HubModel>, String> {
+    fetch_hub_models(Some(&query), offset, 20, false).await
+}
 
-#[derive(Clone, Serialize)]
+// Download progress event payload emitted during model downloads.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadProgress {
+    pub id: String,
     pub filename: String,
+    pub dest_path: Option<String>,
     pub downloaded_bytes: u64,
     pub total_bytes: u64,
     pub percent: f32,
     pub done: bool,
+    pub status: String,
     pub error: Option<String>,
 }
 
-// ─── Tauri commands ───────────────────────────────────────────────────────────
+// Tauri commands for browsing, downloading, and deleting models.
+
+fn sanitize_download_subpath(filename: &str) -> Result<PathBuf, String> {
+    let mut sanitized = PathBuf::new();
+
+    for component in std::path::Path::new(filename).components() {
+        match component {
+            Component::Normal(segment) => sanitized.push(segment),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("Invalid model path from Hugging Face: {filename}"));
+            }
+        }
+    }
+
+    if sanitized.as_os_str().is_empty() {
+        return Err("Hugging Face returned an empty model path".to_string());
+    }
+
+    Ok(sanitized)
+}
+
+async fn upsert_download(
+    state: &SharedState,
+    progress: DownloadProgress,
+    cancel_token: Option<CancellationToken>,
+) {
+    let mut s = state.write().await;
+    if let Some(existing) = s.active_downloads.get_mut(&progress.id) {
+        existing.progress = progress;
+        if let Some(token) = cancel_token {
+            existing.cancel_token = token;
+        }
+        return;
+    }
+
+    if let Some(token) = cancel_token {
+        s.active_downloads.insert(
+            progress.id.clone(),
+            crate::state::ActiveDownload {
+                progress,
+                cancel_token: token,
+            },
+        );
+    }
+}
+
+async fn emit_download_progress(
+    app: &tauri::AppHandle,
+    state: &SharedState,
+    progress: DownloadProgress,
+    cancel_token: Option<CancellationToken>,
+) {
+    upsert_download(state, progress.clone(), cancel_token).await;
+    let _ = app.emit("model-download-progress", progress);
+}
 
 /// Open the containing folder for a path in the native file manager.
 /// On Windows, selects the file itself in Explorer.
@@ -514,10 +337,61 @@ pub async fn show_in_folder(path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Return the curated model catalog (synchronous, no I/O).
+/// Return popular Hugging Face GGUF models for the Browse tab.
 #[tauri::command]
-pub async fn list_hub_models() -> Vec<HubModel> {
-    catalog()
+pub async fn list_hub_models() -> Result<Vec<HubModel>, String> {
+    fetch_hub_models(None, 0, 80, true).await
+}
+
+#[tauri::command]
+pub async fn list_downloads(
+    state: tauri::State<'_, SharedState>,
+) -> Result<Vec<DownloadProgress>, String> {
+    let s = state.read().await;
+    let mut items: Vec<DownloadProgress> = s
+        .active_downloads
+        .values()
+        .map(|entry| entry.progress.clone())
+        .collect();
+    items.sort_by(|left, right| {
+        left.done
+            .cmp(&right.done)
+            .then_with(|| left.filename.cmp(&right.filename))
+    });
+    Ok(items)
+}
+
+#[tauri::command]
+pub async fn cancel_download(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+    id: String,
+) -> Result<(), String> {
+    let progress = {
+        let mut s = state.write().await;
+        let entry = s
+            .active_downloads
+            .get_mut(&id)
+            .ok_or_else(|| "Download not found.".to_string())?;
+        if entry.progress.done {
+            return Ok(());
+        }
+        entry.cancel_token.cancel();
+        entry.progress.status = "Cancelling".to_string();
+        entry.progress.clone()
+    };
+
+    let _ = app.emit("model-download-progress", progress);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn clear_completed_downloads(
+    state: tauri::State<'_, SharedState>,
+) -> Result<(), String> {
+    let mut s = state.write().await;
+    s.active_downloads.retain(|_, entry| !entry.progress.done);
+    Ok(())
 }
 
 /// Stream-download a GGUF file into the first configured scan directory.
@@ -529,13 +403,15 @@ pub async fn download_hub_model(
     url: String,
     filename: String,
 ) -> Result<String, String> {
+    let relative_path = sanitize_download_subpath(&filename)?;
+    let download_id = url.clone();
     let dest_dir: std::path::PathBuf = {
         let s = state.read().await;
         match s.config.models.scan_dirs.first() {
             Some(d) => std::path::PathBuf::from(d),
             None => {
                 return Err(
-                    "No model directory configured. Add one in Settings → Model Directories."
+                    "No model directory configured. Add one in Settings > Model Directories."
                         .to_string(),
                 )
             }
@@ -546,93 +422,202 @@ pub async fn download_hub_model(
         .await
         .map_err(|e| format!("Cannot create {}: {e}", dest_dir.display()))?;
 
-    let dest_path = dest_dir.join(&filename);
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(7200)) // 2-hour ceiling for large models
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("Download request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!(
-            "Server returned HTTP {} for {}",
-            resp.status(),
-            url
-        ));
+    let dest_path = dest_dir.join(&relative_path);
+    if let Some(parent) = dest_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("Cannot create {}: {e}", parent.display()))?;
     }
 
-    let total_bytes = resp.content_length().unwrap_or(0);
-    let mut file = tokio::fs::File::create(&dest_path)
-        .await
-        .map_err(|e| format!("Cannot create {}: {e}", dest_path.display()))?;
-
-    let mut stream = resp.bytes_stream();
-    let mut downloaded: u64 = 0;
-    let mut last_emit = std::time::Instant::now();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Download error: {e}"))?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("Write error: {e}"))?;
-        downloaded += chunk.len() as u64;
-
-        if last_emit.elapsed().as_millis() >= 250 {
-            let percent = if total_bytes > 0 {
-                downloaded as f32 / total_bytes as f32
-            } else {
-                0.0
-            };
-            let _ = app.emit(
-                "model-download-progress",
-                DownloadProgress {
-                    filename: filename.clone(),
-                    downloaded_bytes: downloaded,
-                    total_bytes,
-                    percent,
-                    done: false,
-                    error: None,
-                },
-            );
-            last_emit = std::time::Instant::now();
+    {
+        let s = state.read().await;
+        if let Some(existing) = s.active_downloads.get(&download_id) {
+            if !existing.progress.done {
+                return Err(format!("Download already in progress for {}", existing.progress.filename));
+            }
         }
     }
 
-    file.flush()
-        .await
-        .map_err(|e| format!("Flush error: {e}"))?;
-    drop(file);
-
-    // Rescan so the new model appears immediately in the registry and UI
-    {
-        let s = state.read().await;
-        let dirs = s.config.models.scan_dirs.clone();
-        drop(s);
-        let scanned = tokio::task::spawn_blocking(move || crate::models::scanner::scan_all(&dirs))
-            .await
-            .unwrap_or_default();
-        state.write().await.model_registry.update(scanned);
-    }
-
-    let _ = app.emit(
-        "model-download-progress",
+    let cancel_token = CancellationToken::new();
+    let dest_path_string = dest_path.to_string_lossy().to_string();
+    emit_download_progress(
+        &app,
+        state.inner(),
         DownloadProgress {
+            id: download_id.clone(),
             filename: filename.clone(),
-            downloaded_bytes: downloaded,
-            total_bytes,
-            percent: 1.0,
-            done: true,
+            dest_path: Some(dest_path_string.clone()),
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            percent: 0.0,
+            done: false,
+            status: "Starting".to_string(),
             error: None,
         },
-    );
+        Some(cancel_token.clone()),
+    )
+    .await;
 
-    Ok(dest_path.to_string_lossy().to_string())
+    let result: Result<String, String> = async {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(7200)) // 2-hour ceiling for large models
+            .user_agent("InferenceBridge/1.0")
+            .build()
+            .map_err(|e| e.to_string())?;
+
+        let resp = client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "application/octet-stream")
+            .send()
+            .await
+            .map_err(|e| format!("Download request failed: {e}"))?;
+
+        if !resp.status().is_success() {
+            return Err(format!(
+                "Server returned HTTP {} for {}",
+                resp.status(),
+                url
+            ));
+        }
+
+        let total_bytes = resp.content_length().unwrap_or(0);
+        let mut file = tokio::fs::File::create(&dest_path)
+            .await
+            .map_err(|e| format!("Cannot create {}: {e}", dest_path.display()))?;
+
+        let mut stream = resp.bytes_stream();
+        let mut downloaded: u64 = 0;
+        let mut last_emit = std::time::Instant::now();
+        let mut cancelled = false;
+
+        while let Some(chunk) = tokio::select! {
+            _ = cancel_token.cancelled() => {
+                cancelled = true;
+                None
+            }
+            chunk = stream.next() => chunk
+        } {
+            let chunk = chunk.map_err(|e| format!("Download error: {e}"))?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| format!("Write error: {e}"))?;
+            downloaded += chunk.len() as u64;
+
+            if last_emit.elapsed().as_millis() >= 250 {
+                let percent = if total_bytes > 0 {
+                    downloaded as f32 / total_bytes as f32
+                } else {
+                    0.0
+                };
+                emit_download_progress(
+                    &app,
+                    state.inner(),
+                    DownloadProgress {
+                        id: download_id.clone(),
+                        filename: filename.clone(),
+                        dest_path: Some(dest_path_string.clone()),
+                        downloaded_bytes: downloaded,
+                        total_bytes,
+                        percent,
+                        done: false,
+                        status: "Downloading".to_string(),
+                        error: None,
+                    },
+                    None,
+                )
+                .await;
+                last_emit = std::time::Instant::now();
+            }
+        }
+
+        if cancelled {
+            drop(file);
+            let _ = tokio::fs::remove_file(&dest_path).await;
+            emit_download_progress(
+                &app,
+                state.inner(),
+                DownloadProgress {
+                    id: download_id.clone(),
+                    filename: filename.clone(),
+                    dest_path: Some(dest_path_string.clone()),
+                    downloaded_bytes: downloaded,
+                    total_bytes,
+                    percent: if total_bytes > 0 {
+                        downloaded as f32 / total_bytes as f32
+                    } else {
+                        0.0
+                    },
+                    done: true,
+                    status: "Cancelled".to_string(),
+                    error: None,
+                },
+                None,
+            )
+            .await;
+            return Err("Download cancelled".to_string());
+        }
+
+        file.flush()
+            .await
+            .map_err(|e| format!("Flush error: {e}"))?;
+        drop(file);
+
+        {
+            let s = state.read().await;
+            let dirs = s.config.models.scan_dirs.clone();
+            drop(s);
+            let scanned = tokio::task::spawn_blocking(move || crate::models::scanner::scan_all(&dirs))
+                .await
+                .unwrap_or_default();
+            state.write().await.model_registry.update(scanned);
+        }
+
+        emit_download_progress(
+            &app,
+            state.inner(),
+            DownloadProgress {
+                id: download_id.clone(),
+                filename: filename.clone(),
+                dest_path: Some(dest_path_string.clone()),
+                downloaded_bytes: downloaded,
+                total_bytes,
+                percent: 1.0,
+                done: true,
+                status: "Completed".to_string(),
+                error: None,
+            },
+            None,
+        )
+        .await;
+
+        Ok(dest_path.to_string_lossy().to_string())
+    }
+    .await;
+
+    if let Err(error) = &result {
+        if error != "Download cancelled" {
+            let _ = tokio::fs::remove_file(&dest_path).await;
+            emit_download_progress(
+                &app,
+                state.inner(),
+                DownloadProgress {
+                    id: download_id,
+                    filename,
+                    dest_path: Some(dest_path_string),
+                    downloaded_bytes: 0,
+                    total_bytes: 0,
+                    percent: 0.0,
+                    done: true,
+                    status: "Failed".to_string(),
+                    error: Some(error.clone()),
+                },
+                None,
+            )
+            .await;
+        }
+    }
+
+    result
 }
 
 /// Delete a local .gguf file and refresh the model registry.
@@ -669,3 +654,24 @@ pub async fn delete_model_file(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_download_subpath;
+    use std::path::PathBuf;
+
+    #[test]
+    fn allows_nested_repo_paths() {
+        let path = sanitize_download_subpath("BF16/Qwen3.5-27B-BF16-00001-of-00002.gguf").unwrap();
+        assert_eq!(
+            path,
+            PathBuf::from("BF16").join("Qwen3.5-27B-BF16-00001-of-00002.gguf")
+        );
+    }
+
+    #[test]
+    fn rejects_parent_traversal() {
+        assert!(sanitize_download_subpath("../escape.gguf").is_err());
+    }
+}
+
