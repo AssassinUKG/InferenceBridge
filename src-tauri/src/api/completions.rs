@@ -4,7 +4,7 @@ use axum::response::{IntoResponse, Json, Response};
 use serde::{Deserialize, Serialize};
 
 use crate::api::errors::ApiErrorResponse;
-use crate::engine::client::{CompletionRequest, LlamaClient};
+use crate::engine::client::{CompletionRequest, ImageData, LlamaClient};
 use crate::engine::streaming::{self, StreamEvent};
 use crate::models::profiles::ModelProfile;
 use crate::state::{GenerationRequest, SharedState};
@@ -15,6 +15,7 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ApiMessage>,
     #[serde(default)]
     pub stream: bool,
+    #[serde(alias = "max_completion_tokens")]
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
@@ -30,7 +31,53 @@ pub struct ChatCompletionRequest {
 #[derive(Debug, Deserialize)]
 pub struct ApiMessage {
     pub role: String,
-    pub content: Option<String>,
+    #[serde(default)]
+    pub content: Option<ApiMessageContent>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub refusal: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum ApiMessageContent {
+    Text(String),
+    Parts(Vec<ApiContentPart>),
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ApiContentPart {
+    Text { text: String },
+    InputText { text: String },
+    ImageUrl { image_url: ApiImageUrl },
+    InputImage {
+        #[serde(default)]
+        image_url: Option<ApiImageUrl>,
+        #[serde(default)]
+        image_base64: Option<String>,
+    },
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum ApiImageUrl {
+    String(String),
+    Object { url: String },
+}
+
+impl ApiImageUrl {
+    fn into_url(self) -> String {
+        match self {
+            ApiImageUrl::String(url) => url,
+            ApiImageUrl::Object { url } => url,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -163,26 +210,156 @@ async fn resolve_loaded_model(
     s.loaded_model.clone().ok_or_else(ApiErrorResponse::no_model)
 }
 
+fn normalize_image_payload(value: &str) -> Result<String, ApiErrorResponse> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(ApiErrorResponse::bad_request(
+            "Image content parts must not be empty.",
+        ));
+    }
+
+    if trimmed.starts_with("data:") {
+        return trimmed
+            .split_once(',')
+            .map(|(_, data)| data.to_string())
+            .ok_or_else(|| {
+                ApiErrorResponse::bad_request(
+                    "Image data URLs must include a base64 payload after the comma.",
+                )
+            });
+    }
+
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Err(ApiErrorResponse::bad_request(
+            "Remote image URLs are not supported yet. Send image_url as a base64 data URL or raw base64.",
+        ));
+    }
+
+    Ok(trimmed.to_string())
+}
+
+fn normalize_api_messages(
+    messages: &[ApiMessage],
+) -> Result<(Vec<crate::templates::engine::ChatMessage>, Vec<ImageData>), ApiErrorResponse> {
+    let mut normalized = Vec::with_capacity(messages.len());
+    let mut image_data = Vec::new();
+    let mut next_image_id = 1u32;
+
+    for message in messages {
+        let mut content_parts = Vec::new();
+
+        match message.content.clone() {
+            None => {}
+            Some(ApiMessageContent::Text(text)) => {
+                if !text.is_empty() {
+                    content_parts.push(text);
+                }
+            }
+            Some(ApiMessageContent::Parts(parts)) => {
+                for part in parts {
+                    match part {
+                        ApiContentPart::Text { text } | ApiContentPart::InputText { text } => {
+                            if !text.is_empty() {
+                                content_parts.push(text);
+                            }
+                        }
+                        ApiContentPart::ImageUrl { image_url } => {
+                            let image_id = next_image_id;
+                            next_image_id += 1;
+                            content_parts.push(format!("[img-{image_id}]"));
+                            image_data.push(ImageData {
+                                data: normalize_image_payload(&image_url.into_url())?,
+                                id: image_id,
+                            });
+                        }
+                        ApiContentPart::InputImage {
+                            image_url,
+                            image_base64,
+                        } => {
+                            let raw = if let Some(image_base64) = image_base64 {
+                                normalize_image_payload(&image_base64)?
+                            } else if let Some(image_url) = image_url {
+                                normalize_image_payload(&image_url.into_url())?
+                            } else {
+                                return Err(ApiErrorResponse::bad_request(
+                                    "input_image parts require image_url or image_base64.",
+                                ));
+                            };
+                            let image_id = next_image_id;
+                            next_image_id += 1;
+                            content_parts.push(format!("[img-{image_id}]"));
+                            image_data.push(ImageData { data: raw, id: image_id });
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(name) = &message.name {
+            content_parts.insert(0, format!("[name:{name}]"));
+        }
+
+        if let Some(tool_call_id) = &message.tool_call_id {
+            content_parts.insert(0, format!("[tool_call_id:{tool_call_id}]"));
+        }
+
+        if let Some(refusal) = &message.refusal {
+            if !refusal.is_empty() {
+                content_parts.push(format!("[refusal]\n{refusal}"));
+            }
+        }
+
+        if let Some(tool_calls) = &message.tool_calls {
+            if !tool_calls.is_empty() {
+                let serialized = serde_json::to_string_pretty(tool_calls)
+                    .unwrap_or_else(|_| "[]".to_string());
+                content_parts.push(format!("[tool_calls]\n{serialized}"));
+            }
+        }
+
+        normalized.push(crate::templates::engine::ChatMessage {
+            role: message.role.clone(),
+            content: content_parts.join("\n"),
+        });
+    }
+
+    Ok((normalized, image_data))
+}
+
+fn prepend_tool_schema_message(
+    messages: &mut Vec<crate::templates::engine::ChatMessage>,
+    tools: Option<&Vec<serde_json::Value>>,
+) {
+    let Some(tools) = tools.filter(|tools| !tools.is_empty()) else {
+        return;
+    };
+
+    let serialized = serde_json::to_string_pretty(tools).unwrap_or_else(|_| "[]".to_string());
+    messages.insert(
+        0,
+        crate::templates::engine::ChatMessage {
+            role: "system".to_string(),
+            content: format!(
+                "Available tools (OpenAI-style schema):\n{serialized}\n\nIf a tool is needed, reply using the tool-calling format appropriate for your model family."
+            ),
+        },
+    );
+}
+
 fn build_chat_request(
     profile: &ModelProfile,
     req: ChatCompletionRequest,
     server_defaults: (&Option<f32>, &Option<f32>, &Option<i32>, &Option<u32>),
-) -> CompletionRequest {
-    let messages: Vec<crate::templates::engine::ChatMessage> = req
-        .messages
-        .iter()
-        .map(|message| crate::templates::engine::ChatMessage {
-            role: message.role.clone(),
-            content: message.content.clone().unwrap_or_default(),
-        })
-        .collect();
+) -> Result<CompletionRequest, ApiErrorResponse> {
+    let (mut messages, image_data) = normalize_api_messages(&req.messages)?;
+    prepend_tool_schema_message(&mut messages, req.tools.as_ref());
 
     let mut stop = profile.stop_markers.clone();
     if let Some(user_stop) = req.stop {
         stop.extend(user_stop.into_vec());
     }
 
-    CompletionRequest {
+    Ok(CompletionRequest {
         prompt: crate::templates::engine::render_prompt(&messages, profile),
         n_predict: req
             .max_tokens
@@ -203,8 +380,8 @@ fn build_chat_request(
         stream: req.stream,
         stop,
         special: true,
-        image_data: vec![],
-    }
+        image_data,
+    })
 }
 
 pub async fn chat_completions(
@@ -235,7 +412,13 @@ pub async fn chat_completions(
             &server_defaults.2,
             &server_defaults.3,
         ),
-    );
+    )?;
+
+    if !request.image_data.is_empty() && !profile.supports_vision {
+        return Err(ApiErrorResponse::bad_request(format!(
+            "The loaded model '{model_name}' does not advertise vision support. Load a vision-capable model first."
+        )));
+    }
 
     {
         let mut s = state.write().await;
@@ -330,6 +513,19 @@ async fn stream_chat_completion(
 
     let stream = async_stream::stream! {
         let mut raw_full_text = String::new();
+
+        let opening_chunk = serde_json::json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model_name,
+            "choices": [{
+                "index": 0,
+                "delta": { "role": "assistant" },
+                "finish_reason": serde_json::Value::Null
+            }]
+        });
+        yield Ok::<Event, std::convert::Infallible>(Event::default().data(opening_chunk.to_string()));
 
         while let Some(event) = rx.recv().await {
             match event {
@@ -540,4 +736,117 @@ pub async fn text_completions(
         },
     })
     .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_api_messages, ApiMessage, ChatCompletionRequest};
+
+    #[test]
+    fn deserializes_string_message_content() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "messages": [
+                    { "role": "user", "content": "hello" }
+                ]
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        assert_eq!(request.messages.len(), 1);
+    }
+
+    #[test]
+    fn deserializes_array_message_content() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            { "type": "text", "text": "hello" },
+                            { "type": "text", "text": "world" }
+                        ]
+                    }
+                ]
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        let (messages, image_data) = match normalize_api_messages(&request.messages) {
+            Ok(value) => value,
+            Err(_) => panic!("messages should normalize"),
+        };
+        assert_eq!(messages[0].content, "hello\nworld");
+        assert!(image_data.is_empty());
+    }
+
+    #[test]
+    fn normalizes_data_url_images() {
+        let messages = vec![ApiMessage {
+            role: "user".to_string(),
+            content: Some(serde_json::from_str(
+                r#"[
+                    { "type": "text", "text": "what is in this image?" },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }
+                ]"#,
+            )
+            .expect("content should deserialize")),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            refusal: None,
+        }];
+
+        let (normalized, image_data) = match normalize_api_messages(&messages) {
+            Ok(value) => value,
+            Err(_) => panic!("messages should normalize"),
+        };
+        assert!(normalized[0].content.contains("[img-1]"));
+        assert_eq!(image_data.len(), 1);
+        assert_eq!(image_data[0].data, "AAAA");
+    }
+
+    #[test]
+    fn supports_max_completion_tokens_alias() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "max_completion_tokens": 321,
+                "messages": [
+                    { "role": "user", "content": "hello" }
+                ]
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        assert_eq!(request.max_tokens, Some(321));
+    }
+
+    #[test]
+    fn preserves_tool_metadata_in_message_history() {
+        let messages = vec![ApiMessage {
+            role: "assistant".to_string(),
+            content: None,
+            name: Some("planner".to_string()),
+            tool_call_id: Some("call_123".to_string()),
+            tool_calls: Some(vec![serde_json::json!({
+                "id": "call_123",
+                "type": "function",
+                "function": {
+                    "name": "search_docs",
+                    "arguments": "{\"query\":\"qwen\"}"
+                }
+            })]),
+            refusal: None,
+        }];
+
+        let (normalized, _) = match normalize_api_messages(&messages) {
+            Ok(value) => value,
+            Err(_) => panic!("messages should normalize"),
+        };
+
+        assert!(normalized[0].content.contains("[name:planner]"));
+        assert!(normalized[0].content.contains("[tool_call_id:call_123]"));
+        assert!(normalized[0].content.contains("[tool_calls]"));
+    }
 }
