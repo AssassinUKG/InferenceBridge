@@ -42,6 +42,7 @@ impl SessionDb {
                 session_id  TEXT NOT NULL REFERENCES sessions(id),
                 role        TEXT NOT NULL,
                 content     TEXT,
+                image_base64 TEXT,
                 token_count INTEGER DEFAULT 0,
                 created_at  TEXT NOT NULL DEFAULT (datetime('now'))
             );
@@ -67,6 +68,18 @@ impl SessionDb {
             CREATE INDEX IF NOT EXISTS idx_tool_calls_message ON tool_calls(message_id);
             ",
         )?;
+        self.ensure_messages_image_column()?;
+        Ok(())
+    }
+
+    fn ensure_messages_image_column(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(messages)")?;
+        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let has_image_column = columns.filter_map(|col| col.ok()).any(|col| col == "image_base64");
+        if !has_image_column {
+            self.conn
+                .execute("ALTER TABLE messages ADD COLUMN image_base64 TEXT", [])?;
+        }
         Ok(())
     }
 
@@ -104,10 +117,11 @@ impl SessionDb {
         role: &str,
         content: &str,
         token_count: u32,
+        image_base64: Option<&str>,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO messages (session_id, role, content, token_count) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![session_id, role, content, token_count],
+            "INSERT INTO messages (session_id, role, content, image_base64, token_count) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![session_id, role, content, image_base64, token_count],
         )?;
         let msg_id = self.conn.last_insert_rowid();
         self.conn.execute(
@@ -120,15 +134,16 @@ impl SessionDb {
     /// Get all messages for a session, in order.
     pub fn get_messages(&self, session_id: &str) -> Result<Vec<MessageInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, role, content, token_count, created_at FROM messages WHERE session_id = ?1 ORDER BY id",
+            "SELECT id, role, content, image_base64, token_count, created_at FROM messages WHERE session_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map(rusqlite::params![session_id], |row| {
             Ok(MessageInfo {
                 id: row.get(0)?,
                 role: row.get(1)?,
                 content: row.get(2)?,
-                token_count: row.get(3)?,
-                created_at: row.get(4)?,
+                image_base64: row.get(3)?,
+                token_count: row.get(4)?,
+                created_at: row.get(5)?,
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -176,6 +191,7 @@ pub struct MessageInfo {
     pub id: i64,
     pub role: String,
     pub content: Option<String>,
+    pub image_base64: Option<String>,
     pub token_count: Option<u32>,
     pub created_at: String,
 }

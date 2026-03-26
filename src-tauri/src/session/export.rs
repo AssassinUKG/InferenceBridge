@@ -13,6 +13,7 @@ pub fn export_to_jsonl(db: &SessionDb, session_id: &str, output: &Path) -> Resul
         let json = serde_json::json!({
             "role": msg.role,
             "content": msg.content,
+            "image_base64": msg.image_base64,
             "token_count": msg.token_count,
             "created_at": msg.created_at,
         });
@@ -33,8 +34,9 @@ pub fn import_from_jsonl(db: &SessionDb, session_id: &str, input: &Path) -> Resu
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
             let role = json["role"].as_str().unwrap_or("user");
             let content = json["content"].as_str().unwrap_or("");
+            let image_base64 = json["image_base64"].as_str();
             let tokens = json["token_count"].as_u64().unwrap_or(0) as u32;
-            db.add_message(session_id, role, content, tokens)?;
+            db.add_message(session_id, role, content, tokens, image_base64)?;
             count += 1;
         }
     }
