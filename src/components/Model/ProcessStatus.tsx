@@ -51,6 +51,7 @@ export function ProcessStatus({ status, settings }: Props) {
   }
 
   const apiUrl = status.api_url ?? buildServerUrl(settings);
+  const apiReachable = status.api_reachable;
 
   return (
     <section className="rounded px-4 py-4" style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}>
@@ -67,8 +68,8 @@ export function ProcessStatus({ status, settings }: Props) {
           <div className="text-[11px] uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
             API
           </div>
-          <div className="mt-1 text-sm font-medium" style={{ color: toneForState(status.api_state) }}>
-            {status.api_state}
+          <div className="mt-1 text-sm font-medium" style={{ color: toneForState(apiReachable ? "Running" : status.api_state) }}>
+            {apiReachable ? "Running" : status.api_state}
           </div>
         </div>
       </div>

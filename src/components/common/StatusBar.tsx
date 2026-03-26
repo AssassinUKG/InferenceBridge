@@ -37,6 +37,7 @@ export function StatusBar({ processStatus, contextStatus, settings }: Props) {
   const pct = Math.round(contextStatus.fill_ratio * 100);
   const apiUrl = processStatus?.api_url ?? buildApiUrl(settings);
   const apiState = processStatus?.api_state ?? "Idle";
+  const apiReachable = processStatus?.api_reachable ?? false;
 
   const kvColor =
     pct > 95
@@ -84,12 +85,12 @@ export function StatusBar({ processStatus, contextStatus, settings }: Props) {
           )}
 
           <span className={`rounded-full border px-3 py-1 ${apiStateTone(apiState)}`}>
-            API {apiState}
+            API {apiReachable ? "Running" : apiState}
           </span>
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
-          <span className="text-slate-500">{apiUrl}</span>
+          <span className={apiReachable ? "text-emerald-300" : "text-slate-500"}>{apiUrl}</span>
 
           {processStatus?.api_error && (
             <span className="max-w-[28rem] truncate text-rose-300" title={processStatus.api_error}>

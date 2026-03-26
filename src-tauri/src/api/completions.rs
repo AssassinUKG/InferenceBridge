@@ -88,9 +88,13 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
-fn build_parse_trace(raw: &str, stripped: &str) -> String {
-    let (tool_calls, visible_text) = crate::normalize::tool_extract::extract_tool_calls(stripped);
+fn build_parse_trace(profile: &ModelProfile, raw: &str, stripped: &str) -> String {
+    let (tool_calls, visible_text) =
+        crate::normalize::tool_extract::extract_tool_calls_for_profile(stripped, profile);
     serde_json::to_string_pretty(&serde_json::json!({
+        "parser_type": format!("{:?}", profile.parser_type),
+        "tool_call_format": format!("{:?}", profile.tool_call_format),
+        "think_tag_style": format!("{:?}", profile.think_tag_style),
         "raw_response": raw,
         "stripped_response": stripped,
         "visible_text": visible_text,
@@ -241,7 +245,7 @@ pub async fn chat_completions(
     let client = LlamaClient::new(server_defaults.4);
 
     if request.stream {
-        return stream_chat_completion(state, client, request, model_name).await;
+        return stream_chat_completion(state, client, request, model_name, profile).await;
     }
 
     let response = client.complete(&request).await.map_err(|e| {
@@ -249,12 +253,16 @@ pub async fn chat_completions(
         ApiErrorResponse::inference_failed(&e.to_string())
     })?;
 
-    let stripped = crate::normalize::think_strip::strip_think_tags(&response.content);
+    let stripped = crate::normalize::think_strip::strip_think_tags_with_style(
+        &response.content,
+        profile.think_tag_style,
+    );
     {
         let mut s = state.write().await;
-        s.last_parse_trace = Some(build_parse_trace(&response.content, &stripped));
+        s.last_parse_trace = Some(build_parse_trace(&profile, &response.content, &stripped));
     }
-    let (tool_calls, text) = crate::normalize::tool_extract::extract_tool_calls(&stripped);
+    let (tool_calls, text) =
+        crate::normalize::tool_extract::extract_tool_calls_for_profile(&stripped, &profile);
     let content = if text.is_empty() { None } else { Some(text) };
     let api_tool_calls: Vec<serde_json::Value> = tool_calls
         .iter()
@@ -303,6 +311,7 @@ async fn stream_chat_completion(
     client: LlamaClient,
     request: CompletionRequest,
     model_name: String,
+    profile: ModelProfile,
 ) -> Result<Response, ApiErrorResponse> {
     let response = client.complete_stream(&request).await.map_err(|e| {
         tracing::error!(error = %e, "Stream completion failed");
@@ -349,9 +358,12 @@ async fn stream_chat_completion(
                     tokens_evaluated,
                     ..
                 } => {
-                    let stripped = crate::normalize::think_strip::strip_think_tags(&full_text);
+                    let stripped = crate::normalize::think_strip::strip_think_tags_with_style(
+                        &full_text,
+                        profile.think_tag_style,
+                    );
                     let mut s = state_for_stream.write().await;
-                    s.last_parse_trace = Some(build_parse_trace(&full_text, &stripped));
+                    s.last_parse_trace = Some(build_parse_trace(&profile, &full_text, &stripped));
                     drop(s);
 
                     let final_chunk = serde_json::json!({
@@ -391,9 +403,12 @@ async fn stream_chat_completion(
         }
 
         if !raw_full_text.is_empty() {
-            let stripped = crate::normalize::think_strip::strip_think_tags(&raw_full_text);
+            let stripped = crate::normalize::think_strip::strip_think_tags_with_style(
+                &raw_full_text,
+                profile.think_tag_style,
+            );
             let mut s = state_for_stream.write().await;
-            s.last_parse_trace = Some(build_parse_trace(&raw_full_text, &stripped));
+            s.last_parse_trace = Some(build_parse_trace(&profile, &raw_full_text, &stripped));
         }
         finish_api_generation(&state_for_stream, "completed").await;
         yield Ok(Event::default().data("[DONE]"));
@@ -498,10 +513,13 @@ pub async fn text_completions(
         ApiErrorResponse::inference_failed(&e.to_string())
     })?;
 
-    let text = crate::normalize::think_strip::strip_think_tags(&response.content);
+    let text = crate::normalize::think_strip::strip_think_tags_with_style(
+        &response.content,
+        profile.think_tag_style,
+    );
     {
         let mut s = state.write().await;
-        s.last_parse_trace = Some(build_parse_trace(&response.content, &text));
+        s.last_parse_trace = Some(build_parse_trace(&profile, &response.content, &text));
     }
 
     Ok(Json(TextCompletionResponse {

@@ -7,12 +7,14 @@ pub struct ChatMessage {
 }
 
 pub fn render_prompt(messages: &[ChatMessage], profile: &ModelProfile) -> String {
-    match profile.renderer_type {
+    let rendered = match profile.renderer_type {
         RendererType::ChatML => render_chatml(messages, profile),
         RendererType::QwenChat => render_qwen_chat(messages, profile),
         RendererType::Llama3Chat => render_llama3_chat(messages),
         RendererType::GemmaChat => render_gemma_chat(messages),
-    }
+    };
+
+    super::patches::apply_patches(&rendered, profile)
 }
 
 fn render_chatml(messages: &[ChatMessage], profile: &ModelProfile) -> String {

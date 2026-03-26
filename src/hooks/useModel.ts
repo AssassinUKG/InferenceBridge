@@ -52,6 +52,7 @@ function sameProcessStatus(
     a.api_state === b.api_state &&
     a.api_error === b.api_error &&
     a.api_url === b.api_url &&
+    a.api_reachable === b.api_reachable &&
     a.api_port_owner?.pid === b.api_port_owner?.pid &&
     a.api_port_owner?.killable === b.api_port_owner?.killable
   );

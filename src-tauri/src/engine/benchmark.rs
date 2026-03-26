@@ -98,7 +98,10 @@ pub async fn test_model(
     let start = std::time::Instant::now();
     let resp = client.complete(&request).await?;
     let elapsed = start.elapsed().as_millis();
-    let response_text = crate::normalize::think_strip::strip_think_tags(&resp.content);
+    let response_text = crate::normalize::think_strip::strip_think_tags_with_style(
+        &resp.content,
+        profile.think_tag_style,
+    );
     Ok(ModelTestStats {
         model: model_name.to_string(),
         context_size,

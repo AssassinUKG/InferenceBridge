@@ -47,7 +47,9 @@ function App() {
       ? model.processStatus.api_error
       : null;
   const apiState = model.processStatus?.api_state ?? "Idle";
-  const apiRunning = apiState === "Running" || apiState === "Starting";
+  const apiReachable = model.processStatus?.api_reachable ?? false;
+  const apiRunning = apiState === "Running" && apiReachable;
+  const apiStarting = apiState === "Starting";
   const apiPortOwner = model.processStatus?.api_port_owner ?? null;
 
   useEffect(() => {
@@ -150,14 +152,14 @@ function App() {
               className={`h-2 w-2 rounded-full ${apiState === "Starting" ? "animate-pulse" : ""}`}
               style={{
                 background:
-                  apiRunning ? "#34d399" : apiState === "Error" ? "#f87171" : "#6b7280",
+                  apiRunning ? "#34d399" : apiStarting ? "#fde68a" : apiState === "Error" ? "#f87171" : "#6b7280",
               }}
             />
-            <span>{apiRunning ? `Serve ${apiState}` : apiState === "Error" ? "Serve Port Busy" : "Serve Off"}</span>
+            <span>{apiRunning ? "Serve Running" : apiStarting ? "Serve Starting" : apiState === "Error" ? "Serve Unreachable" : "Serve Off"}</span>
           </button>
 
           <button
-            onClick={() => model.setApiServerRunning(!apiRunning)}
+            onClick={() => model.setApiServerRunning(apiRunning || apiStarting ? false : true)}
             className="rounded px-3 py-1 text-xs font-medium transition"
             style={{
               background: "#22d3ee",
@@ -166,7 +168,7 @@ function App() {
               cursor: "pointer",
             }}
           >
-            {apiRunning ? "Stop API" : apiState === "Error" ? "Retry API" : "Start API"}
+            {apiRunning || apiStarting ? "Stop API" : apiState === "Error" ? "Retry API" : "Start API"}
           </button>
 
           {chat.isStreaming && (
@@ -202,7 +204,7 @@ function App() {
           <p className="mt-1 text-xs" style={{ color: "#fda4af" }}>
             The desktop UI still talks to InferenceBridge directly. This only affects external API clients that expect the public `8800` endpoint.
           </p>
-          {apiPortOwner && (
+          {apiPortOwner && !apiReachable && (
             <p className="mt-2 text-xs" style={{ color: "#fecaca" }}>
               Port owner: {apiPortOwner.name ?? "Unknown process"} (PID {apiPortOwner.pid})
             </p>

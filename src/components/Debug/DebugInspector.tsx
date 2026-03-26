@@ -280,7 +280,9 @@ export function DebugInspector({
 
   const activeModel = processStatus?.model ?? null;
   const serveState = processStatus?.api_state ?? "Idle";
-  const serveRunning = serveState === "Running" || serveState === "Starting";
+  const serveReachable = processStatus?.api_reachable ?? false;
+  const serveRunning = serveState === "Running" && serveReachable;
+  const serveStarting = serveState === "Starting";
   const selectedModel = selectedProfileModel || activeModel || models[0]?.filename || null;
   const examples = useMemo(() => exampleList(activeModel, selectedModel), [activeModel, selectedModel]);
 
@@ -437,8 +439,8 @@ export function DebugInspector({
               <ActionButton label="Copy URL" onClick={() => navigator.clipboard.writeText(apiUrl)} />
               <ActionButton label="Server Settings" onClick={onOpenSettings} />
               <ActionButton
-                label={serveRunning ? "Stop API" : "Start API"}
-                onClick={() => onSetApiServerRunning(!serveRunning)}
+                label={serveRunning || serveStarting ? "Stop API" : serveState === "Error" ? "Retry API" : "Start API"}
+                onClick={() => onSetApiServerRunning(serveRunning || serveStarting ? false : true)}
                 primary
               />
             </div>
@@ -446,23 +448,25 @@ export function DebugInspector({
         >
           <div className="grid gap-3 px-4 py-3 lg:grid-cols-4">
             <div>
-              <div className="flex items-center gap-2 text-sm font-semibold" style={{ color: serveRunning ? "#34d399" : serveState === "Error" ? "#f87171" : "var(--text-0)" }}>
-                <StatusDot running={serveRunning} starting={serveState === "Starting"} error={serveState === "Error"} />
-                <span>{serveRunning ? serveState : serveState === "Error" ? "Port Busy" : "Stopped"}</span>
+              <div className="flex items-center gap-2 text-sm font-semibold" style={{ color: serveRunning ? "#34d399" : serveStarting ? "#fde68a" : serveState === "Error" ? "#f87171" : "var(--text-0)" }}>
+                <StatusDot running={serveRunning} starting={serveStarting} error={serveState === "Error"} />
+                <span>{serveRunning ? "Running" : serveStarting ? "Starting" : serveState === "Error" ? "Unreachable" : "Stopped"}</span>
               </div>
               <p className="mt-2 text-xs" style={{ color: "var(--text-1)" }}>
                 {serveRunning
                   ? "Public API is reachable for external tools."
-                  : serveState === "Error"
+                  : serveStarting
+                    ? "Public API is starting up."
+                    : serveState === "Error"
                     ? processStatus?.api_error ?? "The public API is not bound right now."
                     : "The public API is currently off."}
               </p>
             </div>
             <div>
               <div className="text-[11px] font-semibold uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
-                Reachable At
+                {serveReachable ? "Reachable At" : "Configured At"}
               </div>
-              <div className="mt-1 font-mono text-sm" style={{ color: "var(--text-0)" }}>
+              <div className="mt-1 font-mono text-sm" style={{ color: serveReachable ? "#34d399" : "var(--text-0)" }}>
                 {apiUrl}
               </div>
             </div>

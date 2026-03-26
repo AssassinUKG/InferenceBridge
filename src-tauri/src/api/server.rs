@@ -459,12 +459,12 @@ fn diagnose_port_conflict_windows(port: u16) -> Option<String> {
         }
 
         return Some(format!(
-            "Diagnostics: Windows reports PID {pid} is holding port {port}, but the process name could not be resolved. It may already be exiting, so InferenceBridge will retry briefly before giving up."
+            "Diagnostics: Windows briefly reported port {port} as busy, but the owner could not be resolved. The conflict may already have cleared; retry API if the port now looks free."
         ));
     }
 
     Some(format!(
-        "Diagnostics: Windows reported the port as busy, but no LISTENING owner was found in netstat output. This can happen briefly during a race or if another startup path in this process is still binding."
+        "Diagnostics: Windows briefly reported port {port} as busy, but no current LISTENING owner was found in netstat output. The conflict may already have cleared; retry API if the port now looks free."
     ))
 }
 

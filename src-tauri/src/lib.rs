@@ -891,7 +891,10 @@ pub fn run_one_shot(
 
         match client.complete(&request).await {
             Ok(resp) => {
-                let text = normalize::think_strip::strip_think_tags(&resp.content);
+                let text = normalize::think_strip::strip_think_tags_with_style(
+                    &resp.content,
+                    profile.think_tag_style,
+                );
                 // Print to stdout — clean for piping
                 print!("{text}");
                 if let Some(timings) = &resp.timings {

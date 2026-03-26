@@ -35,6 +35,7 @@ export interface ProcessStatusInfo {
   api_state: string;
   api_error: string | null;
   api_url: string;
+  api_reachable: boolean;
   api_port_owner: ApiPortOwnerInfo | null;
   startup_duration_ms: number | null;
   parallel_slots: number | null;

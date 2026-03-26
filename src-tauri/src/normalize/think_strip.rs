@@ -1,6 +1,8 @@
 //! Strip `<think>…</think>` chain-of-thought blocks from model output.
 //! Ported from HelixClaw's llm.rs strip_think_tags().
 
+use crate::models::profiles::ThinkTagStyle;
+
 /// Strip think tags, preserving content after the closing tag.
 /// If the entire output is wrapped in think tags, preserve the inner
 /// content (the model's reasoning IS the response for short queries).
@@ -49,6 +51,13 @@ pub fn strip_think_tags(text: &str) -> String {
     }
 
     text.to_string()
+}
+
+pub fn strip_think_tags_with_style(text: &str, style: ThinkTagStyle) -> String {
+    match style {
+        ThinkTagStyle::None => text.to_string(),
+        ThinkTagStyle::Standard | ThinkTagStyle::Qwen => strip_think_tags(text),
+    }
 }
 
 #[cfg(test)]

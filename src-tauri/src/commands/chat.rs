@@ -3,6 +3,7 @@ use tauri::Emitter;
 use crate::context::{compressor, strategy, tracker};
 use crate::engine::client::{CompletionRequest, ImageData, LlamaClient};
 use crate::engine::streaming::{self, StreamEvent};
+use crate::models::profiles::{ModelFamily, ModelProfile};
 use crate::state::{GenerationRequest, SharedState};
 use crate::templates::engine::{render_prompt, ChatMessage};
 
@@ -10,9 +11,13 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
-fn build_parse_trace(raw: &str, stripped: &str, reasoning: &str) -> String {
-    let (tool_calls, visible_text) = crate::normalize::tool_extract::extract_tool_calls(stripped);
+fn build_parse_trace(profile: &ModelProfile, raw: &str, stripped: &str, reasoning: &str) -> String {
+    let (tool_calls, visible_text) =
+        crate::normalize::tool_extract::extract_tool_calls_for_profile(stripped, profile);
     serde_json::to_string_pretty(&serde_json::json!({
+        "parser_type": format!("{:?}", profile.parser_type),
+        "tool_call_format": format!("{:?}", profile.tool_call_format),
+        "think_tag_style": format!("{:?}", profile.think_tag_style),
         "raw_response": raw,
         "reasoning_text": reasoning,
         "stripped_response": stripped,
@@ -20,6 +25,35 @@ fn build_parse_trace(raw: &str, stripped: &str, reasoning: &str) -> String {
         "tool_calls": tool_calls,
     }))
     .unwrap_or_else(|_| "Failed to serialize parse trace".to_string())
+}
+
+fn apply_thinking_preference(
+    mut messages: Vec<ChatMessage>,
+    profile: &ModelProfile,
+    show_thinking: Option<bool>,
+) -> Vec<ChatMessage> {
+    let Some(last) = messages.last_mut().filter(|message| message.role == "user") else {
+        return messages;
+    };
+
+    match (profile.family, show_thinking) {
+        (ModelFamily::Qwen3_5 | ModelFamily::Qwen3, Some(true)) => {}
+        (ModelFamily::Qwen3_5 | ModelFamily::Qwen3, Some(false)) => {
+            last.content = format!(
+                "Respond directly without emitting <think> blocks. Return only the final answer.\n\n{}",
+                last.content
+            );
+        }
+        (_, Some(true)) if profile.has_think_tags() => {
+            last.content = format!("/think\n{}", last.content);
+        }
+        (_, Some(false)) if profile.has_think_tags() => {
+            last.content = format!("/no_think\n{}", last.content);
+        }
+        _ => {}
+    }
+
+    messages
 }
 
 async fn begin_generation(
@@ -260,19 +294,7 @@ pub async fn send_message(
         })
         .collect();
 
-    let messages = if profile.has_think_tags() {
-        let mut messages = messages;
-        if let Some(last) = messages.last_mut().filter(|message| message.role == "user") {
-            match show_thinking {
-                Some(true) => last.content = format!("/think\n{}", last.content),
-                Some(false) => last.content = format!("/no_think\n{}", last.content),
-                None => {}
-            }
-        }
-        messages
-    } else {
-        messages
-    };
+    let messages = apply_thinking_preference(messages, &profile, show_thinking);
 
     let prompt = render_prompt(&messages, &profile);
     {
@@ -361,11 +383,14 @@ pub async fn send_message(
     }
 
     let stripped = if profile.has_think_tags() && show_thinking != Some(true) {
-        crate::normalize::think_strip::strip_think_tags(&full_text)
+        crate::normalize::think_strip::strip_think_tags_with_style(
+            &full_text,
+            profile.think_tag_style,
+        )
     } else {
         full_text.clone()
     };
-    let parse_trace = build_parse_trace(&full_text, &stripped, &reasoning_text);
+    let parse_trace = build_parse_trace(&profile, &full_text, &stripped, &reasoning_text);
     {
         let mut s = state.write().await;
         s.last_parse_trace = Some(parse_trace);

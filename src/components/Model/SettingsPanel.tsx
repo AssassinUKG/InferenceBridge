@@ -392,7 +392,9 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
 
   const serverUrl = `http://${settings.server_host}:${settings.server_port}/v1`;
   const apiState = processStatus?.api_state ?? "Idle";
-  const apiRunning = apiState === "Running" || apiState === "Starting";
+  const apiReachable = processStatus?.api_reachable ?? false;
+  const apiRunning = apiState === "Running" && apiReachable;
+  const apiStarting = apiState === "Starting";
   const apiError = processStatus?.api_error ?? null;
 
   return (
@@ -431,14 +433,20 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
               <p className="text-sm font-medium" style={{ color: "var(--text-0)" }}>
                 Server Status
               </p>
-              <p className="mt-0.5 text-xs" style={{ color: apiRunning ? "#34d399" : apiState === "Error" ? "#f87171" : "var(--text-2)" }}>
-                {apiRunning ? `Public API ${apiState.toLowerCase()} on ${serverUrl}` : apiState === "Error" ? "Public API failed to bind. Stop/start it here after changing settings or freeing the port." : "Public API is currently off."}
+              <p className="mt-0.5 text-xs" style={{ color: apiRunning ? "#34d399" : apiStarting ? "#fde68a" : apiState === "Error" ? "#f87171" : "var(--text-2)" }}>
+                {apiRunning
+                  ? `Public API reachable on ${serverUrl}`
+                  : apiStarting
+                    ? `Public API is starting on ${serverUrl}`
+                    : apiState === "Error"
+                      ? apiError ?? `Public API is not reachable on ${serverUrl}.`
+                      : "Public API is currently off."}
               </p>
             </div>
             <div className="flex items-center gap-2">
               <FlatBtn
-                label={apiRunning ? "Stop API" : "Start API"}
-                onClick={() => onSetApiServerRunning(!apiRunning)}
+                label={apiRunning || apiStarting ? "Stop API" : apiState === "Error" ? "Retry API" : "Start API"}
+                onClick={() => onSetApiServerRunning(apiRunning || apiStarting ? false : true)}
                 primary
               />
             </div>
@@ -454,10 +462,12 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
           <Divider />
           <div
             className="flex items-center gap-2 px-4 py-2.5"
-            style={{ background: "rgba(52,211,153,0.04)" }}
+            style={{ background: apiReachable ? "rgba(52,211,153,0.04)" : "rgba(255,255,255,0.03)" }}
           >
-            <span className="text-xs" style={{ color: "var(--text-1)" }}>Reachable at</span>
-            <span className="font-mono text-xs" style={{ color: "#34d399" }}>{serverUrl}</span>
+            <span className="text-xs" style={{ color: "var(--text-1)" }}>
+              {apiReachable ? "Reachable at" : "Configured endpoint"}
+            </span>
+            <span className="font-mono text-xs" style={{ color: apiReachable ? "#34d399" : "var(--text-1)" }}>{serverUrl}</span>
           </div>
           <Divider />
           <div className="flex items-center justify-between px-4 py-3">

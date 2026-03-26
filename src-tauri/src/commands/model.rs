@@ -924,6 +924,14 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
         )
     }; // read lock released before any async I/O
 
+    let api_reachable = probe_public_api(&api_url).await;
+
+    if api_reachable && (api_state != "Running" || api_error.is_some()) {
+        let mut s = state.write().await;
+        s.api_server_state = crate::state::ApiServerState::Running;
+        s.api_server_error = None;
+    }
+
     // Get backend from live detection (parsed from server stderr on startup)
     let backend = if is_running {
         let guard = detected_arc.lock().await;
@@ -948,10 +956,36 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
         })
     });
 
-    let api_port_owner = if api_state == "Error" {
+    let effective_api_state = if api_reachable {
+        "Running".to_string()
+    } else if api_state == "Running" {
+        "Error".to_string()
+    } else {
+        api_state.clone()
+    };
+
+    let api_port_owner = if effective_api_state == "Error" && !api_reachable {
         detect_api_port_owner(api_port)
     } else {
         None
+    };
+
+    let effective_api_error = if api_reachable {
+        None
+    } else if effective_api_state == "Error" {
+        if api_port_owner.is_some() {
+            api_error.clone().or_else(|| {
+                Some(format!(
+                    "The public API is not currently reachable on {api_url}. Another process appears to be holding port {api_port}."
+                ))
+            })
+        } else {
+            Some(format!(
+                "The public API is not currently reachable on {api_url}. No active listener is holding port {api_port}. Retry API to start it again."
+            ))
+        }
+    } else {
+        api_error.clone()
     };
 
     let slot_count = if is_running {
@@ -969,15 +1003,32 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
         server_version,
         server_path: server_path.map(|p| p.to_string_lossy().to_string()),
         backend,
-        api_state,
-        api_error,
+        api_state: effective_api_state,
+        api_error: effective_api_error,
         api_url,
+        api_reachable,
         api_port_owner,
         startup_duration_ms,
         parallel_slots,
         slot_count,
         last_launch_preview,
     })
+}
+
+async fn probe_public_api(api_url: &str) -> bool {
+    let health_url = format!("{}/health", api_url.trim_end_matches('/'));
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(1200))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+
+    match client.get(&health_url).send().await {
+        Ok(response) => response.status().is_success(),
+        Err(_) => false,
+    }
 }
 
 /// Detect backend by checking the binary's directory for CUDA/Vulkan DLLs.
@@ -1067,7 +1118,7 @@ fn detect_api_port_owner_windows(port: u16) -> Option<ApiPortOwnerInfo> {
         } else if lower.contains("inference-bridge") {
             ("inference-bridge".to_string(), true)
         } else if lower.is_empty() {
-            ("unknown".to_string(), false)
+            return None;
         } else {
             ("other".to_string(), false)
         };
@@ -1342,6 +1393,7 @@ pub struct ProcessStatusInfo {
     pub api_state: String,
     pub api_error: Option<String>,
     pub api_url: String,
+    pub api_reachable: bool,
     pub api_port_owner: Option<ApiPortOwnerInfo>,
     pub startup_duration_ms: Option<u64>,
     pub parallel_slots: Option<u32>,
