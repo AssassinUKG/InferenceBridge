@@ -60,13 +60,17 @@ function ThinkBlock({ text }: { text: string }) {
 export function MessageBubble({ message }: Props) {
   const isUser = message.role === "user";
   const content = message.content ?? "";
-  const isImage = typeof content === "string" && content.startsWith("data:image/");
+  const imageSrc =
+    message.image_base64 ??
+    (typeof content === "string" && content.startsWith("data:image/") ? content : null);
+  const hasImage = !!imageSrc;
+  const textContent = imageSrc === content ? "" : content;
 
-  const hasThinkTags = !isUser && content.includes("<think>");
-  const parts = hasThinkTags ? parseThinkBlocks(content) : null;
+  const hasThinkTags = !isUser && textContent.includes("<think>");
+  const parts = hasThinkTags ? parseThinkBlocks(textContent) : null;
 
   // The plain text to copy (strip think tags)
-  const plainTextForCopy = content.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+  const plainTextForCopy = textContent.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
 
   return (
     <div className={`flex gap-3 px-4 py-3 group ${isUser ? "" : "bg-gray-800/30"}`}>
@@ -83,13 +87,15 @@ export function MessageBubble({ message }: Props) {
 
       {/* Content */}
       <div className="flex-1 min-w-0">
-        {isImage ? (
+        {hasImage && (
           <img
-            src={content}
-            alt="image"
-            className="max-w-xs max-h-64 rounded border border-gray-700"
+            src={imageSrc ?? undefined}
+            alt="attachment"
+            className="mb-2 max-w-xs max-h-64 rounded border border-gray-700"
           />
-        ) : hasThinkTags && parts ? (
+        )}
+
+        {hasThinkTags && parts ? (
           <div>
             {parts.map((p, i) =>
               p.type === "think" ? (
@@ -99,13 +105,19 @@ export function MessageBubble({ message }: Props) {
               )
             )}
           </div>
-        ) : isUser ? (
+        ) : textContent && isUser ? (
           // User messages: simple text (preserves newlines, no markdown)
           <p className="text-sm text-gray-300 whitespace-pre-wrap break-words leading-relaxed">
-            {content}
+            {textContent}
           </p>
-        ) : (
-          <MarkdownContent content={content} />
+        ) : textContent ? (
+          <MarkdownContent content={textContent} />
+        ) : null}
+
+        {!hasImage && !textContent && (
+          <p className="text-sm text-gray-500 italic">
+            Empty message
+          </p>
         )}
 
         {/* Footer row: token count + copy button */}

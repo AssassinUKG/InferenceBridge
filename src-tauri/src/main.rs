@@ -174,7 +174,16 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Serve { model, ctx_size, host, scan_dirs, temperature, top_p, top_k, max_tokens }) => {
+        Some(Commands::Serve {
+            model,
+            ctx_size,
+            host,
+            scan_dirs,
+            temperature,
+            top_p,
+            top_k,
+            max_tokens,
+        }) => {
             inference_bridge_lib::run_headless(
                 cli.port,
                 host,

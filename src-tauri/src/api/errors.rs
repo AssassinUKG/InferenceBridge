@@ -28,9 +28,7 @@ pub struct ApiErrorBody {
 impl ApiError {
     pub fn new(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<Self>) {
         let error_type = match status {
-            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
-                "invalid_request_error"
-            }
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => "invalid_request_error",
             StatusCode::UNAUTHORIZED => "authentication_error",
             StatusCode::NOT_FOUND => "invalid_request_error",
             StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",

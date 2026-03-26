@@ -64,6 +64,7 @@ export interface MessageInfo {
   id: number;
   role: string;
   content: string | null;
+  image_base64?: string | null;
   token_count: number | null;
   created_at: string;
 }

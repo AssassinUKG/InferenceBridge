@@ -38,7 +38,14 @@ pub async fn backend_load_model(
         s.app_handle.clone()
     };
 
-    emit_load_progress(&app_handle, "resolving", "Resolving model...", 0.0, false, None);
+    emit_load_progress(
+        &app_handle,
+        "resolving",
+        "Resolving model...",
+        0.0,
+        false,
+        None,
+    );
 
     // Phase 1: Resolve model info (brief lock) + claim loading generation
     let (config, model_filename, my_generation) = {
@@ -152,10 +159,7 @@ pub async fn backend_load_model(
 
     loop {
         if start.elapsed() > timeout {
-            let msg = format!(
-                "llama-server did not become healthy within {:?}",
-                timeout
-            );
+            let msg = format!("llama-server did not become healthy within {:?}", timeout);
             tracing::error!("{msg}");
             emit_load_progress(&app_handle, "error", &msg, 0.0, true, Some(msg.clone()));
             let mut s = state.write().await;
@@ -197,10 +201,7 @@ pub async fn backend_load_model(
 
                 if status_code.is_success() {
                     if body.contains("ok") || body.contains("\"status\":\"ok\"") {
-                        tracing::info!(
-                            "llama-server healthy after {}s",
-                            start.elapsed().as_secs()
-                        );
+                        tracing::info!("llama-server healthy after {}s", start.elapsed().as_secs());
                         break;
                     }
                     if body.contains("loading") {
@@ -233,7 +234,10 @@ pub async fn backend_load_model(
                     emit_load_progress(
                         &app_handle,
                         "starting",
-                        &format!("Waiting for llama-server (HTTP {})... ({}s)", status_code, elapsed),
+                        &format!(
+                            "Waiting for llama-server (HTTP {})... ({}s)",
+                            status_code, elapsed
+                        ),
                         0.08,
                         false,
                         None,
@@ -271,10 +275,7 @@ pub async fn backend_load_model(
                 current_gen = s.loading_generation,
                 "Stale load — a newer swap is in progress, discarding"
             );
-            return Ok(format!(
-                "Superseded by newer swap (gen {})",
-                my_generation
-            ));
+            return Ok(format!("Superseded by newer swap (gen {})", my_generation));
         }
         if let Some(prev) = s.loaded_model.take() {
             if prev != model_filename {

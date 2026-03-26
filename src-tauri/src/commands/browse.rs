@@ -361,9 +361,8 @@ struct HfApiModel {
 
 fn extract_quant(filename: &str) -> String {
     const KNOWN: &[&str] = &[
-        "IQ4_XS", "IQ4_NL", "IQ3_XXS", "IQ3_XS", "IQ2_XXS", "IQ2_XS",
-        "Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q5_1", "Q5_0",
-        "Q4_K_M", "Q4_K_S", "Q4_1", "Q4_0", "Q3_K_M", "Q3_K_L", "Q3_K_S",
+        "IQ4_XS", "IQ4_NL", "IQ3_XXS", "IQ3_XS", "IQ2_XXS", "IQ2_XS", "Q8_0", "Q6_K", "Q5_K_M",
+        "Q5_K_S", "Q5_1", "Q5_0", "Q4_K_M", "Q4_K_S", "Q4_1", "Q4_0", "Q3_K_M", "Q3_K_L", "Q3_K_S",
         "Q2_K", "F16", "BF16",
     ];
     let upper = filename.to_uppercase();
@@ -372,7 +371,12 @@ fn extract_quant(filename: &str) -> String {
             return k.to_string();
         }
     }
-    filename.trim_end_matches(".gguf").rsplit('-').next().unwrap_or("GGUF").to_uppercase()
+    filename
+        .trim_end_matches(".gguf")
+        .rsplit('-')
+        .next()
+        .unwrap_or("GGUF")
+        .to_uppercase()
 }
 
 fn hf_api_to_hub(m: HfApiModel) -> Option<HubModel> {
@@ -390,15 +394,25 @@ fn hf_api_to_hub(m: HfApiModel) -> Option<HubModel> {
         .map(|s| HubQuant {
             quant: extract_quant(&s.rfilename),
             size_gb: s.size.map(|sz| sz as f32 / 1_073_741_824.0).unwrap_or(0.0),
-            url: format!("https://huggingface.co/{}/resolve/main/{}", m.model_id, s.rfilename),
+            url: format!(
+                "https://huggingface.co/{}/resolve/main/{}",
+                m.model_id, s.rfilename
+            ),
             filename: s.rfilename.clone(),
         })
         .collect();
 
-    let name = m.model_id.split('/').last().unwrap_or(&m.model_id)
-        .replace('-', " ").replace('_', " ");
+    let name = m
+        .model_id
+        .split('/')
+        .last()
+        .unwrap_or(&m.model_id)
+        .replace('-', " ")
+        .replace('_', " ");
 
-    let tags: Vec<String> = m.tags.into_iter()
+    let tags: Vec<String> = m
+        .tags
+        .into_iter()
         .filter(|t| !t.contains(':') && !t.starts_with("base_model") && t.len() < 24)
         .take(5)
         .collect();
@@ -546,7 +560,11 @@ pub async fn download_hub_model(
         .map_err(|e| format!("Download request failed: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("Server returned HTTP {} for {}", resp.status(), url));
+        return Err(format!(
+            "Server returned HTTP {} for {}",
+            resp.status(),
+            url
+        ));
     }
 
     let total_bytes = resp.content_length().unwrap_or(0);
@@ -586,7 +604,9 @@ pub async fn download_hub_model(
         }
     }
 
-    file.flush().await.map_err(|e| format!("Flush error: {e}"))?;
+    file.flush()
+        .await
+        .map_err(|e| format!("Flush error: {e}"))?;
     drop(file);
 
     // Rescan so the new model appears immediately in the registry and UI
@@ -594,10 +614,9 @@ pub async fn download_hub_model(
         let s = state.read().await;
         let dirs = s.config.models.scan_dirs.clone();
         drop(s);
-        let scanned =
-            tokio::task::spawn_blocking(move || crate::models::scanner::scan_all(&dirs))
-                .await
-                .unwrap_or_default();
+        let scanned = tokio::task::spawn_blocking(move || crate::models::scanner::scan_all(&dirs))
+            .await
+            .unwrap_or_default();
         state.write().await.model_registry.update(scanned);
     }
 
@@ -642,10 +661,9 @@ pub async fn delete_model_file(
         let s = state.read().await;
         let dirs = s.config.models.scan_dirs.clone();
         drop(s);
-        let scanned =
-            tokio::task::spawn_blocking(move || crate::models::scanner::scan_all(&dirs))
-                .await
-                .unwrap_or_default();
+        let scanned = tokio::task::spawn_blocking(move || crate::models::scanner::scan_all(&dirs))
+            .await
+            .unwrap_or_default();
         state.write().await.model_registry.update(scanned);
     }
 

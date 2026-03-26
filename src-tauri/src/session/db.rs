@@ -75,7 +75,9 @@ impl SessionDb {
     fn ensure_messages_image_column(&self) -> Result<()> {
         let mut stmt = self.conn.prepare("PRAGMA table_info(messages)")?;
         let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-        let has_image_column = columns.filter_map(|col| col.ok()).any(|col| col == "image_base64");
+        let has_image_column = columns
+            .filter_map(|col| col.ok())
+            .any(|col| col == "image_base64");
         if !has_image_column {
             self.conn
                 .execute("ALTER TABLE messages ADD COLUMN image_base64 TEXT", [])?;

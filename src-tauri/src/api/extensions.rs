@@ -59,12 +59,14 @@ pub async fn create_session(
 
     let id = db
         .create_session(&name, req.model_id.as_deref())
-        .map_err(|e| ApiErrorResponse::service_unavailable(format!("Failed to create session: {e}")))?;
+        .map_err(|e| {
+            ApiErrorResponse::service_unavailable(format!("Failed to create session: {e}"))
+        })?;
 
     // Re-fetch the created session to get timestamps.
-    let sessions = db
-        .list_sessions()
-        .map_err(|e| ApiErrorResponse::service_unavailable(format!("Failed to fetch session: {e}")))?;
+    let sessions = db.list_sessions().map_err(|e| {
+        ApiErrorResponse::service_unavailable(format!("Failed to fetch session: {e}"))
+    })?;
 
     sessions
         .into_iter()
@@ -85,12 +87,13 @@ pub async fn delete_session(
         .lock()
         .map_err(|_| ApiErrorResponse::service_unavailable("Session DB lock poisoned"))?;
 
-    db.delete_session(&session_id)
-        .map_err(|e| {
-            ApiErrorResponse::service_unavailable(format!("Failed to delete session: {e}"))
-        })?;
+    db.delete_session(&session_id).map_err(|e| {
+        ApiErrorResponse::service_unavailable(format!("Failed to delete session: {e}"))
+    })?;
 
-    Ok(Json(serde_json::json!({ "deleted": true, "id": session_id })))
+    Ok(Json(
+        serde_json::json!({ "deleted": true, "id": session_id }),
+    ))
 }
 
 // ─── Session messages ─────────────────────────────────────────────────────────
@@ -105,23 +108,21 @@ pub async fn get_session_messages(
         .lock()
         .map_err(|_| ApiErrorResponse::service_unavailable("Session DB lock poisoned"))?;
 
-    db.get_messages(&session_id)
-        .map(Json)
-        .map_err(|e| {
-            if e.to_string().contains("no rows") {
-                ApiErrorResponse(
-                    StatusCode::NOT_FOUND,
-                    axum::Json(crate::api::errors::ApiError {
-                        error: crate::api::errors::ApiErrorBody {
-                            message: format!("Session '{session_id}' not found"),
-                            error_type: "invalid_request_error".to_string(),
-                            code: None,
-                            param: Some("session_id".to_string()),
-                        },
-                    }),
-                )
-            } else {
-                ApiErrorResponse::service_unavailable(format!("Failed to fetch messages: {e}"))
-            }
-        })
+    db.get_messages(&session_id).map(Json).map_err(|e| {
+        if e.to_string().contains("no rows") {
+            ApiErrorResponse(
+                StatusCode::NOT_FOUND,
+                axum::Json(crate::api::errors::ApiError {
+                    error: crate::api::errors::ApiErrorBody {
+                        message: format!("Session '{session_id}' not found"),
+                        error_type: "invalid_request_error".to_string(),
+                        code: None,
+                        param: Some("session_id".to_string()),
+                    },
+                }),
+            )
+        } else {
+            ApiErrorResponse::service_unavailable(format!("Failed to fetch messages: {e}"))
+        }
+    })
 }

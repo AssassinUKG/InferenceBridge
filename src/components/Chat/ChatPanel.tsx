@@ -15,6 +15,7 @@ interface Props {
   hasSession: boolean;
   /** Name of the currently loaded model — used to detect thinking support. */
   loadedModel?: string | null;
+  loadedModelSupportsVision?: boolean;
   onSend: (
     content: string,
     sampling?: SamplingParams,
@@ -33,6 +34,7 @@ export function ChatPanel({
   hasModel,
   hasSession,
   loadedModel,
+  loadedModelSupportsVision = false,
   onSend,
   onStop,
 }: Props) {
@@ -43,6 +45,7 @@ export function ChatPanel({
   const [sampling, setSampling] = useState<SamplingParams>({});
   const [showThinking, setShowThinking] = useState(false);
   const [activePreset, setActivePreset] = useState<PresetKey | null>(null);
+  const [composerError, setComposerError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const canThink = modelSupportsThinking(loadedModel);
@@ -65,6 +68,7 @@ export function ChatPanel({
   const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] || null;
     setImage(file);
+    setComposerError(null);
     if (file) {
       const reader = new FileReader();
       reader.onload = (ev) => {
@@ -79,6 +83,7 @@ export function ChatPanel({
   const handleRemoveImage = () => {
     setImage(null);
     setImagePreview(null);
+    setComposerError(null);
   };
 
   // Allow pasting images directly from the clipboard into the chat input.
@@ -90,6 +95,7 @@ export function ChatPanel({
     const file = imageItem.getAsFile();
     if (!file) return;
     setImage(file);
+    setComposerError(null);
     const reader = new FileReader();
     reader.onload = (ev) => setImagePreview(ev.target?.result as string);
     reader.readAsDataURL(file);
@@ -102,7 +108,12 @@ export function ChatPanel({
   const handleSubmit = () => {
     const trimmed = input.trim();
     if ((!trimmed && !image) || !hasModel || !hasSession || isStreaming) return;
+    if (image && !loadedModelSupportsVision) {
+      setComposerError("The current model does not advertise vision support. Load a Vision model first.");
+      return;
+    }
     const params = Object.keys(sampling).length > 0 ? sampling : undefined;
+    setComposerError(null);
     onSend(trimmed, params, imagePreview, showThinking);
     setInput("");
     setImage(null);
@@ -146,10 +157,10 @@ export function ChatPanel({
         <div ref={bottomRef} />
       </div>
 
-      {(tokensPerSecond != null || error) && (
+      {(tokensPerSecond != null || error || composerError) && (
         <div className="px-4 py-1 text-xs border-t border-gray-700/50">
-          {error ? (
-            <span className="text-red-400">{error}</span>
+          {error || composerError ? (
+            <span className="text-red-400">{composerError ?? error}</span>
           ) : (
             <span className="text-gray-500">
               {tokensPerSecond?.toFixed(1)} tok/s
@@ -425,6 +436,11 @@ export function ChatPanel({
               alt="preview"
               className="max-h-24 rounded border border-gray-600"
             />
+            <span className="text-xs text-gray-500">
+              {loadedModelSupportsVision
+                ? "Will be sent to the current vision model."
+                : "Current model is text-only. Load a Vision model before sending."}
+            </span>
             <button
               onClick={handleRemoveImage}
               className="text-xs text-red-400 hover:underline"

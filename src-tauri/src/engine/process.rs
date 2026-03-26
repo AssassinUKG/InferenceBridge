@@ -20,6 +20,77 @@ fn system_command(program: &str) -> std::process::Command {
     cmd
 }
 
+fn filename_supports_vision(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    name.contains("vision")
+        || name.contains("llava")
+        || name.contains("multimodal")
+        || name.contains("qwen2.5-vl")
+        || name.contains("-vl")
+        || name.contains("_vl")
+}
+
+fn is_mmproj_candidate(path: &Path) -> bool {
+    let Some(filename) = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+    else {
+        return false;
+    };
+    path.extension()
+        .map(|ext| ext.eq_ignore_ascii_case("gguf"))
+        .unwrap_or(false)
+        && (filename.starts_with("mmproj")
+            || filename.contains("-mmproj")
+            || filename.contains("_mmproj")
+            || filename.contains("mmproj-model"))
+}
+
+fn shared_token_score(model_path: &Path, candidate: &Path) -> usize {
+    let model_tokens = model_path
+        .file_stem()
+        .map(|stem| {
+            stem.to_string_lossy()
+                .to_lowercase()
+                .split(|ch: char| !ch.is_ascii_alphanumeric())
+                .filter(|token| token.len() > 2)
+                .map(|token| token.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let candidate_name = candidate
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    model_tokens
+        .iter()
+        .filter(|token| candidate_name.contains(token.as_str()))
+        .count()
+}
+
+fn find_mmproj_for_model(model_path: &Path) -> Option<PathBuf> {
+    let parent = model_path.parent()?;
+    let mut candidates = std::fs::read_dir(parent)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| is_mmproj_candidate(path))
+        .collect::<Vec<_>>();
+
+    if candidates.is_empty() {
+        return None;
+    }
+
+    candidates
+        .sort_by_key(|candidate| std::cmp::Reverse(shared_token_score(model_path, candidate)));
+    candidates.into_iter().next()
+}
+
 /// Process state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ProcessState {
@@ -281,6 +352,22 @@ impl LlamaProcess {
             .arg("--parallel")
             .arg(config.parallel_slots.max(1).to_string())
             .arg("--slots"); // Enable /slots endpoint for KV cache monitoring
+
+        if filename_supports_vision(&config.model_path) {
+            if let Some(mmproj_path) = find_mmproj_for_model(&config.model_path) {
+                tracing::info!(
+                    model = %config.model_path.display(),
+                    mmproj = %mmproj_path.display(),
+                    "Using multimodal projection sidecar for vision model"
+                );
+                cmd.arg("--mmproj").arg(mmproj_path);
+            } else {
+                tracing::warn!(
+                    model = %config.model_path.display(),
+                    "Vision-capable model detected but no mmproj sidecar was found nearby; image understanding may fail"
+                );
+            }
+        }
 
         if config.gpu_layers != 0 {
             cmd.arg("--n-gpu-layers").arg(if config.gpu_layers < 0 {

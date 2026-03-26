@@ -35,6 +35,11 @@ function App() {
   const context = useContext();
 
   const hasModel = !!model.processStatus?.model;
+  const loadedModelName = model.processStatus?.model ?? null;
+  const loadedModelSupportsVision = loadedModelName
+    ? model.models.find((entry) => entry.filename === loadedModelName)?.supports_vision ??
+      /vision|llava|multimodal|qwen2\.5-vl|-vl|_vl/i.test(loadedModelName)
+    : false;
   const debugApiUrl =
     model.processStatus?.api_url ??
     `http://${settings?.server_host ?? "127.0.0.1"}:${settings?.server_port ?? 8800}/v1`;
@@ -274,7 +279,8 @@ function App() {
               error={chat.error}
               hasModel={hasModel}
               hasSession={!!session.activeId}
-              loadedModel={model.processStatus?.model ?? null}
+              loadedModel={loadedModelName}
+              loadedModelSupportsVision={loadedModelSupportsVision}
               onSend={chat.sendMessage}
               onStop={chat.stopGeneration}
             />

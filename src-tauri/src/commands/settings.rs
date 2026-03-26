@@ -108,9 +108,7 @@ pub async fn update_settings(
     s.config.process.defrag_thold = settings.defrag_thold;
     s.config.process.rope_freq_scale = settings.rope_freq_scale;
     // Normalise the API key: treat empty string as "no key"
-    s.config.server.api_key = settings
-        .api_key
-        .filter(|k| !k.trim().is_empty());
+    s.config.server.api_key = settings.api_key.filter(|k| !k.trim().is_empty());
 
     // Persist to disk.
     s.config

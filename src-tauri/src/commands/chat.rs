@@ -32,20 +32,30 @@ pub async fn send_message(
         return Err("No model loaded".to_string());
     }
 
-    // Save user message to DB (text only for now)
+    let model_name = s.loaded_model.as_deref().unwrap_or("");
+    let model_supports_vision = model_name_supports_vision(model_name);
+
+    if image_base64.is_some() && !model_supports_vision {
+        tracing::warn!(
+            model = model_name,
+            "Image was attached but the loaded model does not advertise vision support"
+        );
+        return Err(format!(
+            "The loaded model `{model_name}` does not advertise vision support. Load a Vision-capable model first."
+        ));
+    }
+
+    // Save user message to DB, including the pasted image when present.
     {
         let db = s.session_db.lock().map_err(|e| e.to_string())?;
         let _ = db
-            .add_message(&session_id, "user", &content, 0)
+            .add_message(&session_id, "user", &content, 0, image_base64.as_deref())
             .map_err(|e| e.to_string())?;
     }
 
     // If image is present, log its size (it will be injected into the prompt below)
     if let Some(ref img) = image_base64 {
-        tracing::info!(
-            len = img.len(),
-            "Received image_base64 for vision model"
-        );
+        tracing::info!(len = img.len(), "Received image_base64 for vision model");
     }
 
     // Build message history from DB
@@ -54,29 +64,37 @@ pub async fn send_message(
         db.get_messages(&session_id).map_err(|e| e.to_string())?
     };
 
+    let mut image_data = Vec::new();
+    let mut next_image_id = 1u32;
     let messages: Vec<ChatMessage> = db_messages
         .iter()
-        .map(|m| ChatMessage {
-            role: m.role.clone(),
-            content: m.content.clone().unwrap_or_default(),
+        .map(|m| {
+            let mut message_content = m.content.clone().unwrap_or_default();
+            if let Some(image_uri) = &m.image_base64 {
+                let image_id = next_image_id;
+                next_image_id += 1;
+                let marker = format!("[img-{image_id}]");
+                message_content = if message_content.trim().is_empty() {
+                    marker
+                } else {
+                    format!("{marker}\n{message_content}")
+                };
+
+                let raw = image_uri.split(',').nth(1).unwrap_or(image_uri);
+                image_data.push(ImageData {
+                    data: raw.to_string(),
+                    id: image_id,
+                });
+            }
+
+            ChatMessage {
+                role: m.role.clone(),
+                content: message_content,
+            }
         })
         .collect();
 
-    // Detect model profile
-    let model_name = s.loaded_model.as_deref().unwrap_or("");
     let profile = crate::models::profiles::ModelProfile::detect(model_name);
-
-    // If an image was attached, prepend [img-1] to the last user message so the
-    // vision model knows where to find the image.  DB always stores clean text.
-    let messages = if let Some(_) = &image_base64 {
-        let mut msgs = messages;
-        if let Some(last) = msgs.last_mut().filter(|m| m.role == "user") {
-            last.content = format!("[img-1]\n{}", last.content);
-        }
-        msgs
-    } else {
-        messages
-    };
 
     // For Qwen-style thinking models: inject /think or /no_think into the last
     // user message before rendering — this controls whether the model reasons.
@@ -115,15 +133,7 @@ pub async fn send_message(
         stream: true,
         stop: profile.stop_markers.clone(),
         special: true,
-        // Strip the data-URI prefix (data:image/jpeg;base64,<data>) so
-        // llama-server receives the raw base64 bytes.
-        image_data: image_base64
-            .as_deref()
-            .map(|uri| {
-                let raw = uri.split(',').nth(1).unwrap_or(uri);
-                vec![ImageData { data: raw.to_string(), id: 1 }]
-            })
-            .unwrap_or_default(),
+        image_data,
     };
 
     let port = s.process.port();
@@ -204,7 +214,7 @@ pub async fn send_message(
     {
         let s = state.read().await;
         let db = s.session_db.lock().map_err(|e| e.to_string())?;
-        let _ = db.add_message(&session_id, "assistant", &stripped, 0);
+        let _ = db.add_message(&session_id, "assistant", &stripped, 0, None);
     }
 
     Ok(stripped)
@@ -216,4 +226,14 @@ pub async fn stop_generation(state: tauri::State<'_, SharedState>) -> Result<(),
     s.generation_stop.store(true, Ordering::Relaxed);
     tracing::info!("stop_generation: cancellation flag set");
     Ok(())
+}
+
+fn model_name_supports_vision(model_name: &str) -> bool {
+    let name = model_name.to_lowercase();
+    name.contains("vision")
+        || name.contains("llava")
+        || name.contains("multimodal")
+        || name.contains("qwen2.5-vl")
+        || name.contains("-vl")
+        || name.contains("_vl")
 }
