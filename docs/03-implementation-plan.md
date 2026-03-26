@@ -60,6 +60,15 @@
 - documentation and examples
 - CI validation
 
+## Phase 8: Inference Runtime Roadmap
+
+- Streaming and async execution hardening
+- Model-aware configuration profiles and family-specific fixes
+- Better context accounting, compaction, and memory handling
+- Tighter `llama.cpp`-style execution control
+
+See [docs/05-inference-runtime-roadmap.md](docs/05-inference-runtime-roadmap.md) for the detailed implementation plan.
+
 ## Success Criteria
 
 - The app launches cleanly on supported platforms

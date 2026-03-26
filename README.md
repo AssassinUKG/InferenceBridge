@@ -198,6 +198,7 @@ npm run tauri dev
 - [docs/02-architecture.md](docs/02-architecture.md)
 - [docs/03-implementation-plan.md](docs/03-implementation-plan.md)
 - [docs/04-debug-api-workspace.md](docs/04-debug-api-workspace.md)
+- [docs/05-inference-runtime-roadmap.md](docs/05-inference-runtime-roadmap.md)
 
 ## License
 
