@@ -1,26 +1,31 @@
 # InferenceBridge
 
-**A local LLM desktop app** — run any GGUF model on your own hardware with an OpenAI-compatible API and a clean, modern UI.
+**A local LLM desktop app** - run any GGUF model on your own hardware with an OpenAI-compatible API and a clean, modern UI.
 
-Built with Tauri (Rust) + React. Wraps `llama-server` from [llama.cpp](https://github.com/ggerganov/llama.cpp) and manages the whole thing — process lifecycle, model loading, streaming chat, API serving, and context monitoring.
+Built with Tauri (Rust) + React. Wraps `llama-server` from [llama.cpp](https://github.com/ggerganov/llama.cpp) and manages the whole thing - process lifecycle, model loading, streaming chat, API serving, and context monitoring.
 
 ---
 
 ## Screenshots
 
 <!-- Chat interface with streaming response -->
-![Chat](docs/screenshots/chat.png)
+<figure>
+  <figcaption>Chat window</figcaption>
+<img src="docs/screenshots/chat.png" width=50% height=50%>
+</figure>
+<figure>
+  <figcaption>Browse HF window</figcaption>
+<img src="docs/screenshots/browse.png" width=50% height=50%>
+</figure>
+<figure>
+  <figcaption>Models window</figcaption>
+<img src="docs/screenshots/models.png" width=50% height=50%>
+  </figure>
+<figure>
+  <figcaption>API window</figcaption>
+<img src="docs/screenshots/api.png" width=50% height=50%>
+  </figure>
 
-<!-- Model browser — search HuggingFace, download with progress -->
-![Browse](docs/screenshots/browse.png)
-
-<!-- Models tab — context slider, VRAM bar, per-family settings -->
-![Models](docs/screenshots/models.png)
-
-<!-- API inspector — live HTTP client for the local API -->
-![API](docs/screenshots/api.png)
-
----
 
 ## Download
 
