@@ -2,7 +2,7 @@
 name = "inference-bridge"
 version = "0.1.0"
 edition = "2021"
-description = "Local LLM inference bridge — replaces LM Studio for HelixClaw"
+description = "Local LLM desktop app with a shared OpenAI-compatible API"
 
 [lib]
 name = "inference_bridge_lib"

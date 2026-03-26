@@ -1,80 +1,93 @@
-# InferenceBridge — Migration & Design Note
+# InferenceBridge Migration and Design Note
 
 ## Purpose
 
-InferenceBridge replaces LM Studio as the local inference layer for HelixClaw.
-It is a Tauri desktop application (Rust backend + React/TypeScript frontend) that
-manages a single `llama-server` (llama.cpp) process, provides an OpenAI-compatible
-API, and adds model-aware template patching, context/KV management, tool-call
-normalization, and session persistence — all things HelixClaw currently works
-around via heuristics in its LLM provider layer.
+InferenceBridge is a desktop-first local inference app that combines:
 
----
+- a Tauri desktop UI
+- a shared OpenAI-compatible API
+- managed `llama-server` lifecycle
+- model-aware prompting and normalization
+- session persistence and debugging tools
 
-## What to Reuse from HelixClaw
+The goal is to make local inference feel like a single product instead of a loose collection of scripts, sidecars, and one-off integrations.
 
-| Component | Source | Lines | Reuse strategy |
-|-----------|--------|-------|----------------|
-| **ModelProfile / ModelFamily** | `llm/model_profiles.rs` | ~516 | **Port directly** — family detection, profile flags (`use_qwen_parser`, `split_tool_calling`, `disable_thinking_for_tools`, etc.), context tiers, temp/penalty defaults. This becomes InferenceBridge's `model_profiles` crate. |
-| **QwenStreamParser** | `llm/qwen_parser.rs` | ~779 | **Port directly** — state machine for `<tool_call>`, `<function=...>`, think-block closure. Core of the output normalization pipeline. |
-| **QwenChatRenderer** | `llm/qwen_renderer.rs` | ~147 | **Port directly** — history turn rendering for Qwen chat format. |
-| **Think-tag stripping** | `llm.rs` `strip_think_tags()` | ~40 | **Port directly** — handles `<think>` and `<|think|>` with salvage. |
-| **JSON repair pipeline** | `llm.rs` `repair_json()` | ~80 | **Port directly** — 5-step repair (fast parse → trailing commas → unclosed strings → rebalance braces → salvage). |
-| **LLM types** | `llm.rs` | ~200 | **Adapt** — `LlmMessage`, `LlmToolCall`, `LlmToolDefinition`, `LlmResponse`, `LlmStreamEvent`. Simplify: remove multi-provider abstraction (InferenceBridge only talks to its own llama-server). |
-| **Context tiering constants** | `llm.rs` `SUPPORTED_CONTEXT_TIERS` | ~10 | **Port directly** — tier breakpoints for auto-context sizing. |
-| **VRAM management logic** | `llm/openai.rs` | ~200 | **Adapt heavily** — `lms_ensure_vram_available()`, model load/unload. Replace LM Studio REST calls with direct llama-server process control. |
-| **Think-suppression suffix** | `llm/model_profiles.rs` | ~15 | **Port** — `lmstudio_think_suppression_suffix()` becomes a general method (no longer LM Studio-specific). |
-| **Retry/backoff** | `llm.rs` `retry_with_backoff()` | ~30 | **Port directly** — generic async retry helper. |
+## Reuse Strategy
 
-### What NOT to reuse
+Several ideas from earlier internal experiments are still useful here:
 
-| Component | Reason |
-|-----------|--------|
-| OpenAI provider HTTP client (`openai.rs` ~6000 lines) | Too coupled to LM Studio's REST API quirks. InferenceBridge talks to its own llama-server via a thin HTTP client — much simpler. |
-| Anthropic / Ollama / OpenAI Responses providers | Out of scope — InferenceBridge is local-only. |
-| Agent actor loop, supervisor, CEO logic | Stays in HelixClaw. InferenceBridge is the inference layer only. |
-| Session JSONL format | InferenceBridge uses SQLite for persistence (richer queries, atomic writes). |
-| Config loader / types.rs | HelixClaw config is agent-focused. InferenceBridge has its own simpler config. |
+| Area | Reuse strategy |
+| --- | --- |
+| Model profiles and family detection | Keep the capability-driven approach so model behavior can be tuned by family |
+| Prompt rendering and template ownership | Keep prompt construction in-app instead of delegating it fully to the backend |
+| Think-tag cleanup and JSON repair | Preserve the normalization pipeline for messy local model output |
+| Retry and health checks | Keep explicit backoff and health probes around the backend process |
+| Context tiering | Keep layered context management rather than a single unbounded prompt |
 
----
+## What Not to Reuse
 
-## Key Design Decisions
+| Area | Reason |
+| --- | --- |
+| Multi-provider abstraction | InferenceBridge focuses on local GGUF inference rather than remote provider switching |
+| LM Studio-specific logic | The app should manage its own process and API surface directly |
+| Flat-file session storage | SQLite provides safer writes and better queries |
+| Agent-specific orchestration logic | InferenceBridge is an inference layer and desktop app, not an agent runner |
 
-### 1. Single llama-server process (Option B)
-- At any time, exactly one model is loaded.
-- Model switch = graceful shutdown of current process → start new process.
-- Eliminates VRAM contention, simplifies KV cache management.
-- HelixClaw's VRAM manager heuristics become unnecessary.
+## Core Design Decisions
 
-### 2. Template subsystem owns chat formatting
-- InferenceBridge applies chat templates BEFORE sending to llama-server.
-- llama-server runs with `--no-chat-template` (raw completion mode).
-- This gives us full control over Qwen patches, think-tag injection, tool-call formatting.
-- Eliminates the current pain point where LM Studio's template handling differs from expectations.
+### 1. One managed backend process
 
-### 3. SQLite for sessions (not JSONL)
-- Richer queries (search messages, filter by model, find tool calls).
-- Atomic writes (no partial-line corruption on crash).
-- Easy export to JSONL if needed.
+At any given time the app runs a single `llama-server` instance for the active model.
 
-### 4. Output normalization pipeline
-- Runs AFTER llama-server returns tokens, BEFORE exposing to API consumers.
-- Pipeline: raw tokens → think-tag strip → Qwen parser (if applicable) → JSON repair → tool-call extraction → validation.
-- Same pipeline for streaming and non-streaming (streaming accumulates then normalizes per-turn).
+- model switch = unload current process, then start the next one
+- simpler VRAM behavior
+- fewer hidden background conflicts
+- easier shared state between GUI and API
 
-### 5. HelixClaw-compatible API
-- Exposes `/v1/chat/completions` and `/v1/models` endpoints.
-- HelixClaw's `openai.rs` can point at InferenceBridge instead of LM Studio with zero code changes.
-- InferenceBridge also adds richer endpoints (`/v1/context/status`, `/v1/sessions`, etc.) that HelixClaw can optionally adopt.
+### 2. Shared state between GUI and API
 
----
+The desktop UI and the public API are two interfaces over the same application state.
+
+- loading from the GUI should be visible through the API
+- loading from the API should be visible in the GUI
+- unload, sessions, and context status should stay in sync
+
+### 3. App-owned prompt and normalization pipeline
+
+InferenceBridge owns the prompt path around the backend:
+
+1. render model-aware prompt
+2. send request to `llama-server`
+3. normalize output
+4. expose the result to GUI and API callers
+
+This keeps behavior consistent across model families and makes debugging possible from inside the app.
+
+### 4. SQLite-backed session persistence
+
+SQLite is used for:
+
+- sessions
+- messages
+- tool calls
+- context snapshots
+
+That gives better durability and better introspection than JSONL-only storage.
+
+### 5. Local API as a first-class feature
+
+The embedded API is not just a test hook. It is a supported part of the product.
+
+- external tools should be able to rely on `http://127.0.0.1:8800/v1`
+- the Debug tab should exercise that same surface
+- serve lifecycle should be visible and controllable in the app
 
 ## Risk Areas
 
 | Risk | Mitigation |
-|------|-----------|
-| llama-server process crashes | Health check loop + auto-restart with backoff. Expose crash count in UI. |
-| KV cache state opacity | llama-server exposes `/health` and `/slots` — poll these for context usage. |
-| Qwen template drift (new model versions) | Template subsystem is pluggable — new templates added without code changes. |
-| GGUF model format variations | Use llama.cpp's own model detection; InferenceBridge just needs the path. |
-| Large context rebuilds are slow | Layered context strategy (pinned/rolling/compressed) minimizes full rebuilds. |
+| --- | --- |
+| Backend crash or stale process | explicit health checks, retries, and visible process controls |
+| Port conflicts | surface owner diagnostics and offer safe kill actions for known stale owners |
+| Model-specific formatting drift | keep template and normalization logic pluggable |
+| Context overflow | track KV usage and trigger compression or rebuild when needed |
+| Vision model misconfiguration | detect nearby projector files and warn when a text-only model is used with images |

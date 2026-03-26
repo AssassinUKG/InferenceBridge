@@ -13,7 +13,7 @@ interface Props {
   error: string | null;
   hasModel: boolean;
   hasSession: boolean;
-  /** Name of the currently loaded model — used to detect thinking support. */
+  /** Name of the currently loaded model used to detect thinking support. */
   loadedModel?: string | null;
   loadedModelSupportsVision?: boolean;
   onSend: (
@@ -170,7 +170,7 @@ export function ChatPanel({
       )}
 
       <div className="border-t border-gray-700 p-3">
-        {/* ── Preset row ── */}
+        {/* Preset row */}
         <div className="flex items-center gap-1.5 mb-2 flex-wrap">
           <span className="text-[10px] uppercase tracking-widest text-gray-600 mr-0.5">Preset</span>
           {PRESET_ORDER.map((key) => {
@@ -198,14 +198,17 @@ export function ChatPanel({
             );
           })}
 
-          {/* Divider */}
           <div style={{ width: "1px", height: "14px", background: "rgba(255,255,255,0.08)", margin: "0 2px" }} />
 
-          {/* Thinking toggle — only shown for models that support it */}
+          {/* Thinking toggle only shown for models that support it */}
           {canThink && (
             <button
               onClick={() => setShowThinking(!showThinking)}
-              title={showThinking ? "Thinking ON — model reasons step-by-step before answering" : "Thinking OFF — direct response (faster)"}
+              title={
+                showThinking
+                  ? "Thinking ON - model reasons step-by-step before answering"
+                  : "Thinking OFF - direct response (faster)"
+              }
               className="flex items-center gap-1.5 rounded px-2 py-0.5 text-xs transition"
               style={{
                 background: showThinking ? "rgba(167,139,250,0.12)" : "transparent",
@@ -214,7 +217,6 @@ export function ChatPanel({
                 cursor: "pointer",
               }}
             >
-              <span style={{ fontSize: "10px" }}>💭</span>
               Think
               <span
                 className="relative shrink-0 rounded-full transition"
@@ -238,7 +240,7 @@ export function ChatPanel({
             </button>
           )}
 
-          {/* Show thinking for non-thinking models still (manual override) */}
+          {/* Show thinking for non-thinking models too (manual override) */}
           {!canThink && (
             <button
               onClick={() => setShowThinking(!showThinking)}
@@ -251,12 +253,11 @@ export function ChatPanel({
                 background: "transparent",
               }}
             >
-              <span style={{ fontSize: "10px" }}>💭</span>
               Think
             </button>
           )}
 
-          {/* Sampling custom button — show/hide fine-tune panel */}
+          {/* Sampling custom button shows or hides the fine-tune panel */}
           <button
             onClick={() => setShowSampling(!showSampling)}
             className="flex items-center gap-1 rounded px-2 py-0.5 text-xs transition"
@@ -268,7 +269,7 @@ export function ChatPanel({
             }}
             title="Fine-tune individual sampling parameters"
           >
-            ⚙ {showSampling ? "Hide" : "Params"}
+            {showSampling ? "Hide Params" : "Params"}
             {Object.values(sampling).some((v) => v !== undefined) && !activePreset && (
               <span className="w-1.5 h-1.5 rounded-full" style={{ background: "#22d3ee" }} />
             )}
@@ -281,7 +282,7 @@ export function ChatPanel({
               style={{ color: "#6b7280", border: "none", background: "transparent", cursor: "pointer" }}
               title="Reset to model defaults"
             >
-              ↺ reset
+              Reset
             </button>
           )}
         </div>
@@ -396,7 +397,7 @@ export function ChatPanel({
               }
             }}
             onPaste={handlePaste}
-            placeholder="Type a message… (Enter to send · Shift+Enter for newline · paste image)"
+            placeholder="Type a message... (Enter to send, Shift+Enter for newline, paste image)"
             rows={1}
             className="flex-1 bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-200 placeholder-gray-500 resize-none focus:outline-none focus:border-blue-500"
           />

@@ -2,8 +2,6 @@ import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-// ── Copy button ───────────────────────────────────────────────────────────────
-
 function CopyButton({ text, small = false }: { text: string; small?: boolean }) {
   const [copied, setCopied] = useState(false);
 
@@ -31,12 +29,10 @@ function CopyButton({ text, small = false }: { text: string; small?: boolean }) 
         fontFamily: "inherit",
       }}
     >
-      {copied ? "✓ Copied" : "Copy"}
+      {copied ? "Copied" : "Copy"}
     </button>
   );
 }
-
-// ── Code block with header ─────────────────────────────────────────────────────
 
 function CodeBlock({ language, code }: { language: string; code: string }) {
   return (
@@ -47,7 +43,6 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
         border: "1px solid rgba(255,255,255,0.08)",
       }}
     >
-      {/* Header bar */}
       <div
         className="flex items-center justify-between px-3 py-1.5"
         style={{
@@ -63,7 +58,6 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
         </span>
         <CopyButton text={code} small />
       </div>
-      {/* Code body */}
       <pre
         className="overflow-x-auto m-0 p-3 text-[12px] leading-relaxed"
         style={{ color: "#e2e8f0", fontFamily: "ui-monospace, 'Cascadia Code', Consolas, monospace" }}
@@ -73,8 +67,6 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
     </div>
   );
 }
-
-// ── Main markdown renderer ────────────────────────────────────────────────────
 
 interface Props {
   content: string;
@@ -86,16 +78,13 @@ export function MarkdownContent({ content }: Props) {
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
-          // ── Code: block vs inline ─────────────────────────────────────────
           pre: ({ children }) => <>{children}</>,
           code: ({ className, children }) => {
             const match = /language-(\w+)/.exec(className || "");
             const codeStr = String(children).replace(/\n$/, "");
-            // Treat as a block if there's a language tag OR it contains newlines
             if (match || codeStr.includes("\n")) {
               return <CodeBlock language={match?.[1] ?? ""} code={codeStr} />;
             }
-            // Inline code
             return (
               <code
                 className="rounded px-1 py-0.5 font-mono text-[12px]"
@@ -109,8 +98,6 @@ export function MarkdownContent({ content }: Props) {
               </code>
             );
           },
-
-          // ── Headings ──────────────────────────────────────────────────────
           h1: ({ children }) => (
             <h1 className="text-lg font-bold mt-3 mb-1.5" style={{ color: "#f1f5f9", borderBottom: "1px solid rgba(255,255,255,0.08)", paddingBottom: "6px" }}>
               {children}
@@ -131,13 +118,9 @@ export function MarkdownContent({ content }: Props) {
               {children}
             </h4>
           ),
-
-          // ── Paragraph ─────────────────────────────────────────────────────
           p: ({ children }) => (
             <p className="my-1.5 leading-relaxed">{children}</p>
           ),
-
-          // ── Lists ─────────────────────────────────────────────────────────
           ul: ({ children }) => (
             <ul className="my-1.5 pl-5 space-y-0.5" style={{ listStyleType: "disc" }}>
               {children}
@@ -153,8 +136,6 @@ export function MarkdownContent({ content }: Props) {
               {children}
             </li>
           ),
-
-          // ── Blockquote ────────────────────────────────────────────────────
           blockquote: ({ children }) => (
             <blockquote
               className="my-2 pl-3 py-0.5"
@@ -168,13 +149,9 @@ export function MarkdownContent({ content }: Props) {
               {children}
             </blockquote>
           ),
-
-          // ── Horizontal rule ───────────────────────────────────────────────
           hr: () => (
             <hr className="my-3" style={{ border: "none", borderTop: "1px solid rgba(255,255,255,0.1)" }} />
           ),
-
-          // ── Table ─────────────────────────────────────────────────────────
           table: ({ children }) => (
             <div className="my-2 overflow-x-auto rounded" style={{ border: "1px solid rgba(255,255,255,0.1)" }}>
               <table className="w-full text-xs border-collapse">{children}</table>
@@ -199,8 +176,6 @@ export function MarkdownContent({ content }: Props) {
               {children}
             </td>
           ),
-
-          // ── Links ─────────────────────────────────────────────────────────
           a: ({ href, children }) => (
             <a
               href={href}
@@ -211,8 +186,6 @@ export function MarkdownContent({ content }: Props) {
               {children}
             </a>
           ),
-
-          // ── Strong / em ───────────────────────────────────────────────────
           strong: ({ children }) => (
             <strong style={{ color: "#f1f5f9", fontWeight: 600 }}>{children}</strong>
           ),
@@ -227,5 +200,4 @@ export function MarkdownContent({ content }: Props) {
   );
 }
 
-// Re-export CopyButton for use in MessageBubble
 export { CopyButton };

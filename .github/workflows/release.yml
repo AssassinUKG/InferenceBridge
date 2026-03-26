@@ -3,11 +3,11 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'          # trigger on v1.0.0, v1.2.3, etc.
-  workflow_dispatch:  # allow manual trigger from GitHub UI
+      - 'v*'
+  workflow_dispatch:
 
 permissions:
-  contents: write   # needed to create GitHub Releases and upload assets
+  contents: write
 
 jobs:
   build:
@@ -29,11 +29,9 @@ jobs:
     name: Build ${{ matrix.name }}
 
     steps:
-      # ── Checkout ────────────────────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── Node ────────────────────────────────────────────────────────────────
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -43,7 +41,6 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # ── Rust ────────────────────────────────────────────────────────────────
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -54,7 +51,6 @@ jobs:
         with:
           workspaces: './src-tauri -> target'
 
-      # ── Linux system libraries ───────────────────────────────────────────────
       - name: Install Linux dependencies
         if: matrix.os == 'ubuntu-22.04'
         run: |
@@ -66,7 +62,6 @@ jobs:
             librsvg2-dev \
             patchelf
 
-      # ── Build ───────────────────────────────────────────────────────────────
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -78,16 +73,17 @@ jobs:
             ## InferenceBridge ${{ github.ref_name }}
 
             ### Installation
-            - **Windows:** Download and run the `.msi` or `.exe` installer
-            - **macOS:** Download the `.dmg`, open it and drag to Applications
-            - **Linux:** Download the `.deb` (Debian/Ubuntu) or `.AppImage`
+            - **Windows:** Download and run the `.msi` or `.exe` installer.
+            - **macOS:** Download the `.dmg`, open it, and drag the app to Applications.
+            - **Linux:** Download the `.deb` or `.AppImage`.
 
             ### First run
-            1. Open the app and go to **Settings → llama-server** → click **Download** to get the inference engine
-            2. Go to **Browse** to find and download a model
-            3. Go to **Models**, click **Load**, then start chatting or connect via the API at `http://localhost:8800/v1`
+            1. Open the app and go to **Settings > llama-server**.
+            2. Click **Download** to fetch the inference engine.
+            3. Go to **Browse** to find and download a model.
+            4. Go to **Models**, click **Load**, then start chatting or connect via `http://localhost:8800/v1`.
 
             See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for full documentation.
-          releaseDraft: true       # creates a draft — review before publishing
+          releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
