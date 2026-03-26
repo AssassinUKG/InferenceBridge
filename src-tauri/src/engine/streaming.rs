@@ -18,14 +18,23 @@ pub enum StreamEvent {
 fn longest_partial_suffix(buffer: &str, candidates: &[&str]) -> usize {
     let mut longest = 0usize;
     for candidate in candidates {
-        let max_len = candidate.len().saturating_sub(1);
-        for suffix_len in 1..=max_len {
-            if buffer.len() >= suffix_len
-                && candidate.starts_with(&buffer[buffer.len() - suffix_len..])
-                && suffix_len > longest
+        for (start, _) in buffer.char_indices() {
+            let suffix = &buffer[start..];
+            if !suffix.is_empty()
+                && suffix.len() < candidate.len()
+                && candidate.starts_with(suffix)
+                && suffix.len() > longest
             {
-                longest = suffix_len;
+                longest = suffix.len();
             }
+        }
+
+        if !buffer.is_empty()
+            && buffer.len() < candidate.len()
+            && candidate.starts_with(buffer)
+            && buffer.len() > longest
+        {
+            longest = buffer.len();
         }
     }
     longest
@@ -280,4 +289,19 @@ pub async fn consume_sse_stream(
     }
 
     Ok(full_text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::longest_partial_suffix;
+
+    #[test]
+    fn longest_partial_suffix_handles_multibyte_unicode() {
+        assert_eq!(longest_partial_suffix("–", &["<think>"]), 0);
+    }
+
+    #[test]
+    fn longest_partial_suffix_keeps_partial_tag_after_unicode_prefix() {
+        assert_eq!(longest_partial_suffix("–<thi", &["<think>"]), 4);
+    }
 }
