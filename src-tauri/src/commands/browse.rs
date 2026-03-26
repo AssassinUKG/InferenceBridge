@@ -1,6 +1,7 @@
 //! Model browser commands backed by live Hugging Face GGUF search and downloads.
 
-use std::path::{Component, PathBuf};
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -209,12 +210,11 @@ fn hf_api_to_hub(m: HfApiModel) -> Option<HubModel> {
     })
 }
 
-async fn fetch_hub_models(
+async fn search_hf_api_models(
     query: Option<&str>,
     offset: u32,
     limit: u32,
-    featured_only: bool,
-) -> Result<Vec<HubModel>, String> {
+) -> Result<Vec<HfApiModel>, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .user_agent("InferenceBridge/1.0")
@@ -243,16 +243,86 @@ async fn fetch_hub_models(
         return Err(format!("HuggingFace returned HTTP {}", resp.status()));
     }
 
-    let models: Vec<HfApiModel> = resp
-        .json()
+    resp.json::<Vec<HfApiModel>>()
         .await
-        .map_err(|e| format!("Failed to parse HuggingFace response: {e}"))?;
+        .map_err(|e| format!("Failed to parse HuggingFace response: {e}"))
+}
+
+async fn fetch_hub_models(
+    query: Option<&str>,
+    offset: u32,
+    limit: u32,
+    featured_only: bool,
+) -> Result<Vec<HubModel>, String> {
+    let models = search_hf_api_models(query, offset, limit).await?;
 
     Ok(models
         .into_iter()
         .filter(|model| !featured_only || is_hf_featured_candidate(model))
         .filter_map(hf_api_to_hub)
         .collect())
+}
+
+fn basename_lower(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_else(|| path.to_lowercase())
+}
+
+fn push_unique_query(queries: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
+    let trimmed = value.trim().trim_matches('-').to_string();
+    if trimmed.len() >= 4 && seen.insert(trimmed.to_lowercase()) {
+        queries.push(trimmed);
+    }
+}
+
+fn build_hf_sync_queries(filename: &str) -> Vec<String> {
+    let stem = Path::new(filename)
+        .file_stem()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| filename.to_string());
+    let normalized = stem.replace('_', "-");
+
+    let mut queries = Vec::new();
+    let mut seen = HashSet::new();
+    push_unique_query(&mut queries, &mut seen, &stem);
+    push_unique_query(&mut queries, &mut seen, &normalized);
+
+    let mut parts: Vec<&str> = normalized
+        .split('-')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    while parts.len() >= 3 && queries.len() < 6 {
+        parts.pop();
+        let candidate = parts.join("-");
+        push_unique_query(&mut queries, &mut seen, &candidate);
+    }
+
+    queries
+}
+
+async fn lookup_hf_supports_vision(filename: &str) -> Result<Option<bool>, String> {
+    let target = filename.to_lowercase();
+    for query in build_hf_sync_queries(filename) {
+        let models = search_hf_api_models(Some(&query), 0, 20).await?;
+        for model in models {
+            if !is_hf_downloadable(&model) {
+                continue;
+            }
+
+            let has_exact_sibling = model.siblings.iter().any(|sibling| {
+                let sibling_name = sibling.rfilename.to_lowercase();
+                sibling_name == target || basename_lower(&sibling_name) == target
+            });
+
+            if has_exact_sibling {
+                return Ok(Some(hf_supports_vision(&model)));
+            }
+        }
+    }
+
+    Ok(None)
 }
 
 /// Search HuggingFace for GGUF models. Returns up to 20 results sorted by downloads.
@@ -275,6 +345,13 @@ pub struct DownloadProgress {
     pub done: bool,
     pub status: String,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetadataSyncSummary {
+    pub scanned_models: usize,
+    pub matched_models: usize,
+    pub updated_models: usize,
 }
 
 // Tauri commands for browsing, downloading, and deleting models.
@@ -417,6 +494,64 @@ pub async fn clear_completed_downloads(
     let mut s = state.write().await;
     s.active_downloads.retain(|_, entry| !entry.progress.done);
     Ok(())
+}
+
+#[tauri::command]
+pub async fn sync_local_model_metadata(
+    state: tauri::State<'_, SharedState>,
+) -> Result<MetadataSyncSummary, String> {
+    let (filenames, scan_dirs) = {
+        let s = state.read().await;
+        (
+            s.model_registry
+                .list()
+                .iter()
+                .map(|model| model.filename.clone())
+                .collect::<Vec<_>>(),
+            s.config.models.scan_dirs.clone(),
+        )
+    };
+
+    let mut matched_models = 0usize;
+    let mut updated_models = 0usize;
+
+    for filename in &filenames {
+        match lookup_hf_supports_vision(filename).await {
+            Ok(Some(supports_vision)) => {
+                matched_models += 1;
+                match crate::models::overrides::set_model_supports_vision_override(
+                    filename,
+                    supports_vision,
+                ) {
+                    Ok(()) => updated_models += 1,
+                    Err(error) => tracing::warn!(
+                        model = %filename,
+                        supports_vision,
+                        error = %error,
+                        "Failed to persist synced Hugging Face metadata override"
+                    ),
+                }
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                model = %filename,
+                error = %error,
+                "Failed to sync model metadata from Hugging Face"
+            ),
+        }
+    }
+
+    let rescanned = tokio::task::spawn_blocking(move || crate::models::scanner::scan_all(&scan_dirs))
+        .await
+        .unwrap_or_default();
+
+    state.write().await.model_registry.update(rescanned);
+
+    Ok(MetadataSyncSummary {
+        scanned_models: filenames.len(),
+        matched_models,
+        updated_models,
+    })
 }
 
 /// Stream-download a GGUF file into the first configured scan directory.
@@ -702,7 +837,7 @@ pub async fn delete_model_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{hf_supports_vision, sanitize_download_subpath, HfApiModel};
+    use super::{build_hf_sync_queries, hf_supports_vision, sanitize_download_subpath, HfApiModel};
     use std::path::PathBuf;
 
     #[test]
@@ -717,6 +852,12 @@ mod tests {
     #[test]
     fn rejects_parent_traversal() {
         assert!(sanitize_download_subpath("../escape.gguf").is_err());
+    }
+
+    #[test]
+    fn reduces_quantized_filename_to_searchable_hf_queries() {
+        let queries = build_hf_sync_queries("Qwen3.5-35B-A3B-Q4_K_M.gguf");
+        assert!(queries.iter().any(|query| query == "Qwen3.5-35B-A3B"));
     }
 
     #[test]

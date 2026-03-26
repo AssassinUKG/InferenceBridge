@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Image attached to a completion request (for vision models).
 /// llama-server expects base64-encoded image data (no data-URI prefix) plus an
@@ -73,8 +74,9 @@ pub struct SlotInfo {
     /// May be absent in newer llama-server versions.
     #[serde(default)]
     pub state: u32,
-    /// Nested token info (newer builds).
-    #[serde(default)]
+    /// Nested token info (newer builds). Some llama.cpp builds return this as a
+    /// single object, while others wrap it in a one-element array.
+    #[serde(default, deserialize_with = "deserialize_next_token")]
     pub next_token: Option<NextTokenInfo>,
     #[serde(default)]
     pub is_processing: bool,
@@ -86,6 +88,28 @@ pub struct NextTokenInfo {
     pub n_decoded: u32,
     #[serde(default)]
     pub n_remain: i64,
+}
+
+fn deserialize_next_token<'de, D>(deserializer: D) -> std::result::Result<Option<NextTokenInfo>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    match value {
+        Value::Object(_) => serde_json::from_value(value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        Value::Array(values) => values
+            .into_iter()
+            .find(|entry| !entry.is_null())
+            .map(|entry| serde_json::from_value(entry).map_err(serde::de::Error::custom))
+            .transpose(),
+        _ => Ok(None),
+    }
 }
 
 /// Server properties from /props endpoint (always available).
@@ -176,5 +200,26 @@ impl LlamaClient {
             Ok(resp) => Ok(resp.status().is_success()),
             Err(_) => Ok(false),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SlotInfo;
+
+    #[test]
+    fn deserializes_slot_info_when_next_token_is_array() {
+        let payload = r#"[{"id":0,"n_ctx":8192,"n_past":0,"state":0,"is_processing":false,"next_token":[{"has_next_token":false,"has_new_line":false,"n_remain":11619,"n_decoded":669}]}]"#;
+        let slots: Vec<SlotInfo> = serde_json::from_str(payload).expect("slot payload should deserialize");
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].n_ctx, 8192);
+        assert_eq!(slots[0].next_token.as_ref().map(|token| token.n_decoded), Some(669));
+    }
+
+    #[test]
+    fn deserializes_slot_info_when_next_token_is_object() {
+        let payload = r#"[{"id":0,"n_ctx":4096,"n_past":128,"state":0,"is_processing":true,"next_token":{"n_remain":12,"n_decoded":128}}]"#;
+        let slots: Vec<SlotInfo> = serde_json::from_str(payload).expect("slot payload should deserialize");
+        assert_eq!(slots[0].next_token.as_ref().map(|token| token.n_decoded), Some(128));
     }
 }

@@ -168,6 +168,12 @@ export interface DownloadProgress {
   error: string | null;
 }
 
+export interface MetadataSyncSummary {
+  scanned_models: number;
+  matched_models: number;
+  updated_models: number;
+}
+
 export const searchHubModels = (query: string, offset: number = 0) =>
   invoke<HubModel[]>("search_hub_models", { query, offset });
 
@@ -192,6 +198,9 @@ export const cancelDownload = (id: string) =>
 
 export const clearCompletedDownloads = () =>
   invoke<void>("clear_completed_downloads");
+
+export const syncLocalModelMetadata = () =>
+  invoke<MetadataSyncSummary>("sync_local_model_metadata");
 
 export const deleteModelFile = (path: string) =>
   invoke<void>("delete_model_file", { path });

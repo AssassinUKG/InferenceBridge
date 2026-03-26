@@ -892,19 +892,13 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
         {/* ── Lifecycle ── */}
         <SectionPanel>
           <SectionHeader title="Lifecycle" />
-          <div className="flex items-center justify-between px-4 py-3">
-            <div>
-              <p className="text-sm font-medium" style={{ color: "var(--text-0)" }}>
-                Kill servers on exit
-              </p>
-              <p className="mt-0.5 text-xs" style={{ color: "var(--text-2)" }}>
-                Stop managed llama-server processes when the app closes.
-              </p>
-            </div>
-            <Toggle
-              checked={settings.kill_on_exit}
-              onChange={() => setSettings({ ...settings, kill_on_exit: !settings.kill_on_exit })}
-            />
+          <div className="px-4 py-3">
+            <p className="text-sm font-medium" style={{ color: "var(--text-0)" }}>
+              Managed backend exit
+            </p>
+            <p className="mt-0.5 text-xs" style={{ color: "var(--text-2)" }}>
+              The desktop app now always unloads the current model and stops the managed llama-server when the window closes.
+            </p>
           </div>
         </SectionPanel>
 

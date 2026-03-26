@@ -67,6 +67,8 @@ export function ModelBrowser({ models, onRefresh }: Props) {
   const [downloads, setDownloads] = useState<Record<string, DownloadProgress>>({});
   const [downloadsOpen, setDownloadsOpen] = useState(false);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
+  const [syncingMetadata, setSyncingMetadata] = useState(false);
+  const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const downloadsMenuRef = useRef<HTMLDivElement>(null);
 
@@ -164,6 +166,24 @@ export function ModelBrowser({ models, onRefresh }: Props) {
       setDeleteConfirm(null);
     } catch (deleteError) {
       alert(`Failed to delete: ${deleteError}`);
+    }
+  }
+
+  async function handleSyncLocalMetadata() {
+    setSyncingMetadata(true);
+    setSyncMessage(null);
+    try {
+      const summary = await api.syncLocalModelMetadata();
+      onRefresh();
+      setSyncMessage(
+        summary.matched_models > 0
+          ? `Synced ${summary.updated_models} of ${summary.matched_models} Hugging Face matches across ${summary.scanned_models} local models.`
+          : `No exact Hugging Face matches found for ${summary.scanned_models} local models.`
+      );
+    } catch (syncError) {
+      setSyncMessage(`Sync failed: ${String(syncError)}`);
+    } finally {
+      setSyncingMetadata(false);
     }
   }
 
@@ -327,7 +347,28 @@ export function ModelBrowser({ models, onRefresh }: Props) {
           </div>
         ) : (
           <div>
-            <p className="mb-3 text-xs" style={{ color: "var(--text-2)" }}>These are your locally scanned .gguf files. Delete removes the file from disk.</p>
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs" style={{ color: "var(--text-2)" }}>These are your locally scanned .gguf files. Delete removes the file from disk.</p>
+              <button
+                onClick={() => void handleSyncLocalMetadata()}
+                disabled={syncingMetadata || models.length === 0}
+                className="rounded px-3 py-1.5 text-xs font-medium transition"
+                style={{
+                  background: syncingMetadata ? "rgba(34,211,238,0.12)" : "var(--surface-2)",
+                  color: syncingMetadata ? "#22d3ee" : "var(--text-1)",
+                  border: syncingMetadata ? "1px solid rgba(34,211,238,0.24)" : "1px solid var(--border)",
+                  cursor: syncingMetadata || models.length === 0 ? "not-allowed" : "pointer",
+                  opacity: syncingMetadata || models.length === 0 ? 0.7 : 1,
+                }}
+              >
+                {syncingMetadata ? "Syncing HF Metadata..." : "Sync HF Metadata"}
+              </button>
+            </div>
+            {syncMessage && (
+              <div className="mb-3 rounded px-3 py-2 text-xs" style={{ background: "rgba(34,211,238,0.08)", border: "1px solid rgba(34,211,238,0.18)", color: "var(--text-1)" }}>
+                {syncMessage}
+              </div>
+            )}
             {models.length === 0 ? (
               <div className="flex items-center justify-center py-16 text-sm" style={{ color: "var(--text-2)" }}>No local models found. Download some from Hugging Face, or add a directory in Settings.</div>
             ) : (

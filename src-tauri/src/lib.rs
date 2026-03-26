@@ -208,6 +208,7 @@ pub fn run() {
             commands::browse::list_downloads,
             commands::browse::cancel_download,
             commands::browse::clear_completed_downloads,
+            commands::browse::sync_local_model_metadata,
             commands::browse::delete_model_file,
             commands::browse::search_hub_models,
             commands::browse::show_in_folder,
@@ -277,18 +278,16 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|app, event| {
             if let RunEvent::Exit = event {
-                // Kill managed llama-server on exit if configured
+                // Always stop the managed public API and backend process when the GUI exits.
                 let state: Option<tauri::State<'_, state::SharedState>> = app.try_state();
                 if let Some(shared) = state {
                     let shared = shared.inner().clone();
                     tauri::async_runtime::block_on(async {
                         let _ = crate::api::runtime::stop_managed(shared.clone()).await;
                         let mut s = shared.write().await;
-                        if s.config.process.kill_on_exit {
-                            tracing::info!("kill_on_exit enabled — shutting down llama-server");
-                            if let Err(e) = s.process.shutdown().await {
-                                tracing::warn!(error = %e, "Error shutting down llama-server");
-                            }
+                        tracing::info!("GUI exit — shutting down managed llama-server");
+                        if let Err(e) = s.process.shutdown().await {
+                            tracing::warn!(error = %e, "Error shutting down llama-server");
                         }
                     });
                 }
