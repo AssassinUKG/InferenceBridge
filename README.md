@@ -9,17 +9,16 @@ Built with Tauri (Rust) + React. Wraps `llama-server` from [llama.cpp](https://g
 ## Screenshots
 
 <!-- Chat interface with streaming response -->
-![Chat](docs/screenshots/chat.png | width=100)
+<img src="docs/screenshots/chat.png" width=50% height=50%>
 
 <!-- Model browser — search HuggingFace, download with progress -->
-![Browse](docs/screenshots/browse.png | width=100)
+<img src="docs/screenshots/browse.png" width=50% height=50%>
 
 <!-- Models tab — context slider, VRAM bar, per-family settings -->
-![Models](docs/screenshots/models.png | width=100)
+<img src="docs/screenshots/models.png" width=50% height=50%>
 
 <!-- API inspector — live HTTP client for the local API -->
-![API](docs/screenshots/api.png | width=100)
-
+<img src="docs/screenshots/api.png" width=50% height=50%>
 ---
 
 ## Download
