@@ -86,6 +86,9 @@ pub struct ResponsesRequest {
     pub reasoning_tokens: Option<u32>,
     #[serde(default)]
     pub previous_response_id: Option<String>,
+    /// Ollama-format options object — e.g. {"options": {"num_ctx": 32768}}.
+    #[serde(default)]
+    pub options: Option<serde_json::Value>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -94,6 +97,11 @@ impl ResponsesRequest {
     fn requested_context_size(&self) -> Option<u32> {
         self.context_size
             .filter(|value| *value > 0)
+            .or_else(|| {
+                self.options
+                    .as_ref()
+                    .and_then(|v| crate::api::completions::extract_context_size_from_value(v))
+            })
             .or_else(|| extract_context_size_from_hash_map(&self.extra))
     }
 }
@@ -200,6 +208,7 @@ fn into_chat_request(request: ResponsesRequest) -> ChatCompletionRequest {
         reasoning_effort: request.reasoning_effort,
         reasoning_tokens: request.reasoning_tokens,
         stream_options: None,
+        options: request.options,
         extra: request.extra,
     }
 }

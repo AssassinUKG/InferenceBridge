@@ -93,8 +93,11 @@ fn resolve_launch_context_size(
         }
     }
 
-    // No explicit override → let llama-server decide from model metadata.
-    None
+    // No explicit override — enforce the configured fallback so llama-server
+    // never silently uses its built-in 4 096-token default.  Users who want the
+    // model's native context window should set  in the
+    // config to a value equal to the model's training context length.
+    Some(fallback_ctx_size)
 }
 
 #[cfg(test)]
@@ -258,6 +261,47 @@ pub async fn backend_load_model(
     model_name: String,
     context_size: Option<u32>,
 ) -> Result<String, String> {
+    // Serialize concurrent model-load requests with a per-app mutex.
+    //
+    // Without this, two simultaneous requests for the same (or different) model both
+    // enter the load path, the second one calls shutdown() + kill() on the process the
+    // first one just started, and they race indefinitely.  With the mutex the second
+    // caller waits, then coalesces — if the first load already loaded the right model
+    // it returns immediately without touching the process at all.
+    let load_mutex = {
+        let s = state.read().await;
+        s.model_load_mutex.clone()
+    };
+    let _load_guard = load_mutex.lock().await;
+
+    // Coalesce: a concurrent load may have already satisfied this request.
+    {
+        let s = state.read().await;
+        if let Some(loaded) = &s.loaded_model {
+            let req = model_name.trim().to_ascii_lowercase();
+            let cur = loaded.to_ascii_lowercase();
+            let name_ok = cur == req
+                || cur.trim_end_matches(".gguf") == req
+                || cur == req.trim_end_matches(".gguf")
+                || (!req.is_empty() && cur.contains(&req));
+            let ctx_ok = context_size
+                .map(|req_ctx| {
+                    s.last_launch_preview
+                        .as_ref()
+                        .and_then(|p| p.context_size)
+                        == Some(req_ctx)
+                })
+                .unwrap_or(true);
+            if name_ok && ctx_ok {
+                tracing::info!(
+                    model = %model_name,
+                    "Coalesced: model already loaded by concurrent request, skipping load"
+                );
+                return Ok(loaded.clone());
+            }
+        }
+    }
+
     let transition = {
         let s = state.read().await;
         load_transition_for_request(s.loaded_model.as_deref(), &model_name)
@@ -405,6 +449,20 @@ pub async fn backend_load_model(
     };
 
     // Phase 2: Launch process (brief write lock, then released)
+    //
+    // Pre-launch cleanup: kill any stale port occupants BEFORE acquiring the write lock.
+    // The WMIC scan inside kill_all_managed_processes() can take 1-3 seconds on Windows.
+    // Running it under the write lock would freeze every concurrent reader for that duration.
+    #[cfg(windows)]
+    {
+        let port = config.port;
+        tokio::task::spawn_blocking(move || {
+            crate::engine::process::LlamaProcess::clear_stale_port_processes(port);
+        })
+        .await
+        .ok();
+    }
+
     publish_model_load_progress(
         &state,
         transition.clone(),
@@ -455,32 +513,40 @@ pub async fn backend_load_model(
             return Err(msg);
         }
 
-        // Check if process crashed
-        {
+        // Check if process crashed.
+        //
+        // Use poll_exited() (non-blocking, no sleep) under the write lock so the lock
+        // is not held during the 100ms stderr-flush wait.  That 100ms sleep previously
+        // blocked every concurrent reader on every crash detection.
+        let process_exited = {
             let mut s = state.write().await;
-            if s.process.check_crashed().await {
-                let stderr = s.process.last_stderr().await;
-                let last_lines: String = stderr
-                    .iter()
-                    .rev()
-                    .take(10)
-                    .rev()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let msg = format!(
-                    "llama-server crashed on startup.\n{}",
-                    if last_lines.is_empty() {
-                        "No stderr output captured.".to_string()
-                    } else {
-                        last_lines
-                    }
-                );
-                tracing::error!("{msg}");
-                emit_load_progress(&app_handle, "error", &msg, 0.0, true, Some(msg.clone()));
-                clear_runtime_after_backend_exit(&mut s, Some(msg.clone()));
-                return Err(msg);
-            }
+            s.process.poll_exited()
+        };
+        if process_exited {
+            // Give the background stderr-reader task a moment to drain — outside the lock.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let mut s = state.write().await;
+            let stderr = s.process.last_stderr().await;
+            let last_lines: String = stderr
+                .iter()
+                .rev()
+                .take(10)
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n");
+            let msg = format!(
+                "llama-server crashed on startup.\n{}",
+                if last_lines.is_empty() {
+                    "No stderr output captured.".to_string()
+                } else {
+                    last_lines
+                }
+            );
+            tracing::error!("{msg}");
+            emit_load_progress(&app_handle, "error", &msg, 0.0, true, Some(msg.clone()));
+            clear_runtime_after_backend_exit(&mut s, Some(msg.clone()));
+            return Err(msg);
         }
 
         match client.get(health_url).send().await {
@@ -601,6 +667,11 @@ pub async fn backend_load_model(
             if let Some(stats) = s.model_stats.as_mut() {
                 stats.context_size = real_ctx;
             }
+            // Sync the real context back into last_launch_preview so that
+            // resolve_loaded_model can correctly detect context mismatches on
+            // subsequent API requests (e.g. if no --ctx-size was explicitly
+            // requested, preview.context_size was None and any explicit-ctx
+            // request would always trigger an unnecessary reload).
             if let Some(preview) = s.last_launch_preview.as_mut() {
                 preview.context_size = Some(real_ctx);
             }

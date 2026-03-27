@@ -21,7 +21,10 @@ pub struct LoadModelRequest {
         alias = "contextlength",
         alias = "ctx_size",
         alias = "n_ctx",
-        alias = "maxContextLength"
+        alias = "maxContextLength",
+        // Ollama format
+        alias = "num_ctx",
+        alias = "numCtx"
     )]
     pub context_size: Option<u32>,
     #[serde(flatten)]
