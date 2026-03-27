@@ -54,7 +54,10 @@ pub struct ChatCompletionRequest {
         alias = "context_size",
         alias = "ctx_size",
         alias = "n_ctx",
-        alias = "maxContextLength"
+        alias = "maxContextLength",
+        // Ollama format (num_ctx inside top-level or inside options object)
+        alias = "num_ctx",
+        alias = "numCtx"
     )]
     pub context_size: Option<u32>,
     #[serde(default)]
@@ -139,6 +142,9 @@ const CONTEXT_SIZE_KEYS: &[&str] = &[
     "ctxSize",
     "n_ctx",
     "nCtx",
+    // Ollama format (also used by HelixClaw when sending to Ollama-compatible endpoints)
+    "num_ctx",
+    "numCtx",
     "maxContextLength",
     "max_context_length",
     "contextWindow",

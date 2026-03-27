@@ -252,6 +252,16 @@ fn api_routes() -> Router<SharedState> {
 fn native_api_routes() -> Router<SharedState> {
     Router::new()
         .route("/models", axum::routing::get(super::models::list_models))
+        // LM Studio-compatible load/unload endpoints at /api/v1/models/load and /api/v1/models/unload.
+        // HelixClaw and other LM Studio clients POST model-load requests (with context_length) here.
+        .route(
+            "/models/load",
+            axum::routing::post(super::models::load_model),
+        )
+        .route(
+            "/models/unload",
+            axum::routing::post(super::models::unload_model),
+        )
         .route("/health", axum::routing::get(super::health::health_check))
 }
 
