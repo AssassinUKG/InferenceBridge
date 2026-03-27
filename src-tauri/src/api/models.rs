@@ -1,3 +1,4 @@
+use crate::api::errors::{ApiErrorResponse, ApiResult};
 use crate::state::{LoadProgress, ModelLoadState, ModelStats, SharedState};
 use axum::{
     extract::{Path, State},
@@ -50,59 +51,24 @@ pub struct LoadModelResponse {
 pub async fn load_model(
     State(state): State<SharedState>,
     Json(req): Json<LoadModelRequest>,
-) -> Json<LoadModelResponse> {
-    {
-        let mut s = state.write().await;
-        s.model_load_state = ModelLoadState::Loading;
-        s.model_load_progress = Some(LoadProgress {
-            stage: "starting".to_string(),
-            message: format!("Loading model {}...", req.model),
-            progress: 0.0,
-            done: false,
-            error: None,
-        });
-    }
-
-    let state_clone = state.clone();
+) -> ApiResult<Json<LoadModelResponse>> {
     let model_name = req.model.clone();
     let context_size = req.requested_context_size();
-    task::spawn(async move {
-        use crate::commands::model::backend_load_model;
-        use crate::context::tracker::reset_slots_warning;
-        let result =
-            backend_load_model(state_clone.clone(), model_name.clone(), context_size).await;
-        let mut s = state_clone.write().await;
-        match result {
-            Ok(_msg) => {
-                s.model_load_state = ModelLoadState::Loaded;
-                s.model_load_progress = Some(LoadProgress {
-                    stage: "ready".to_string(),
-                    message: format!("Model {} loaded.", model_name),
-                    progress: 1.0,
-                    done: true,
-                    error: None,
-                });
-                reset_slots_warning();
-            }
-            Err(e) => {
-                s.model_load_state = ModelLoadState::Error(e.clone());
-                s.model_load_progress = Some(LoadProgress {
-                    stage: "error".to_string(),
-                    message: format!("Failed to load model {}: {}", model_name, e),
-                    progress: 0.0,
-                    done: true,
-                    error: Some(e),
-                });
-            }
-        }
-    });
+
+    crate::commands::model::backend_load_model(state.clone(), model_name.clone(), context_size)
+        .await
+        .map_err(|error| {
+            ApiErrorResponse::service_unavailable(format!(
+                "Failed to load model '{model_name}': {error}"
+            ))
+        })?;
 
     let s = state.read().await;
-    Json(LoadModelResponse {
-        status: "loading".to_string(),
+    Ok(Json(LoadModelResponse {
+        status: "loaded".to_string(),
         progress: s.model_load_progress.clone(),
         model_info: s.model_stats.clone(),
-    })
+    }))
 }
 
 #[cfg(test)]

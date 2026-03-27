@@ -47,7 +47,7 @@ function fmtToolFormat(f: string) {
 }
 
 function fmtNum(v: number | null | undefined) {
-  if (!v) return "—";
+  if (!v) return "n/a";
   return v.toLocaleString();
 }
 
@@ -313,7 +313,7 @@ export function ModelSelector({
             aria-disabled={isLoading}
           >
             <PlusIcon />
-            {isLoading && !loadProgress ? "Scanning…" : "Scan"}
+            {isLoading && !loadProgress ? "Scanning..." : "Scan"}
           </button>
         </div>
 
@@ -332,7 +332,7 @@ export function ModelSelector({
               type="text"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search name, family, or quant…"
+              placeholder="Search name, family, or quant..."
               className="w-full rounded py-1.5 pl-8 pr-3 text-sm outline-none transition"
               style={{
                 background: "var(--surface-2)",
@@ -390,7 +390,7 @@ export function ModelSelector({
           <span className="ml-auto text-xs" style={{ color: "var(--text-2)" }}>
             {filteredModels.length} / {models.length}
             {processStatus?.backend && (
-              <> · <span style={{ color: "#22d3ee" }}>{processStatus.backend}</span></>
+              <> {" | "} <span style={{ color: "#22d3ee" }}>{processStatus.backend}</span></>
             )}
           </span>
         </div>
@@ -728,7 +728,7 @@ function LoadedModelRow({
               cursor: "pointer",
             }}
           >
-            {expanded ? "▲" : "▼"}
+            {expanded ? "^" : "v"}
           </button>
           {previousModel && previousModel !== model.filename && (
             <ActionBtn
@@ -889,7 +889,7 @@ function ModelRow({
               cursor: "pointer",
             }}
           >
-            {expanded ? "▲" : "▼"}
+            {expanded ? "^" : "v"}
           </button>
           {showSwap ? (
             <ActionBtn

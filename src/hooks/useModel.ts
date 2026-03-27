@@ -11,6 +11,27 @@ interface ModelState {
   error: string | null;
 }
 
+function deriveLoadProgress(status: ProcessStatusInfo | null): LoadProgress | null {
+  const transition = status?.model_load_progress ?? null;
+  if (!transition) {
+    return null;
+  }
+  if (!transition.done || transition.error) {
+    return transition;
+  }
+  return null;
+}
+
+function deriveIsLoading(status: ProcessStatusInfo | null) {
+  const transition = deriveLoadProgress(status);
+  return (
+    !!transition ||
+    ["Loading", "Swapping", "Unloading"].includes(
+      status?.model_load_state ?? "Idle"
+    )
+  );
+}
+
 function sameModels(a: ModelInfo[], b: ModelInfo[]) {
   if (a === b) {
     return true;
@@ -65,7 +86,9 @@ function sameProcessStatus(
     a.api_url === b.api_url &&
     a.api_reachable === b.api_reachable &&
     a.api_port_owner?.pid === b.api_port_owner?.pid &&
-    a.api_port_owner?.killable === b.api_port_owner?.killable
+    a.api_port_owner?.killable === b.api_port_owner?.killable &&
+    a.last_launch_preview?.context_size === b.last_launch_preview?.context_size &&
+    a.last_launch_preview?.model_path === b.last_launch_preview?.model_path
   );
 }
 
@@ -84,21 +107,13 @@ export function useModel() {
         api.listModels(),
         api.getProcessStatus(),
       ]);
-      const transition = status.model_load_progress;
+      const transition = deriveLoadProgress(status);
       setState((s) => ({
         ...s,
         models,
         processStatus: status,
-        isLoading:
-          !!transition && !transition.done
-            ? true
-            : ["Loading", "Swapping", "Unloading"].includes(status.model_load_state),
-        loadProgress:
-          transition && !transition.done
-            ? transition
-            : transition?.error
-              ? transition
-              : null,
+        isLoading: deriveIsLoading(status),
+        loadProgress: transition,
         error: transition?.error ?? null,
       }));
     } catch (err) {
@@ -150,18 +165,9 @@ export function useModel() {
                 ...s,
                 processStatus: status,
                 models,
-                isLoading:
-                  !!status.model_load_progress && !status.model_load_progress.done
-                    ? true
-                    : ["Loading", "Swapping", "Unloading"].includes(status.model_load_state),
-                loadProgress:
-                  status.model_load_progress && !status.model_load_progress.done
-                    ? status.model_load_progress
-                    : status.model_load_progress?.error
-                      ? status.model_load_progress
-                      : s.loadProgress?.done
-                        ? null
-                        : s.loadProgress,
+                isLoading: deriveIsLoading(status),
+                loadProgress: deriveLoadProgress(status),
+                error: status.model_load_progress?.error ?? s.error,
               }
         );
       } catch {
