@@ -425,7 +425,7 @@ pub(crate) async fn resolve_loaded_model(
     requested_model: &str,
     requested_context_size: Option<u32>,
 ) -> Result<String, ApiErrorResponse> {
-    let (target_model, needs_swap, current_context_size) = {
+    let (target_model, needs_swap) = {
         let s = state.read().await;
         let target_model = if requested_model.trim().is_empty() {
             s.loaded_model.clone().ok_or_else(ApiErrorResponse::no_model)?
@@ -433,26 +433,16 @@ pub(crate) async fn resolve_loaded_model(
             requested_model.trim().to_string()
         };
 
-        let model_mismatch = match &s.loaded_model {
+        // Only reload if the model NAME mismatches. Never reload just because
+        // the request includes a different context size — that would cause a
+        // full multi-minute reload on every call (LM Studio never does this).
+        let needs_swap = match &s.loaded_model {
             Some(loaded) => !loaded_model_matches_request(loaded, &target_model),
             None => true,
         };
-        let current_context_size = s.last_launch_preview.as_ref().and_then(|preview| preview.context_size);
-        let context_mismatch = requested_context_size
-            .map(|requested| current_context_size != Some(requested))
-            .unwrap_or(false);
 
-        (target_model, model_mismatch || context_mismatch, current_context_size)
+        (target_model, needs_swap)
     };
-
-    tracing::info!(
-        requested_model = %requested_model,
-        target_model = %target_model,
-        requested_context_size = requested_context_size,
-        current_context_size = current_context_size,
-        needs_swap,
-        "Resolving model for API request"
-    );
 
     if needs_swap {
         swap_model_for_api(state, &target_model, requested_context_size).await.map_err(|e| {
@@ -749,13 +739,16 @@ pub async fn chat_completions(
     let model_name = resolve_loaded_model(&state, &requested_model, requested_context_size).await?;
     let profile = crate::models::overrides::detect_effective_profile(&model_name);
 
-    let server_defaults = {
+    let (server_defaults, scheduler, llama_port) = {
         let s = state.read().await;
         (
-            s.config.server.default_temperature,
-            s.config.server.default_top_p,
-            s.config.server.default_top_k,
-            s.config.server.default_max_tokens,
+            (
+                s.config.server.default_temperature,
+                s.config.server.default_top_p,
+                s.config.server.default_top_k,
+                s.config.server.default_max_tokens,
+            ),
+            s.request_scheduler.clone(),
             s.process.port(),
         )
     };
@@ -774,19 +767,13 @@ pub async fn chat_completions(
 
     ensure_runtime_vision_ready(&state, &model_name, &profile, !request.image_data.is_empty())
         .await?;
-
     {
         let mut s = state.write().await;
         s.last_prompt = Some(request.prompt.clone());
     }
-
-    let scheduler = {
-        let s = state.read().await;
-        s.request_scheduler.clone()
-    };
     let _permit = scheduler.acquire().await;
 
-    let client = LlamaClient::new(server_defaults.4);
+    let client = LlamaClient::new(llama_port);
     let generation_started_at = chrono::Utc::now().to_rfc3339();
     let generation_started = std::time::Instant::now();
 
@@ -1114,7 +1101,7 @@ pub async fn text_completions(
         ));
     }
 
-    let (srv_temp, srv_top_p, srv_top_k, srv_max_tokens, port) = {
+    let (srv_temp, srv_top_p, srv_top_k, srv_max_tokens, port, scheduler) = {
         let s = state.read().await;
         (
             s.config.server.default_temperature,
@@ -1122,6 +1109,7 @@ pub async fn text_completions(
             s.config.server.default_top_k,
             s.config.server.default_max_tokens,
             s.process.port(),
+            s.request_scheduler.clone(),
         )
     };
 
@@ -1163,11 +1151,6 @@ pub async fn text_completions(
         let mut s = state.write().await;
         s.last_prompt = Some(prompt);
     }
-
-    let scheduler = {
-        let s = state.read().await;
-        s.request_scheduler.clone()
-    };
     let _permit = scheduler.acquire().await;
 
     let client = LlamaClient::new(port);

@@ -72,32 +72,10 @@ fn normalize_requested_context_size(context_size: Option<u32>) -> Option<u32> {
 /// Returns `None` when no explicit override exists — the server should use the
 /// model's native context window in that case.  Only returns `Some` when the
 /// user, API request, or server config explicitly sets a value.
-fn resolve_launch_context_size(
-    requested_context_size: Option<u32>,
-    server_default_ctx_size: Option<u32>,
-    _profile_default_ctx_size: Option<u32>,
-    fallback_ctx_size: u32,
-) -> Option<u32> {
-    // Explicit request always wins.
-    if let Some(requested) = normalize_requested_context_size(requested_context_size) {
-        return Some(requested);
-    }
-
-    // Server config override (non-zero, different from the generic fallback).
-    let server_default_ctx_size = server_default_ctx_size.filter(|value| *value > 0);
-    let fallback_ctx_size = fallback_ctx_size.max(1);
-
-    if let Some(server_default) = server_default_ctx_size {
-        if server_default != fallback_ctx_size {
-            return Some(server_default);
-        }
-    }
-
-    // No explicit override — enforce the configured fallback so llama-server
-    // never silently uses its built-in 4 096-token default.  Users who want the
-    // model's native context window should set  in the
-    // config to a value equal to the model's training context length.
-    Some(fallback_ctx_size)
+fn resolve_launch_context_size(requested_context_size: Option<u32>) -> Option<u32> {
+    // Only override context if explicitly requested. Otherwise llama-server
+    // reads the context window from the model's GGUF metadata.
+    normalize_requested_context_size(requested_context_size)
 }
 
 #[cfg(test)]
@@ -105,37 +83,18 @@ mod tests {
     use super::resolve_launch_context_size;
 
     #[test]
-    fn prefers_requested_context_size() {
-        assert_eq!(
-            resolve_launch_context_size(Some(32768), Some(8192), Some(32768), 8192),
-            Some(32768)
-        );
+    fn uses_requested_context_size() {
+        assert_eq!(resolve_launch_context_size(Some(32768)), Some(32768));
     }
 
     #[test]
-    fn returns_none_when_no_explicit_override() {
-        // No request, server default matches fallback, profile has a value
-        // → None so llama-server uses model metadata.
-        assert_eq!(
-            resolve_launch_context_size(None, Some(8192), Some(32768), 8192),
-            None
-        );
+    fn returns_none_when_nothing_requested() {
+        assert_eq!(resolve_launch_context_size(None), None);
     }
 
     #[test]
-    fn preserves_explicit_server_default_when_it_differs_from_fallback() {
-        assert_eq!(
-            resolve_launch_context_size(None, Some(16384), Some(32768), 8192),
-            Some(16384)
-        );
-    }
-
-    #[test]
-    fn returns_none_when_nothing_specified() {
-        assert_eq!(
-            resolve_launch_context_size(None, None, None, 8192),
-            None
-        );
+    fn ignores_zero() {
+        assert_eq!(resolve_launch_context_size(Some(0)), None);
     }
 }
 
@@ -274,7 +233,11 @@ pub async fn backend_load_model(
     };
     let _load_guard = load_mutex.lock().await;
 
-    // Coalesce: a concurrent load may have already satisfied this request.
+    // Coalesce: if the right model is already loaded, return immediately.
+    // Only check the model name — never force a reload just because the
+    // requested context_size differs from what is running.  LM Studio never
+    // reloads for context either; the model serves with whatever context it
+    // was originally loaded with.
     {
         let s = state.read().await;
         if let Some(loaded) = &s.loaded_model {
@@ -284,18 +247,10 @@ pub async fn backend_load_model(
                 || cur.trim_end_matches(".gguf") == req
                 || cur == req.trim_end_matches(".gguf")
                 || (!req.is_empty() && cur.contains(&req));
-            let ctx_ok = context_size
-                .map(|req_ctx| {
-                    s.last_launch_preview
-                        .as_ref()
-                        .and_then(|p| p.context_size)
-                        == Some(req_ctx)
-                })
-                .unwrap_or(true);
-            if name_ok && ctx_ok {
+            if name_ok {
                 tracing::info!(
                     model = %model_name,
-                    "Coalesced: model already loaded by concurrent request, skipping load"
+                    "Coalesced: model already loaded, skipping reload"
                 );
                 return Ok(loaded.clone());
             }
@@ -363,12 +318,7 @@ pub async fn backend_load_model(
 
         let mut s = state.write().await;
 
-        let ctx = resolve_launch_context_size(
-            context_size,
-            s.config.server.default_ctx_size,
-            model.profile.default_context_window,
-            s.config.models.default_context,
-        );
+        let ctx = resolve_launch_context_size(context_size);
 
         // Use a provisional context size for pre-launch state.
         // If ctx is None (server decides), use 0 as placeholder — will be

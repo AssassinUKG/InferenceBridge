@@ -53,9 +53,12 @@ pub fn start_managed(state: SharedState, host: String, port: u16, source: &'stat
         };
 
         if source == "gui" {
-            // Give a previous instance a brief moment to finish releasing the socket
-            // during app restarts before we try to bind the public API again.
-            tokio::time::sleep(Duration::from_millis(900)).await;
+            // Brief pause only if the port is still held from a previous instance.
+            // Skip entirely when the port is already free (the common case).
+            let addr = format!("{effective_host}:{effective_port}");
+            if tokio::net::TcpListener::bind(&addr).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
         }
         if let Err(error) =
             crate::api::server::start_api_server_with_shutdown(

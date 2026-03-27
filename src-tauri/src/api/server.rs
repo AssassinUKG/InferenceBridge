@@ -12,7 +12,7 @@ use crate::state::SharedState;
 
 static API_SERVER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static API_SERVER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
-const PUBLIC_API_BIND_RETRIES: u32 = 40;
+const PUBLIC_API_BIND_RETRIES: u32 = 12;
 
 pub(crate) fn reachable_probe_host(host: &str) -> String {
     match host.trim() {
@@ -358,7 +358,7 @@ fn clear_stale_api_port_process(host: &str, port: u16) {
                         .args(["/PID", &owner_pid.to_string(), "/F"])
                         .output();
                     // Give Windows a moment to release the port.
-                    std::thread::sleep(std::time::Duration::from_millis(600));
+                    std::thread::sleep(std::time::Duration::from_millis(200));
                 }
             }
             break;

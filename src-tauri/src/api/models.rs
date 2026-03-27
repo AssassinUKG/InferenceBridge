@@ -9,10 +9,11 @@ use serde::Serialize;
 use std::collections::HashMap;
 use tokio::task;
 
+// ── Load / Unload ──────────────────────────────────────────────────────
+
 #[derive(serde::Deserialize)]
 pub struct LoadModelRequest {
     pub model: String,
-    /// Optional context size override. Uses model profile default when omitted.
     #[serde(
         default,
         alias = "context_size",
@@ -22,11 +23,12 @@ pub struct LoadModelRequest {
         alias = "ctx_size",
         alias = "n_ctx",
         alias = "maxContextLength",
-        // Ollama format
         alias = "num_ctx",
         alias = "numCtx"
     )]
     pub context_size: Option<u32>,
+    #[serde(default)]
+    pub echo_load_config: bool,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -39,16 +41,31 @@ impl LoadModelRequest {
     }
 }
 
-#[derive(serde::Deserialize)]
-pub struct ModelStatsRequest {
-    pub model: Option<String>,
+/// LM Studio-compatible load response.
+#[derive(serde::Serialize)]
+pub struct LoadModelResponse {
+    /// Always `"llm"` for GGUF models.
+    #[serde(rename = "type")]
+    pub model_type: String,
+    /// Identifier of the loaded instance (matches the model filename).
+    pub instance_id: String,
+    /// Time taken to load the model in seconds.
+    pub load_time_seconds: f64,
+    /// `"loaded"` on success.
+    pub status: String,
+    /// Echoed load config (only when `echo_load_config: true` in request).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_config: Option<LoadConfig>,
+    // InferenceBridge extensions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress: Option<LoadProgress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_info: Option<ModelStats>,
 }
 
 #[derive(serde::Serialize)]
-pub struct LoadModelResponse {
-    pub status: String,
-    pub progress: Option<LoadProgress>,
-    pub model_info: Option<ModelStats>,
+pub struct LoadConfig {
+    pub context_length: u32,
 }
 
 pub async fn load_model(
@@ -57,6 +74,7 @@ pub async fn load_model(
 ) -> ApiResult<Json<LoadModelResponse>> {
     let model_name = req.model.clone();
     let context_size = req.requested_context_size();
+    let echo_load_config = req.echo_load_config;
 
     tracing::info!(
         model = %model_name,
@@ -64,6 +82,7 @@ pub async fn load_model(
         "Native model load requested"
     );
 
+    let load_start = std::time::Instant::now();
     crate::commands::model::backend_load_model(state.clone(), model_name.clone(), context_size)
         .await
         .map_err(|error| {
@@ -71,10 +90,20 @@ pub async fn load_model(
                 "Failed to load model '{model_name}': {error}"
             ))
         })?;
+    let load_time_seconds = load_start.elapsed().as_secs_f64();
 
     let s = state.read().await;
+    let actual_ctx = s.model_stats.as_ref().map(|st| st.context_size).unwrap_or(0);
+    let loaded_name = s.loaded_model.clone().unwrap_or_else(|| model_name.clone());
+
     Ok(Json(LoadModelResponse {
+        model_type: "llm".to_string(),
+        instance_id: loaded_name,
+        load_time_seconds,
         status: "loaded".to_string(),
+        load_config: echo_load_config.then(|| LoadConfig {
+            context_length: actual_ctx,
+        }),
         progress: s.model_load_progress.clone(),
         model_info: s.model_stats.clone(),
     }))
@@ -113,11 +142,46 @@ mod tests {
     }
 }
 
-pub async fn unload_model(State(state): State<SharedState>) -> Json<serde_json::Value> {
+/// LM Studio-compatible unload.  Accepts `{"instance_id": "..."}` or
+/// `{"model": "..."}` — both are treated as the model identifier.
+#[derive(serde::Deserialize, Default)]
+pub struct UnloadModelRequest {
+    #[serde(default)]
+    pub instance_id: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+pub async fn unload_model(
+    State(state): State<SharedState>,
+    body: Option<Json<UnloadModelRequest>>,
+) -> Json<serde_json::Value> {
+    let instance_id = body
+        .and_then(|b| b.instance_id.clone().or_else(|| b.model.clone()))
+        .or_else(|| {
+            // Fall back to the currently loaded model if no body was sent.
+            futures::executor::block_on(async {
+                let s = state.read().await;
+                s.loaded_model.clone()
+            })
+        });
+
     match crate::commands::model::backend_unload_model(state).await {
-        Ok(message) => Json(serde_json::json!({ "status": "unloaded", "message": message })),
+        Ok(_) => Json(serde_json::json!({
+            "instance_id": instance_id,
+            "status": "unloaded"
+        })),
         Err(error) => Json(serde_json::json!({ "status": "error", "error": error })),
     }
+}
+
+// ── OpenAI-compatible /v1/models ────────────────────────────────────────
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[derive(Serialize)]
@@ -126,13 +190,21 @@ pub struct ModelsResponse {
     pub data: Vec<ModelObject>,
 }
 
+/// OpenAI-spec model object.  Required fields: id, object, created, owned_by.
 #[derive(Serialize, Clone)]
 pub struct ModelObject {
     pub id: String,
     pub object: String,
+    pub created: u64,
     pub owned_by: String,
+    // LM Studio / InferenceBridge extensions — always included so HelixClaw
+    // and similar clients can discover context window & load state.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_context_length: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
     pub reasoning: ReasoningCapability,
 }
 
@@ -140,6 +212,7 @@ pub struct ModelObject {
 pub struct ModelDetailResponse {
     pub id: String,
     pub object: String,
+    pub created: u64,
     pub owned_by: String,
     pub active: bool,
     pub path: String,
@@ -150,6 +223,7 @@ pub struct ModelDetailResponse {
     pub supports_reasoning: bool,
     pub supports_vision: bool,
     pub context_window: Option<u32>,
+    pub max_context_length: Option<u32>,
     pub max_output_tokens: Option<u32>,
     pub quant: Option<String>,
     pub tool_call_format: String,
@@ -166,6 +240,13 @@ pub struct ReasoningCapability {
     pub default_effort: Option<String>,
 }
 
+// ── Model stats ─────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct ModelStatsRequest {
+    pub model: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct ModelStatsResponse {
     pub requested_model: Option<String>,
@@ -177,14 +258,17 @@ pub struct ModelStatsResponse {
     pub model: Option<ModelDetailResponse>,
 }
 
+// ── Handlers ────────────────────────────────────────────────────────────
+
 pub async fn list_models(State(state): State<SharedState>) -> Json<ModelsResponse> {
     let snapshot = get_or_scan_models(&state).await;
     let loaded = snapshot.loaded_model.as_deref();
+    let loaded_ctx = snapshot.loaded_context_size;
 
     let data: Vec<ModelObject> = snapshot
         .models
         .iter()
-        .map(|model| model_object_from_scanned(model, loaded))
+        .map(|model| model_object_from_scanned(model, loaded, loaded_ctx))
         .collect();
 
     Json(ModelsResponse {
@@ -199,11 +283,12 @@ pub async fn get_model(
 ) -> Result<Json<ModelDetailResponse>, StatusCode> {
     let snapshot = get_or_scan_models(&state).await;
     let loaded = snapshot.loaded_model.as_deref();
+    let loaded_ctx = snapshot.loaded_context_size;
     let Some(model) = find_model_in_snapshot(&snapshot.models, &model_name) else {
         return Err(StatusCode::NOT_FOUND);
     };
 
-    Ok(Json(model_detail_from_scanned(model, loaded)))
+    Ok(Json(model_detail_from_scanned(model, loaded, loaded_ctx)))
 }
 
 pub async fn model_stats(
@@ -225,6 +310,7 @@ async fn model_stats_inner(
 ) -> Result<Json<ModelStatsResponse>, StatusCode> {
     let snapshot = get_or_scan_models(&state).await;
     let active_model = snapshot.loaded_model.clone();
+    let loaded_ctx = snapshot.loaded_context_size;
     let requested_model = requested_model
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -269,14 +355,17 @@ async fn model_stats_inner(
         state: state_value,
         progress,
         stats,
-        model: model.map(|model| model_detail_from_scanned(&model, active_model.as_deref())),
+        model: model.map(|model| model_detail_from_scanned(&model, active_model.as_deref(), loaded_ctx)),
     }))
 }
+
+// ── Snapshot / scanning ─────────────────────────────────────────────────
 
 #[derive(Clone)]
 struct ModelRegistrySnapshot {
     models: Vec<crate::models::scanner::ScannedModel>,
     loaded_model: Option<String>,
+    loaded_context_size: Option<u32>,
 }
 
 async fn get_or_scan_models(state: &SharedState) -> ModelRegistrySnapshot {
@@ -286,6 +375,7 @@ async fn get_or_scan_models(state: &SharedState) -> ModelRegistrySnapshot {
             return ModelRegistrySnapshot {
                 models: s.model_registry.list().to_vec(),
                 loaded_model: s.loaded_model.clone(),
+                loaded_context_size: s.model_stats.as_ref().map(|st| st.context_size).filter(|v| *v > 0),
             };
         }
     }
@@ -308,8 +398,11 @@ async fn get_or_scan_models(state: &SharedState) -> ModelRegistrySnapshot {
     ModelRegistrySnapshot {
         models: s.model_registry.list().to_vec(),
         loaded_model: s.loaded_model.clone(),
+        loaded_context_size: s.model_stats.as_ref().map(|st| st.context_size).filter(|v| *v > 0),
     }
 }
+
+// ── Helpers ─────────────────────────────────────────────────────────────
 
 fn find_model_in_snapshot<'a>(
     models: &'a [crate::models::scanner::ScannedModel],
@@ -369,14 +462,20 @@ fn names_match(left: &str, right: &str) -> bool {
 fn model_object_from_scanned(
     model: &crate::models::scanner::ScannedModel,
     loaded_model: Option<&str>,
+    loaded_ctx: Option<u32>,
 ) -> ModelObject {
+    let is_active = loaded_model
+        .map(|loaded| names_match(loaded, &model.filename))
+        .unwrap_or(false);
+
     ModelObject {
         id: model.filename.clone(),
         object: "model".to_string(),
-        owned_by: "local".to_string(),
-        active: loaded_model
-            .map(|loaded| names_match(loaded, &model.filename))
-            .unwrap_or(false),
+        created: now_unix_secs(),
+        owned_by: "inference-bridge".to_string(),
+        active: is_active,
+        max_context_length: model.profile.max_context_window,
+        state: Some(if is_active { "loaded" } else { "not-loaded" }.to_string()),
         reasoning: reasoning_capability(&model.profile),
     }
 }
@@ -384,24 +483,23 @@ fn model_object_from_scanned(
 fn model_detail_from_scanned(
     model: &crate::models::scanner::ScannedModel,
     loaded_model: Option<&str>,
+    loaded_ctx: Option<u32>,
 ) -> ModelDetailResponse {
     use crate::models::profiles::ThinkTagStyle;
 
-    // All current ToolCallFormats (NativeApi, HermesXml, QwenXml) represent tool-capable
-    // models. NativeApi is the standard tool_calls field — it IS tool support, not a lack
-    // of it. supports_parallel_tools is an extra capability flag on top.
-    // (If a future ToolCallFormat::NoTools variant is added, exclude it here.)
     let supports_tools = true;
-    let _ = &model.profile.supports_parallel_tools; // kept for future per-model flags
+    let _ = &model.profile.supports_parallel_tools;
     let supports_reasoning = !matches!(model.profile.think_tag_style, ThinkTagStyle::None);
+    let is_active = loaded_model
+        .map(|loaded| names_match(loaded, &model.filename))
+        .unwrap_or(false);
 
     ModelDetailResponse {
         id: model.filename.clone(),
         object: "model".to_string(),
-        owned_by: "local".to_string(),
-        active: loaded_model
-            .map(|loaded| names_match(loaded, &model.filename))
-            .unwrap_or(false),
+        created: now_unix_secs(),
+        owned_by: "inference-bridge".to_string(),
+        active: is_active,
         path: model.path.to_string_lossy().to_string(),
         size_bytes: model.size_bytes,
         size_gb: model.size_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
@@ -409,7 +507,8 @@ fn model_detail_from_scanned(
         supports_tools,
         supports_reasoning,
         supports_vision: model.profile.supports_vision,
-        context_window: model.profile.default_context_window,
+        context_window: if is_active { loaded_ctx } else { model.profile.default_context_window },
+        max_context_length: model.profile.max_context_window,
         max_output_tokens: model.profile.default_max_output_tokens,
         quant: extract_quant(&model.filename),
         tool_call_format: format!("{:?}", model.profile.tool_call_format),
