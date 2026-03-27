@@ -70,6 +70,11 @@ pub struct ChatCompletionRequest {
     pub reasoning_tokens: Option<u32>,
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    /// Ollama-format options object — e.g. {"num_ctx": 32768}.
+    /// Context size is extracted from here via requested_context_size() if not set
+    /// at the top level.
+    #[serde(default)]
+    pub options: Option<serde_json::Value>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -119,6 +124,12 @@ impl ChatCompletionRequest {
     pub fn requested_context_size(&self) -> Option<u32> {
         self.context_size
             .filter(|value| *value > 0)
+            // Check Ollama-style options object: {"options": {"num_ctx": 32768}}
+            .or_else(|| {
+                self.options
+                    .as_ref()
+                    .and_then(|v| extract_context_size_from_value(v))
+            })
             .or_else(|| extract_context_size_from_hash_map(&self.extra))
     }
 
@@ -187,7 +198,7 @@ fn parse_context_size_string(text: &str) -> Option<u32> {
     None
 }
 
-fn extract_context_size_from_value(value: &serde_json::Value) -> Option<u32> {
+pub(crate) fn extract_context_size_from_value(value: &serde_json::Value) -> Option<u32> {
     match value {
         serde_json::Value::Number(number) => number
             .as_u64()

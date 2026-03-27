@@ -93,8 +93,11 @@ fn resolve_launch_context_size(
         }
     }
 
-    // No explicit override → let llama-server decide from model metadata.
-    None
+    // No explicit override — enforce the configured fallback so llama-server
+    // never silently uses its built-in 4 096-token default.  Users who want the
+    // model's native context window should set  in the
+    // config to a value equal to the model's training context length.
+    Some(fallback_ctx_size)
 }
 
 #[cfg(test)]
@@ -663,6 +666,14 @@ pub async fn backend_load_model(
             s.last_context_status = Some(empty_context_status(real_ctx));
             if let Some(stats) = s.model_stats.as_mut() {
                 stats.context_size = real_ctx;
+            }
+            // Sync the real context back into last_launch_preview so that
+            // resolve_loaded_model can correctly detect context mismatches on
+            // subsequent API requests (e.g. if no --ctx-size was explicitly
+            // requested, preview.context_size was None and any explicit-ctx
+            // request would always trigger an unnecessary reload).
+            if let Some(preview) = s.last_launch_preview.as_mut() {
+                preview.context_size = Some(real_ctx);
             }
             tracing::info!(real_ctx, "Discovered actual context size from running server");
         }

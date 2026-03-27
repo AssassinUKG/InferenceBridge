@@ -95,6 +95,10 @@ async fn serve_api_server(
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
+    // Pre-bind cleanup: kill stale InferenceBridge processes that may be
+    // holding the public API port from a previous run (Windows-specific).
+    clear_stale_api_port_process(host, port);
+
     let addr = format!("{host}:{port}");
     tracing::info!(pid, attempt, source, %addr, "Binding InferenceBridge API server");
 
@@ -292,6 +296,77 @@ async fn update_api_status(
     }
 }
 
+/// Kill any stale InferenceBridge process holding `port` so a fresh bind can
+/// succeed.  Only runs on Windows and only acts when the port is actually busy.
+/// This must be called OUTSIDE any lock — the process scan can take a moment.
+fn clear_stale_api_port_process(host: &str, port: u16) {
+    #[cfg(windows)]
+    {
+        use std::net::TcpListener;
+        use std::os::windows::process::CommandExt;
+
+        // Fast path: port is free, nothing to do.
+        let probe_host = reachable_probe_host(host);
+        if TcpListener::bind(format!("{probe_host}:{port}")).is_ok() {
+            return;
+        }
+
+        // Port is busy — find the owner and kill it if it is a stale IB process.
+        let mut command = std::process::Command::new("netstat");
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        let Ok(output) = command.args(["-ano", "-p", "tcp"]).output() else {
+            return;
+        };
+        if !output.status.success() {
+            return;
+        }
+
+        let port_suffix = format!(":{port}");
+        let current_pid = std::process::id();
+
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let cols: Vec<&str> = line.split_whitespace().collect();
+            if cols.len() < 5 {
+                continue;
+            }
+            let proto = cols[0];
+            let local_addr = cols[1];
+            let state = cols[3];
+            let Ok(owner_pid) = cols[4].parse::<u32>() else {
+                continue;
+            };
+
+            if !proto.eq_ignore_ascii_case("TCP")
+                || !local_addr.ends_with(&port_suffix)
+                || state != "LISTENING"
+                || owner_pid == current_pid
+            {
+                continue;
+            }
+
+            // Only auto-kill other InferenceBridge instances (not unrelated processes).
+            if let Some(name) = process_name_for_pid_windows(owner_pid) {
+                if name.to_lowercase().contains("inference-bridge") {
+                    tracing::warn!(
+                        owner_pid,
+                        port,
+                        %name,
+                        "Killing stale InferenceBridge process holding the public API port"
+                    );
+                    let _ = std::process::Command::new("taskkill")
+                        .creation_flags(0x08000000)
+                        .args(["/PID", &owner_pid.to_string(), "/F"])
+                        .output();
+                    // Give Windows a moment to release the port.
+                    std::thread::sleep(std::time::Duration::from_millis(600));
+                }
+            }
+            break;
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (host, port);
+}
 fn format_bind_error(host: &str, port: u16, error: &std::io::Error) -> String {
     let api_url = reachable_api_url(host, port);
     if error.kind() == std::io::ErrorKind::AddrInUse {
