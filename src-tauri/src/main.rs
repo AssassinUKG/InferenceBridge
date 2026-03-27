@@ -135,6 +135,7 @@ enum Commands {
     /// Benchmark a model: load, run a prompt, and print stats.
     ///
     /// Example: inference-bridge test-model --model qwen3.5-9b --ctx 8192 --prompt "What is 2 + 2?" --max-tokens 64 --temperature 0.1
+    #[command(visible_alias = "benchmark")]
     TestModel {
         /// Model to load (filename or partial match).
         #[arg(long, short = 'm')]
@@ -167,6 +168,10 @@ enum Commands {
         /// Random seed (-1 = random).
         #[arg(long)]
         seed: Option<i64>,
+
+        /// Emit benchmark results as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -243,6 +248,7 @@ fn main() {
             top_p,
             top_k,
             seed,
+            json,
         }) => {
             inference_bridge_lib::run_model_test_cli(
                 model,
@@ -258,6 +264,7 @@ fn main() {
                 cli.threads,
                 cli.backend_preference.clone(),
                 cli.verbose,
+                json,
             );
         }
         None => {

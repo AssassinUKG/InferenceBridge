@@ -17,7 +17,7 @@ pub struct ToolCall {
 /// Extract tool calls from text using various formats.
 pub fn extract_tool_calls(text: &str) -> (Vec<ToolCall>, String) {
     let mut calls = Vec::new();
-    let mut remaining = text.to_string();
+    let mut remaining = crate::normalize::think_strip::strip_think_tags(text);
 
     // Try Hermes-style <tool_call>{json}</tool_call>
     extract_hermes_calls(&mut remaining, &mut calls);
@@ -30,7 +30,8 @@ pub fn extract_tool_calls(text: &str) -> (Vec<ToolCall>, String) {
 
 pub fn extract_tool_calls_for_profile(text: &str, profile: &ModelProfile) -> (Vec<ToolCall>, String) {
     let mut calls = Vec::new();
-    let mut remaining = text.to_string();
+    let mut remaining =
+        crate::normalize::think_strip::strip_think_tags_with_style(text, profile.think_tag_style);
 
     match profile.parser_type {
         ParserType::QwenStateMachine => {
@@ -98,10 +99,17 @@ fn extract_qwen_function_calls(text: &mut String, calls: &mut Vec<ToolCall>) {
         let mut args = serde_json::Map::new();
         for param_cap in param_re.captures_iter(body) {
             let key = param_cap.get(1).unwrap().as_str().trim();
-            let value = param_cap.get(2).unwrap().as_str().trim();
-            // Try to parse as JSON value, fall back to string
-            let json_val = serde_json::from_str(value)
-                .unwrap_or_else(|_| serde_json::Value::String(value.to_string()));
+            let raw_value = param_cap.get(2).unwrap().as_str();
+            let trimmed = raw_value.trim();
+            let parse_as_json = (trimmed.starts_with('{') && trimmed.ends_with('}'))
+                || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+                || (trimmed.starts_with('"') && trimmed.ends_with('"'));
+            let json_val = if parse_as_json {
+                serde_json::from_str(trimmed)
+                    .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()))
+            } else {
+                serde_json::Value::String(raw_value.to_string())
+            };
             args.insert(key.to_string(), json_val);
         }
 
@@ -165,5 +173,23 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "ping");
         assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn qwen_xml_preserves_parameter_whitespace() {
+        let text = "<function=echo><parameter=text>  keep surrounding spaces  </parameter></function>";
+        let (calls, _) = extract_tool_calls_for_profile(text, &qwen_profile());
+        assert_eq!(
+            calls[0].arguments["text"],
+            serde_json::Value::String("  keep surrounding spaces  ".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_tool_calls_inside_think_blocks() {
+        let text = "<think><function=secret><parameter=x>1</parameter></function></think>Answer";
+        let (calls, remaining) = extract_tool_calls_for_profile(text, &qwen_profile());
+        assert!(calls.is_empty());
+        assert_eq!(remaining, "Answer");
     }
 }

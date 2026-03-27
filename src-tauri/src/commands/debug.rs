@@ -129,6 +129,18 @@ pub async fn debug_api_request(
             Ok(response) => response,
             Err(status) => status.into_response(),
         }
+    } else if method == "POST" && path == "/v1/responses" {
+        let body = request.body.unwrap_or_else(|| "{}".to_string());
+        let mut parsed =
+            serde_json::from_str::<crate::api::responses::ResponsesRequest>(&body)
+                .map_err(|e| format!("Invalid JSON for /v1/responses: {e}"))?;
+        if parsed.stream {
+            parsed.stream = false;
+        }
+        match crate::api::responses::responses(AxumState(shared), axum::Json(parsed)).await {
+            Ok(response) => response,
+            Err(status) => status.into_response(),
+        }
     } else if method == "GET" {
         if let Some(model_name) = path.strip_prefix("/v1/models/") {
             if !model_name.is_empty() && !model_name.contains('/') {

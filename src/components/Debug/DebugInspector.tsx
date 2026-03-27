@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type {
   DebugApiResponse,
   EffectiveProfileInfo,
+  LoadProgress,
   LogEntry,
   ModelInfo,
   ProcessStatusInfo,
@@ -20,6 +21,7 @@ type Example = {
 interface Props {
   apiUrl: string;
   processStatus: ProcessStatusInfo | null;
+  loadProgress: LoadProgress | null;
   models: ModelInfo[];
   onSetApiServerRunning: (running: boolean) => Promise<void> | void;
   onOpenSettings: () => void;
@@ -254,6 +256,7 @@ function exampleList(activeModel: string | null, selectedModel: string | null): 
 export function DebugInspector({
   apiUrl,
   processStatus,
+  loadProgress,
   models,
   onSetApiServerRunning,
   onOpenSettings,
@@ -281,6 +284,15 @@ export function DebugInspector({
   const activeModel = processStatus?.model ?? null;
   const serveState = processStatus?.api_state ?? "Idle";
   const serveReachable = processStatus?.api_reachable ?? false;
+  const modelTransition =
+    loadProgress && !loadProgress.done
+      ? loadProgress
+      : processStatus?.model_load_progress ?? null;
+  const modelTransitionActive =
+    (!!modelTransition && !modelTransition.done) ||
+    ["Loading", "Swapping", "Unloading"].includes(
+      processStatus?.model_load_state ?? "Idle"
+    );
   const serveRunning = serveState === "Running" && serveReachable;
   const serveStarting = serveState === "Starting";
   const selectedModel = selectedProfileModel || activeModel || models[0]?.filename || null;
@@ -448,12 +460,24 @@ export function DebugInspector({
         >
           <div className="grid gap-3 px-4 py-3 lg:grid-cols-4">
             <div>
-              <div className="flex items-center gap-2 text-sm font-semibold" style={{ color: serveRunning ? "#34d399" : serveStarting ? "#fde68a" : serveState === "Error" ? "#f87171" : "var(--text-0)" }}>
-                <StatusDot running={serveRunning} starting={serveStarting} error={serveState === "Error"} />
-                <span>{serveRunning ? "Running" : serveStarting ? "Starting" : serveState === "Error" ? "Unreachable" : "Stopped"}</span>
+              <div className="flex items-center gap-2 text-sm font-semibold" style={{ color: serveRunning ? "#34d399" : serveStarting || modelTransitionActive ? "#fde68a" : serveState === "Error" ? "#f87171" : "var(--text-0)" }}>
+                <StatusDot running={serveRunning} starting={serveStarting || modelTransitionActive} error={serveState === "Error" && !modelTransitionActive} />
+                <span>
+                  {serveRunning
+                    ? "Running"
+                    : modelTransitionActive
+                      ? processStatus?.model_load_state ?? "Loading"
+                      : serveStarting
+                        ? "Starting"
+                        : serveState === "Error"
+                          ? "Unreachable"
+                          : "Stopped"}
+                </span>
               </div>
               <p className="mt-2 text-xs" style={{ color: "var(--text-1)" }}>
-                {serveRunning
+                {modelTransitionActive
+                  ? modelTransition?.message ?? "Model transition in progress."
+                  : serveRunning
                   ? "Public API is reachable for external tools."
                   : serveStarting
                     ? "Public API is starting up."

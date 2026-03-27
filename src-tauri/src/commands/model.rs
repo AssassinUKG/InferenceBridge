@@ -1,4 +1,14 @@
 /// Emit a model-load-progress event to the GUI (no-op if handle is None / headless).
+fn emit_load_progress_payload(
+    handle: &Option<tauri::AppHandle>,
+    progress: &crate::state::LoadProgress,
+) {
+    use tauri::Emitter;
+    if let Some(h) = handle {
+        let _ = h.emit("model-load-progress", progress.clone());
+    }
+}
+
 fn emit_load_progress(
     handle: &Option<tauri::AppHandle>,
     stage: &str,
@@ -7,18 +17,91 @@ fn emit_load_progress(
     done: bool,
     error: Option<String>,
 ) {
-    use tauri::Emitter;
-    if let Some(h) = handle {
-        let _ = h.emit(
-            "model-load-progress",
-            crate::state::LoadProgress {
-                stage: stage.to_string(),
-                message: msg.to_string(),
-                progress,
-                done,
-                error,
-            },
-        );
+    emit_load_progress_payload(
+        handle,
+        &crate::state::LoadProgress {
+            stage: stage.to_string(),
+            message: msg.to_string(),
+            progress,
+            done,
+            error,
+        },
+    );
+}
+
+fn done_model_load_state(
+    transition: &crate::state::ModelLoadState,
+    error: Option<&str>,
+) -> crate::state::ModelLoadState {
+    if let Some(error) = error {
+        return crate::state::ModelLoadState::Error(error.to_string());
+    }
+
+    match transition {
+        crate::state::ModelLoadState::Unloading => crate::state::ModelLoadState::Idle,
+        _ => crate::state::ModelLoadState::Loaded,
+    }
+}
+
+fn load_transition_for_request(
+    current_model: Option<&str>,
+    requested_model: &str,
+) -> crate::state::ModelLoadState {
+    match current_model {
+        Some(current) if !names_match(current, requested_model) => {
+            crate::state::ModelLoadState::Swapping
+        }
+        _ => crate::state::ModelLoadState::Loading,
+    }
+}
+
+fn names_match(left: &str, right: &str) -> bool {
+    let left = left.to_lowercase();
+    let right = right.to_lowercase();
+    left == right
+        || left.trim_end_matches(".gguf") == right
+        || left == right.trim_end_matches(".gguf")
+}
+
+async fn publish_model_load_progress(
+    state: &SharedState,
+    transition: crate::state::ModelLoadState,
+    stage: &str,
+    msg: &str,
+    progress: f32,
+    done: bool,
+    error: Option<String>,
+) {
+    let payload = crate::state::LoadProgress {
+        stage: stage.to_string(),
+        message: msg.to_string(),
+        progress,
+        done,
+        error: error.clone(),
+    };
+
+    let app_handle = {
+        let mut s = state.write().await;
+        s.model_load_state = if done {
+            done_model_load_state(&transition, error.as_deref())
+        } else {
+            transition.clone()
+        };
+        s.model_load_progress = Some(payload.clone());
+        s.app_handle.clone()
+    };
+
+    emit_load_progress_payload(&app_handle, &payload);
+}
+
+fn model_load_state_label(state: &crate::state::ModelLoadState) -> String {
+    match state {
+        crate::state::ModelLoadState::Idle => "Idle".to_string(),
+        crate::state::ModelLoadState::Loading => "Loading".to_string(),
+        crate::state::ModelLoadState::Swapping => "Swapping".to_string(),
+        crate::state::ModelLoadState::Unloading => "Unloading".to_string(),
+        crate::state::ModelLoadState::Loaded => "Loaded".to_string(),
+        crate::state::ModelLoadState::Error(_) => "Error".to_string(),
     }
 }
 
@@ -65,20 +148,27 @@ pub async fn backend_load_model(
     model_name: String,
     context_size: Option<u32>,
 ) -> Result<String, String> {
+    let transition = {
+        let s = state.read().await;
+        load_transition_for_request(s.loaded_model.as_deref(), &model_name)
+    };
+
     // Grab the app handle once (no lock held after this point).
     let app_handle = {
         let s = state.read().await;
         s.app_handle.clone()
     };
 
-    emit_load_progress(
-        &app_handle,
+    publish_model_load_progress(
+        &state,
+        transition.clone(),
         "resolving",
         "Resolving model...",
         0.0,
         false,
         None,
-    );
+    )
+    .await;
 
     // Phase 1: Resolve model info (brief lock) + claim loading generation
     let (config, model_filename, my_generation, launch_preview) = {
@@ -105,7 +195,14 @@ pub async fn backend_load_model(
                 .cloned()
                 .ok_or_else(|| {
                     let msg = format!("Model not found: {model_name}");
-                    emit_load_progress(&app_handle, "error", &msg, 0.0, true, Some(msg.clone()));
+                    let payload = crate::state::LoadProgress {
+                        stage: "error".to_string(),
+                        message: msg.clone(),
+                        progress: 0.0,
+                        done: true,
+                        error: Some(msg.clone()),
+                    };
+                    emit_load_progress_payload(&app_handle, &payload);
                     msg
                 })?
         };
@@ -138,13 +235,27 @@ pub async fn backend_load_model(
 
         LlamaProcess::validate_launch_config(&config).map_err(|e| {
             let msg = format!("Invalid launch configuration: {e}");
-            emit_load_progress(&app_handle, "error", &msg, 0.0, true, Some(msg.clone()));
+            let payload = crate::state::LoadProgress {
+                stage: "error".to_string(),
+                message: msg.clone(),
+                progress: 0.0,
+                done: true,
+                error: Some(msg.clone()),
+            };
+            emit_load_progress_payload(&app_handle, &payload);
             msg
         })?;
 
         let preview = s.process.build_args_preview(&config).map_err(|e| {
             let msg = format!("Could not build launch preview: {e}");
-            emit_load_progress(&app_handle, "error", &msg, 0.0, true, Some(msg.clone()));
+            let payload = crate::state::LoadProgress {
+                stage: "error".to_string(),
+                message: msg.clone(),
+                progress: 0.0,
+                done: true,
+                error: Some(msg.clone()),
+            };
+            emit_load_progress_payload(&app_handle, &payload);
             msg
         })?;
 
@@ -167,14 +278,16 @@ pub async fn backend_load_model(
     let size_info = format!("{} (ctx: {})", model_filename, ctx);
 
     // Phase 2: Launch process (brief write lock, then released)
-    emit_load_progress(
-        &app_handle,
+    publish_model_load_progress(
+        &state,
+        transition.clone(),
         "launching",
         &format!("Launching llama-server for {}...", model_filename),
         0.05,
         false,
         None,
-    );
+    )
+    .await;
     {
         let mut s = state.write().await;
         s.process.launch(config).await.map_err(|e| {
@@ -348,7 +461,9 @@ use crate::engine::download;
 use crate::engine::process::{LaunchConfig, LaunchPreview, LlamaProcess};
 use crate::models::overrides::{detect_effective_profile, effective_override};
 use crate::models::scanner;
-use crate::state::{EffectiveProfileInfo, LoadProgress, SharedState};
+use crate::state::{
+    EffectiveProfileInfo, GenerationRequest, LoadProgress, RuntimePerformanceMetrics, SharedState,
+};
 use tauri::Emitter;
 
 fn command_no_window(program: &str) -> std::process::Command {
@@ -848,24 +963,58 @@ pub async fn load_model(
 }
 
 pub async fn backend_unload_model(state: SharedState) -> Result<String, String> {
+    publish_model_load_progress(
+        &state,
+        crate::state::ModelLoadState::Unloading,
+        "unloading",
+        "Unloading active model...",
+        0.0,
+        false,
+        None,
+    )
+    .await;
+
     let mut s = state.write().await;
-    s.process
-        .shutdown()
-        .await
-        .map_err(|e| format!("Failed to unload: {e}"))?;
+    if let Err(error) = s.process.shutdown().await {
+        let msg = format!("Failed to unload: {error}");
+        drop(s);
+        publish_model_load_progress(
+            &state,
+            crate::state::ModelLoadState::Unloading,
+            "error",
+            &msg,
+            0.0,
+            true,
+            Some(msg.clone()),
+        )
+        .await;
+        return Err(msg);
+    }
 
     let unloaded = s.loaded_model.take();
     if let Some(name) = unloaded.clone() {
         s.previous_model = Some(name.clone());
     }
-    s.model_load_state = crate::state::ModelLoadState::Idle;
-    s.model_load_progress = None;
     s.model_stats = None;
+    drop(s);
 
-    Ok(match unloaded {
+    let result = match unloaded {
         Some(name) if !name.is_empty() => format!("Unloaded {name}"),
         _ => "Unloaded active model".to_string(),
-    })
+    };
+
+    publish_model_load_progress(
+        &state,
+        crate::state::ModelLoadState::Unloading,
+        "ready",
+        &result,
+        1.0,
+        true,
+        None,
+    )
+    .await;
+
+    Ok(result)
 }
 
 #[tauri::command]
@@ -883,7 +1032,7 @@ pub async fn get_process_status(
 pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusInfo, String> {
     // Extract everything we need from the lock, then drop it before any I/O
     let (
-        state_str,
+        process_state,
         server_path,
         is_running,
         port,
@@ -898,12 +1047,18 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
         last_launch_preview,
         startup_duration_ms,
         parallel_slots,
+        scheduler_snapshot,
+        model_load_state,
+        model_load_progress,
+        active_generation,
+        last_generation_metrics,
     ) = {
         let s = state.read().await;
         let server_path = s.process.find_server_binary();
-        let is_running = s.process.state() != crate::engine::process::ProcessState::Idle;
+        let process_state = s.process.state();
+        let is_running = process_state != crate::engine::process::ProcessState::Idle;
         (
-            format!("{:?}", s.process.state()),
+            process_state,
             server_path,
             is_running,
             s.process.port(),
@@ -921,8 +1076,30 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
             s.last_launch_preview.clone(),
             s.last_startup_duration_ms,
             Some(s.config.process.parallel_slots),
+            s.request_scheduler.snapshot(),
+            s.model_load_state.clone(),
+            s.model_load_progress.clone(),
+            s.active_generation.clone(),
+            s.last_generation_metrics.clone(),
         )
     }; // read lock released before any async I/O
+
+    let state_str = format!("{process_state:?}");
+    let model_load_state_label = model_load_state_label(&model_load_state);
+
+    let transition_active = matches!(
+        process_state,
+        crate::engine::process::ProcessState::Starting
+            | crate::engine::process::ProcessState::Stopping
+    ) || matches!(
+        model_load_state,
+        crate::state::ModelLoadState::Loading
+            | crate::state::ModelLoadState::Swapping
+            | crate::state::ModelLoadState::Unloading
+    ) || model_load_progress
+        .as_ref()
+        .map(|progress| !progress.done)
+        .unwrap_or(false);
 
     let api_reachable = probe_public_api(&api_url).await;
 
@@ -958,19 +1135,23 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
 
     let effective_api_state = if api_reachable {
         "Running".to_string()
+    } else if transition_active {
+        "Starting".to_string()
     } else if api_state == "Running" {
         "Error".to_string()
     } else {
         api_state.clone()
     };
 
-    let api_port_owner = if effective_api_state == "Error" && !api_reachable {
+    let api_port_owner = if effective_api_state == "Error" && !api_reachable && !transition_active {
         detect_api_port_owner(api_port)
     } else {
         None
     };
 
     let effective_api_error = if api_reachable {
+        None
+    } else if transition_active {
         None
     } else if effective_api_state == "Error" {
         if api_port_owner.is_some() {
@@ -1011,7 +1192,14 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
         startup_duration_ms,
         parallel_slots,
         slot_count,
+        active_requests: scheduler_snapshot.active,
+        queued_requests: scheduler_snapshot.queued,
+        scheduler_limit: Some(scheduler_snapshot.limit),
         last_launch_preview,
+        model_load_state: model_load_state_label,
+        model_load_progress,
+        active_generation,
+        last_generation_metrics,
     })
 }
 
@@ -1257,7 +1445,7 @@ fn list_llama_processes_tasklist() -> Result<Vec<ExternalProcess>, String> {
 #[tauri::command]
 pub async fn kill_process(pid: u32) -> Result<String, String> {
     let output = command_no_window("taskkill")
-        .args(["/PID", &pid.to_string(), "/F"])
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
         .output()
         .map_err(|e| format!("Failed to kill process: {e}"))?;
 
@@ -1386,6 +1574,9 @@ pub struct ProcessStatusInfo {
     pub state: String,
     pub model: Option<String>,
     pub previous_model: Option<String>,
+    pub model_load_state: String,
+    pub model_load_progress: Option<LoadProgress>,
+    pub active_generation: Option<GenerationRequest>,
     pub crash_count: u32,
     pub server_version: Option<String>,
     pub server_path: Option<String>,
@@ -1398,7 +1589,11 @@ pub struct ProcessStatusInfo {
     pub startup_duration_ms: Option<u64>,
     pub parallel_slots: Option<u32>,
     pub slot_count: Option<u32>,
+    pub active_requests: usize,
+    pub queued_requests: usize,
+    pub scheduler_limit: Option<u32>,
     pub last_launch_preview: Option<LaunchPreview>,
+    pub last_generation_metrics: Option<RuntimePerformanceMetrics>,
 }
 
 #[derive(Clone, serde::Serialize)]

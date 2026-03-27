@@ -135,6 +135,7 @@ pub struct LlamaProcess {
     state: ProcessState,
     llama_server_path: Option<PathBuf>,
     current_model: Option<String>,
+    current_pid: Option<u32>,
     current_port: u16,
     crash_count: u32,
     state_tx: watch::Sender<ProcessState>,
@@ -148,6 +149,16 @@ pub struct LlamaProcess {
 }
 
 impl LlamaProcess {
+    async fn wait_for_port_release(port: u16, timeout: Duration) {
+        let started = std::time::Instant::now();
+        while started.elapsed() < timeout {
+            if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     pub fn validate_launch_config(config: &LaunchConfig) -> anyhow::Result<()> {
         if !config.model_path.exists() {
             anyhow::bail!("Model file does not exist: {}", config.model_path.display());
@@ -389,6 +400,7 @@ impl LlamaProcess {
             state: ProcessState::Idle,
             llama_server_path: None,
             current_model: None,
+            current_pid: None,
             current_port: 8801,
             crash_count: 0,
             state_tx,
@@ -506,6 +518,7 @@ impl LlamaProcess {
         );
 
         let mut child = cmd.spawn()?;
+        let child_pid = child.id();
 
         // Abort any leftover I/O tasks from a previous launch
         for handle in self.io_tasks.drain(..) {
@@ -565,6 +578,7 @@ impl LlamaProcess {
         }
 
         self.child = Some(child);
+        self.current_pid = child_pid;
         self.current_model = config
             .model_path
             .file_name()
@@ -613,6 +627,7 @@ impl LlamaProcess {
             self.set_state(ProcessState::Stopping);
             tracing::info!(
                 model = ?self.current_model,
+                pid = self.current_pid,
                 port = self.current_port,
                 "Shutting down llama-server"
             );
@@ -636,13 +651,22 @@ impl LlamaProcess {
             if exit.is_err() {
                 tracing::warn!("llama-server did not exit gracefully, killing");
                 let _ = child.kill().await;
+                let _ = child.wait().await;
             } else {
                 tracing::info!("llama-server exited gracefully");
             }
 
+            if let Some(pid) = self.current_pid {
+                let _ = Self::force_kill_process_tree(pid);
+            }
+
             self.current_model = None;
+            self.current_pid = None;
             *self.detected_backend.lock().await = None;
+            self.stderr_lines.lock().await.clear();
             self.set_state(ProcessState::Idle);
+            Self::wait_for_port_release(self.current_port, Duration::from_secs(3)).await;
+            tokio::time::sleep(Duration::from_millis(350)).await;
         }
         // Abort background I/O reader tasks
         for handle in self.io_tasks.drain(..) {
@@ -675,6 +699,7 @@ impl LlamaProcess {
                         "llama-server process exited unexpectedly"
                     );
                     self.child = None;
+                    self.current_pid = None;
                     self.crash_count += 1;
                     self.set_state(ProcessState::Error);
                     true
@@ -697,5 +722,92 @@ impl LlamaProcess {
 
     pub fn crash_count(&self) -> u32 {
         self.crash_count
+    }
+
+    #[cfg(windows)]
+    fn normalize_windows_path(path: &str) -> String {
+        path.trim_matches('"').trim().replace('/', "\\").to_lowercase()
+    }
+
+    #[cfg(windows)]
+    fn force_kill_process_tree(pid: u32) -> anyhow::Result<()> {
+        let output = system_command("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output()?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+        if stderr.contains("not found") || stderr.contains("there is no running instance") {
+            Ok(())
+        } else {
+            anyhow::bail!("Failed to kill PID {pid}: {}", stderr.trim())
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn force_kill_process_tree(_pid: u32) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    pub fn kill_all_managed_processes() -> anyhow::Result<u32> {
+        let managed_exe =
+            Self::normalize_windows_path(&Self::managed_binary_dir().join("llama-server.exe").to_string_lossy());
+
+        let output = system_command("wmic")
+            .args([
+                "process",
+                "where",
+                "name='llama-server.exe'",
+                "get",
+                "ProcessId,ExecutablePath",
+                "/FORMAT:CSV",
+            ])
+            .output()?;
+
+        if !output.status.success() {
+            anyhow::bail!(
+                "Failed to query llama-server processes: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut killed = 0u32;
+        for line in text.lines().skip(1) {
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() < 3 {
+                continue;
+            }
+
+            let executable_path = Self::normalize_windows_path(parts[1]);
+            let pid = parts[2]
+                .trim_matches('"')
+                .trim()
+                .parse::<u32>()
+                .unwrap_or(0);
+
+            if pid == 0 || executable_path.is_empty() {
+                continue;
+            }
+
+            if executable_path == managed_exe {
+                match Self::force_kill_process_tree(pid) {
+                    Ok(_) => killed += 1,
+                    Err(error) => {
+                        tracing::warn!(pid, error = %error, "Failed to kill managed llama-server process");
+                    }
+                }
+            }
+        }
+
+        Ok(killed)
+    }
+
+    #[cfg(not(windows))]
+    pub fn kill_all_managed_processes() -> anyhow::Result<u32> {
+        Ok(0)
     }
 }

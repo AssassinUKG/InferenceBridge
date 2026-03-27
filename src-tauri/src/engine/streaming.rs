@@ -10,7 +10,8 @@ pub enum StreamEvent {
         full_text: String,
         tokens_predicted: u32,
         tokens_evaluated: u32,
-        tokens_per_second: f64,
+        decode_tokens_per_second: f64,
+        prompt_tokens_per_second: Option<f64>,
     },
     Error(String),
 }
@@ -117,7 +118,8 @@ pub async fn consume_sse_stream(
     let mut in_think = false;
     let mut tokens_predicted: u32 = 0;
     let mut tokens_evaluated: u32 = 0;
-    let mut tokens_per_second: f64 = 0.0;
+    let mut decode_tokens_per_second: f64 = 0.0;
+    let mut prompt_tokens_per_second: Option<f64> = None;
     let mut got_first_token = false;
 
     let first_token_timeout = std::time::Duration::from_secs(300);
@@ -130,7 +132,8 @@ pub async fn consume_sse_stream(
                     full_text: full_text.clone(),
                     tokens_predicted,
                     tokens_evaluated,
-                    tokens_per_second,
+                    decode_tokens_per_second,
+                    prompt_tokens_per_second,
                 })
                 .await;
             return Ok(full_text);
@@ -164,7 +167,8 @@ pub async fn consume_sse_stream(
                             full_text: full_text.clone(),
                             tokens_predicted,
                             tokens_evaluated,
-                            tokens_per_second,
+                            decode_tokens_per_second,
+                            prompt_tokens_per_second,
                         })
                         .await;
                 }
@@ -200,7 +204,8 @@ pub async fn consume_sse_stream(
                             full_text: full_text.clone(),
                             tokens_predicted,
                             tokens_evaluated,
-                            tokens_per_second,
+                            decode_tokens_per_second,
+                            prompt_tokens_per_second,
                         })
                         .await;
                     return Ok(full_text);
@@ -228,7 +233,13 @@ pub async fn consume_sse_stream(
                                 .get("timings")
                                 .and_then(|timings| timings["predicted_per_second"].as_f64())
                             {
-                                tokens_per_second = value;
+                                decode_tokens_per_second = value;
+                            }
+                            if let Some(value) = json
+                                .get("timings")
+                                .and_then(|timings| timings["prompt_per_second"].as_f64())
+                            {
+                                prompt_tokens_per_second = Some(value);
                             }
 
                             if !parser_buffer.is_empty() {
@@ -247,7 +258,8 @@ pub async fn consume_sse_stream(
                                     full_text: full_text.clone(),
                                     tokens_predicted,
                                     tokens_evaluated,
-                                    tokens_per_second,
+                                    decode_tokens_per_second,
+                                    prompt_tokens_per_second,
                                 })
                                 .await;
                             return Ok(full_text);
@@ -283,7 +295,8 @@ pub async fn consume_sse_stream(
                 full_text: full_text.clone(),
                 tokens_predicted,
                 tokens_evaluated,
-                tokens_per_second,
+                decode_tokens_per_second,
+                prompt_tokens_per_second,
             })
             .await;
     }

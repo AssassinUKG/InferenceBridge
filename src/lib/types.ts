@@ -24,10 +24,36 @@ export interface LaunchPreview {
   args: string[];
 }
 
+export interface GenerationRequest {
+  id: string;
+  source: string;
+  session_id: string | null;
+  model: string;
+  started_at: string;
+  status: string;
+}
+
+export interface RuntimePerformanceMetrics {
+  source: string;
+  model: string;
+  started_at: string;
+  finished_at: string;
+  elapsed_ms: number;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  total_tokens: number | null;
+  prompt_tokens_per_second: number | null;
+  decode_tokens_per_second: number | null;
+  end_to_end_tokens_per_second: number | null;
+}
+
 export interface ProcessStatusInfo {
   state: string;
   model: string | null;
   previous_model: string | null;
+  model_load_state: string;
+  model_load_progress: LoadProgress | null;
+  active_generation: GenerationRequest | null;
   crash_count: number;
   server_version: string | null;
   server_path: string | null;
@@ -40,7 +66,11 @@ export interface ProcessStatusInfo {
   startup_duration_ms: number | null;
   parallel_slots: number | null;
   slot_count: number | null;
+  active_requests: number;
+  queued_requests: number;
+  scheduler_limit: number | null;
   last_launch_preview: LaunchPreview | null;
+  last_generation_metrics: RuntimePerformanceMetrics | null;
 }
 
 export interface ApiPortOwnerInfo {

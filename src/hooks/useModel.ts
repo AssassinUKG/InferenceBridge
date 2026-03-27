@@ -45,6 +45,17 @@ function sameProcessStatus(
     a.state === b.state &&
     a.model === b.model &&
     a.previous_model === b.previous_model &&
+    a.model_load_state === b.model_load_state &&
+    a.model_load_progress?.stage === b.model_load_progress?.stage &&
+    a.model_load_progress?.message === b.model_load_progress?.message &&
+    a.model_load_progress?.progress === b.model_load_progress?.progress &&
+    a.model_load_progress?.done === b.model_load_progress?.done &&
+    a.model_load_progress?.error === b.model_load_progress?.error &&
+    a.active_generation?.id === b.active_generation?.id &&
+    a.active_generation?.status === b.active_generation?.status &&
+    a.last_generation_metrics?.finished_at === b.last_generation_metrics?.finished_at &&
+    a.last_generation_metrics?.decode_tokens_per_second ===
+      b.last_generation_metrics?.decode_tokens_per_second &&
     a.crash_count === b.crash_count &&
     a.server_version === b.server_version &&
     a.server_path === b.server_path &&
@@ -73,7 +84,23 @@ export function useModel() {
         api.listModels(),
         api.getProcessStatus(),
       ]);
-      setState((s) => ({ ...s, models, processStatus: status, error: null }));
+      const transition = status.model_load_progress;
+      setState((s) => ({
+        ...s,
+        models,
+        processStatus: status,
+        isLoading:
+          !!transition && !transition.done
+            ? true
+            : ["Loading", "Swapping", "Unloading"].includes(status.model_load_state),
+        loadProgress:
+          transition && !transition.done
+            ? transition
+            : transition?.error
+              ? transition
+              : null,
+        error: transition?.error ?? null,
+      }));
     } catch (err) {
       setState((s) => ({ ...s, error: String(err) }));
     }
@@ -119,7 +146,23 @@ export function useModel() {
         setState((s) =>
           sameProcessStatus(s.processStatus, status) && sameModels(s.models, models)
             ? s
-            : { ...s, processStatus: status, models }
+            : {
+                ...s,
+                processStatus: status,
+                models,
+                isLoading:
+                  !!status.model_load_progress && !status.model_load_progress.done
+                    ? true
+                    : ["Loading", "Swapping", "Unloading"].includes(status.model_load_state),
+                loadProgress:
+                  status.model_load_progress && !status.model_load_progress.done
+                    ? status.model_load_progress
+                    : status.model_load_progress?.error
+                      ? status.model_load_progress
+                      : s.loadProgress?.done
+                        ? null
+                        : s.loadProgress,
+              }
         );
       } catch {
         // ignore polling errors

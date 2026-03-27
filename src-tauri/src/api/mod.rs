@@ -3,5 +3,6 @@ pub mod errors;
 pub mod extensions;
 pub mod health;
 pub mod models;
+pub mod responses;
 pub mod runtime;
 pub mod server;

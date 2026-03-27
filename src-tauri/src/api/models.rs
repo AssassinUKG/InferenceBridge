@@ -104,6 +104,7 @@ pub struct ModelObject {
     pub owned_by: String,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub active: bool,
+    pub reasoning: ReasoningCapability,
 }
 
 #[derive(Serialize, Clone)]
@@ -124,6 +125,16 @@ pub struct ModelDetailResponse {
     pub quant: Option<String>,
     pub tool_call_format: String,
     pub think_tag_style: String,
+    pub reasoning: ReasoningCapability,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ReasoningCapability {
+    pub supported: bool,
+    pub separates_content: bool,
+    pub effort_values: Vec<String>,
+    pub supports_reasoning_tokens: bool,
+    pub default_effort: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -337,6 +348,7 @@ fn model_object_from_scanned(
         active: loaded_model
             .map(|loaded| names_match(loaded, &model.filename))
             .unwrap_or(false),
+        reasoning: reasoning_capability(&model.profile),
     }
 }
 
@@ -373,6 +385,34 @@ fn model_detail_from_scanned(
         quant: extract_quant(&model.filename),
         tool_call_format: format!("{:?}", model.profile.tool_call_format),
         think_tag_style: format!("{:?}", model.profile.think_tag_style),
+        reasoning: reasoning_capability(&model.profile),
+    }
+}
+
+fn reasoning_capability(
+    profile: &crate::models::profiles::ModelProfile,
+) -> ReasoningCapability {
+    let supported = !matches!(
+        profile.think_tag_style,
+        crate::models::profiles::ThinkTagStyle::None
+    );
+
+    ReasoningCapability {
+        supported,
+        separates_content: supported,
+        effort_values: if supported {
+            vec![
+                "none".to_string(),
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string(),
+            ]
+        } else {
+            Vec::new()
+        },
+        supports_reasoning_tokens: supported,
+        default_effort: supported.then(|| "medium".to_string()),
     }
 }
 

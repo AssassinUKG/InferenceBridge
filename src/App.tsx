@@ -42,8 +42,20 @@ function App() {
   const debugApiUrl =
     model.processStatus?.api_url ??
     `http://${settings?.server_host ?? "127.0.0.1"}:${settings?.server_port ?? 8800}/v1`;
+  const modelTransition =
+    model.loadProgress && !model.loadProgress.done
+      ? model.loadProgress
+      : model.processStatus?.model_load_progress && !model.processStatus.model_load_progress.done
+      ? model.processStatus.model_load_progress
+      : null;
+  const modelTransitionActive =
+    !!modelTransition ||
+    model.isLoading ||
+    ["Loading", "Swapping", "Unloading"].includes(
+      model.processStatus?.model_load_state ?? "Idle"
+    );
   const apiStartupError =
-    model.processStatus?.api_state === "Error"
+    model.processStatus?.api_state === "Error" && !modelTransitionActive
       ? model.processStatus.api_error
       : null;
   const apiState = model.processStatus?.api_state ?? "Idle";
@@ -202,7 +214,7 @@ function App() {
             {apiStartupError}
           </p>
           <p className="mt-1 text-xs" style={{ color: "#fda4af" }}>
-            The desktop UI still talks to InferenceBridge directly. This only affects external API clients that expect the public `8800` endpoint.
+            The desktop UI still talks to InferenceBridge directly. This only affects external API clients that expect the public endpoint at `{debugApiUrl}`.
           </p>
           {apiPortOwner && !apiReachable && (
             <p className="mt-2 text-xs" style={{ color: "#fecaca" }}>
@@ -253,6 +265,31 @@ function App() {
               </button>
             )}
           </div>
+        </div>
+      )}
+
+      {!apiStartupError && modelTransitionActive && modelTransition && (
+        <div
+          className="shrink-0 border-b px-4 py-3"
+          style={{
+            borderColor: "rgba(251, 191, 36, 0.24)",
+            background: "rgba(120, 53, 15, 0.18)",
+            color: "#fde68a",
+          }}
+        >
+          <p className="text-sm font-semibold">
+            {model.processStatus?.model_load_state === "Swapping"
+              ? "Swapping model"
+              : model.processStatus?.model_load_state === "Unloading"
+                ? "Unloading model"
+                : "Loading model"}
+          </p>
+          <p className="mt-1 text-sm" style={{ color: "#fcd34d" }}>
+            {modelTransition.message}
+          </p>
+          <p className="mt-1 text-xs" style={{ color: "#fde68a" }}>
+            The API is temporarily warming up while the backend changes state. External clients should retry once loading completes.
+          </p>
         </div>
       )}
 
@@ -324,6 +361,7 @@ function App() {
             <DebugInspector
               apiUrl={debugApiUrl}
               processStatus={model.processStatus}
+              loadProgress={model.loadProgress}
               models={model.models}
               onSetApiServerRunning={model.setApiServerRunning}
               onOpenSettings={() => setActiveTab("settings")}
@@ -334,6 +372,7 @@ function App() {
             <SettingsPanel
               onSaved={setSettings}
               processStatus={model.processStatus}
+              loadProgress={model.loadProgress}
               onSetApiServerRunning={model.setApiServerRunning}
             />
           </div>
@@ -344,6 +383,7 @@ function App() {
         processStatus={model.processStatus}
         contextStatus={context}
         settings={settings}
+        loadProgress={model.loadProgress}
       />
     </div>
   );

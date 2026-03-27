@@ -1,5 +1,6 @@
 use crate::engine::download;
 use crate::engine::process::LlamaProcess;
+use crate::engine::scheduler::RequestScheduler;
 use crate::state::SharedState;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, UdpSocket};
@@ -149,6 +150,7 @@ pub async fn update_settings(
         s.config.process.use_mlock = settings.use_mlock;
         s.config.process.cont_batching = settings.cont_batching;
         s.config.process.parallel_slots = settings.parallel_slots;
+        s.request_scheduler = std::sync::Arc::new(RequestScheduler::new(settings.parallel_slots));
         s.config.process.main_gpu = settings.main_gpu;
         s.config.process.defrag_thold = settings.defrag_thold;
         s.config.process.rope_freq_scale = settings.rope_freq_scale;

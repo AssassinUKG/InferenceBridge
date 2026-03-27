@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
-import type { ApiAccessInfo, AppSettings, LlamaServerInfo, ProcessStatusInfo } from "../../lib/types";
+import type { ApiAccessInfo, AppSettings, LlamaServerInfo, LoadProgress, ProcessStatusInfo } from "../../lib/types";
 import * as api from "../../lib/tauri";
 
 interface Props {
   onSaved?: (settings: AppSettings) => void;
   processStatus: ProcessStatusInfo | null;
+  loadProgress: LoadProgress | null;
   onSetApiServerRunning: (running: boolean) => void | Promise<void>;
 }
 
@@ -306,7 +307,7 @@ function ApiKeyRow({ value, onChange }: { value: string; onChange: (v: string) =
 
 // ─── Main component ───────────────────────────────────────────────────────────
 
-export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }: Props) {
+export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiServerRunning }: Props) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [persistedSettings, setPersistedSettings] = useState<AppSettings | null>(null);
   const [accessInfo, setAccessInfo] = useState<ApiAccessInfo | null>(null);
@@ -416,6 +417,15 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
   const apiRunning = apiState === "Running" && apiReachable;
   const apiStarting = apiState === "Starting";
   const apiError = processStatus?.api_error ?? null;
+  const modelTransition =
+    loadProgress && !loadProgress.done
+      ? loadProgress
+      : processStatus?.model_load_progress ?? null;
+  const modelTransitionActive =
+    (!!modelTransition && !modelTransition.done) ||
+    ["Loading", "Swapping", "Unloading"].includes(
+      processStatus?.model_load_state ?? "Idle"
+    );
   const isLanMode = settings.server_host === "0.0.0.0";
   const lanUrl =
     accessInfo?.lan_host ? `http://${accessInfo.lan_host}:${settings.server_port}/v1` : null;
@@ -426,6 +436,9 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
       (persistedSettings.api_key ?? "") !== (settings.api_key ?? ""));
   const statusMessage = apiConfigDirty
     ? `Unsaved API changes: ${serverUrl} will not be used until you save. Current saved endpoint is ${persistedServerUrl}.`
+    : modelTransitionActive
+      ? modelTransition?.message ??
+        `Model transition in progress. Public API will come back on ${serverUrl} once loading finishes.`
     : apiRunning
       ? `Public API reachable on ${serverUrl}`
       : apiStarting
@@ -524,7 +537,20 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
               <p className="text-sm font-medium" style={{ color: "var(--text-0)" }}>
                 Server Status
               </p>
-              <p className="mt-0.5 text-xs" style={{ color: apiRunning ? "#34d399" : apiStarting ? "#fde68a" : apiState === "Error" ? "#f87171" : "var(--text-2)" }}>
+              <p
+                className="mt-0.5 text-xs"
+                style={{
+                  color: modelTransitionActive
+                    ? "#fcd34d"
+                    : apiRunning
+                      ? "#34d399"
+                      : apiStarting
+                        ? "#fde68a"
+                        : apiState === "Error"
+                          ? "#f87171"
+                          : "var(--text-2)",
+                }}
+              >
                 {statusMessage}
               </p>
             </div>
@@ -536,7 +562,7 @@ export function SettingsPanel({ onSaved, processStatus, onSetApiServerRunning }:
               />
             </div>
           </div>
-          {(apiError || apiConfigDirty) && (
+          {((apiError && !modelTransitionActive) || apiConfigDirty) && (
             <>
               <Divider />
               <div className="px-4 py-2.5 text-xs" style={{ color: "#fca5a5", background: "rgba(248,113,113,0.06)" }}>

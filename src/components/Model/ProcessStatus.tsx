@@ -52,6 +52,10 @@ export function ProcessStatus({ status, settings }: Props) {
 
   const apiUrl = status.api_url ?? buildServerUrl(settings);
   const apiReachable = status.api_reachable;
+  const modelTransition = status.model_load_progress;
+  const modelTransitionActive =
+    (!!modelTransition && !modelTransition.done) ||
+    ["Loading", "Swapping", "Unloading"].includes(status.model_load_state);
 
   return (
     <section className="rounded px-4 py-4" style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}>
@@ -63,6 +67,11 @@ export function ProcessStatus({ status, settings }: Props) {
           <div className="mt-1 text-lg font-semibold" style={{ color: toneForState(status.state) }}>
             {status.state}
           </div>
+          {modelTransitionActive && (
+            <p className="mt-1 text-xs" style={{ color: "#fcd34d" }}>
+              {modelTransition?.message ?? `${status.model_load_state} model...`}
+            </p>
+          )}
         </div>
         <div className="text-right">
           <div className="text-[11px] uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
@@ -77,6 +86,7 @@ export function ProcessStatus({ status, settings }: Props) {
       <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
         <Stat label="Current Model" value={status.model ?? "None"} />
         <Stat label="Previous Model" value={status.previous_model ?? "None"} />
+        <Stat label="Load State" value={status.model_load_state} />
         <Stat label="Backend" value={status.backend ?? "Unknown"} />
         <Stat label="llama.cpp" value={status.server_version ?? "Unknown"} />
         <Stat label="API URL" value={apiUrl} />
@@ -93,9 +103,40 @@ export function ProcessStatus({ status, settings }: Props) {
               : `${status.parallel_slots ?? 0} configured`
           }
         />
+        <Stat
+          label="Request Queue"
+          value={`${status.active_requests} active / ${status.queued_requests} queued`}
+        />
       </div>
 
-      {status.api_error && (
+      {status.last_generation_metrics && (
+        <div className="mt-4 rounded px-4 py-3" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
+          <div className="text-[11px] uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
+            Last Generation
+          </div>
+          <div className="mt-2 grid gap-3 md:grid-cols-3">
+            <Stat label="Elapsed" value={`${status.last_generation_metrics.elapsed_ms} ms`} />
+            <Stat
+              label="Decode TPS"
+              value={
+                status.last_generation_metrics.decode_tokens_per_second != null
+                  ? status.last_generation_metrics.decode_tokens_per_second.toFixed(2)
+                  : "Unknown"
+              }
+            />
+            <Stat
+              label="End-to-end TPS"
+              value={
+                status.last_generation_metrics.end_to_end_tokens_per_second != null
+                  ? status.last_generation_metrics.end_to_end_tokens_per_second.toFixed(2)
+                  : "Unknown"
+              }
+            />
+          </div>
+        </div>
+      )}
+
+      {status.api_error && !modelTransitionActive && (
         <div className="mt-4 rounded px-4 py-3" style={{ background: "rgba(127,29,29,0.28)", border: "1px solid rgba(248,113,113,0.22)" }}>
           <div className="text-[11px] uppercase tracking-[0.18em]" style={{ color: "#fecaca" }}>
             API Server Issue

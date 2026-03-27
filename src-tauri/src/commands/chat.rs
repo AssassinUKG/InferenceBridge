@@ -321,6 +321,9 @@ pub async fn send_message(
         image_data,
     };
 
+    let generation_started_at = now_rfc3339();
+    let generation_started = std::time::Instant::now();
+
     let cancel = begin_generation(
         state.inner(),
         "gui",
@@ -333,6 +336,11 @@ pub async fn send_message(
         let s = state.read().await;
         s.process.port()
     };
+    let scheduler = {
+        let s = state.read().await;
+        s.request_scheduler.clone()
+    };
+    let _permit = scheduler.acquire().await;
     let client = LlamaClient::new(port);
     let response = client
         .complete_stream(&request)
@@ -348,7 +356,8 @@ pub async fn send_message(
     let mut reasoning_text = String::new();
     let mut tokens_predicted = None;
     let mut tokens_evaluated = None;
-    let mut tokens_per_second = None;
+    let mut decode_tokens_per_second = None;
+    let mut prompt_tokens_per_second = None;
 
     while let Some(event) = rx.recv().await {
         match event {
@@ -363,15 +372,17 @@ pub async fn send_message(
             }
             StreamEvent::Done {
                 full_text: text,
-                tokens_per_second: tps,
                 tokens_predicted: predicted,
                 tokens_evaluated: evaluated,
+                decode_tokens_per_second: decode_tps,
+                prompt_tokens_per_second: prompt_tps,
             } => {
                 full_text = text;
                 tokens_predicted = Some(predicted);
                 tokens_evaluated = Some(evaluated);
-                tokens_per_second = Some(tps);
-                let _ = app.emit("stream-done", tps);
+                decode_tokens_per_second = Some(decode_tps);
+                prompt_tokens_per_second = prompt_tps;
+                let _ = app.emit("stream-done", decode_tps);
                 break;
             }
             StreamEvent::Error(error) => {
@@ -425,8 +436,35 @@ pub async fn send_message(
                 .as_ref()
                 .map(|status| status.total_tokens)
                 .unwrap_or(0),
-            tokens_per_sec: tokens_per_second.unwrap_or(0.0) as f32,
+            tokens_per_sec: decode_tokens_per_second.unwrap_or(0.0) as f32,
             memory_mb: 0,
+        });
+        s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
+            source: "gui".to_string(),
+            model: s
+                .loaded_model
+                .clone()
+                .unwrap_or_else(|| "Unknown".to_string()),
+            started_at: generation_started_at,
+            finished_at: now_rfc3339(),
+            elapsed_ms: generation_started.elapsed().as_millis() as u64,
+            prompt_tokens: tokens_evaluated,
+            completion_tokens: tokens_predicted,
+            total_tokens: match (tokens_evaluated, tokens_predicted) {
+                (Some(prompt), Some(completion)) => Some(prompt + completion),
+                _ => None,
+            },
+            prompt_tokens_per_second,
+            decode_tokens_per_second,
+            end_to_end_tokens_per_second: match (
+                tokens_predicted,
+                generation_started.elapsed().as_millis() as u64,
+            ) {
+                (Some(tokens), elapsed_ms) if elapsed_ms > 0 => {
+                    Some(tokens as f64 / (elapsed_ms as f64 / 1000.0))
+                }
+                _ => None,
+            },
         });
     }
 

@@ -12,6 +12,14 @@ pub struct ModelTestStats {
     pub response: String,
     pub timings: Option<Timings>,
     pub elapsed_ms: u128,
+    pub prompt_tokens: Option<u32>,
+    pub completion_tokens: Option<u32>,
+    pub total_tokens: Option<u32>,
+    pub prompt_tokens_per_second: Option<f64>,
+    pub decode_tokens_per_second: Option<f64>,
+    pub end_to_end_tokens_per_second: Option<f64>,
+    pub prefill_ms: Option<f64>,
+    pub decode_ms: Option<f64>,
 }
 
 /// Test a model with the given prompt and settings, returning stats.
@@ -102,6 +110,32 @@ pub async fn test_model(
         &resp.content,
         profile.think_tag_style,
     );
+    let prompt_tokens = resp.tokens_evaluated;
+    let completion_tokens = resp.tokens_predicted;
+    let total_tokens = match (prompt_tokens, completion_tokens) {
+        (Some(prompt_tokens), Some(completion_tokens)) => Some(prompt_tokens + completion_tokens),
+        _ => None,
+    };
+    let prompt_tokens_per_second = resp.timings.as_ref().and_then(|timings| timings.prompt_per_second);
+    let decode_tokens_per_second =
+        resp.timings.as_ref().and_then(|timings| timings.predicted_per_second);
+    let prefill_ms = match (prompt_tokens, prompt_tokens_per_second) {
+        (Some(tokens), Some(tokens_per_second)) if tokens_per_second > 0.0 => {
+            Some((tokens as f64 / tokens_per_second) * 1000.0)
+        }
+        _ => None,
+    };
+    let decode_ms = match (completion_tokens, decode_tokens_per_second) {
+        (Some(tokens), Some(tokens_per_second)) if tokens_per_second > 0.0 => {
+            Some((tokens as f64 / tokens_per_second) * 1000.0)
+        }
+        _ => None,
+    };
+    let elapsed_secs = elapsed as f64 / 1000.0;
+    let end_to_end_tokens_per_second = match (completion_tokens, elapsed_secs) {
+        (Some(tokens), elapsed_secs) if elapsed_secs > 0.0 => Some(tokens as f64 / elapsed_secs),
+        _ => None,
+    };
     Ok(ModelTestStats {
         model: model_name.to_string(),
         context_size,
@@ -109,5 +143,13 @@ pub async fn test_model(
         response: response_text,
         timings: resp.timings,
         elapsed_ms: elapsed,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        prompt_tokens_per_second,
+        decode_tokens_per_second,
+        end_to_end_tokens_per_second,
+        prefill_ms,
+        decode_ms,
     })
 }

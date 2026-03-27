@@ -9,7 +9,12 @@ use crate::api::errors::ApiErrorResponse;
 use crate::engine::client::{CompletionRequest, ImageData, LlamaClient};
 use crate::engine::streaming::{self, StreamEvent};
 use crate::models::profiles::ModelProfile;
-use crate::state::{GenerationRequest, SharedState};
+use crate::normalize::think_strip::{
+    extract_reasoning_content_with_style, strip_think_tags_with_style,
+};
+use crate::state::{
+    SharedState, begin_api_generation, finish_api_generation, summarize_reasoning_tokens,
+};
 
 const MAX_REMOTE_IMAGE_BYTES: usize = 15 * 1024 * 1024;
 
@@ -30,9 +35,31 @@ pub struct ChatCompletionRequest {
     pub seed: Option<i64>,
     pub stop: Option<StopParam>,
     pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub reasoning: Option<ReasoningRequest>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub reasoning_tokens: Option<u32>,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
+pub struct ReasoningRequest {
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
 pub struct ApiMessage {
     pub role: String,
     #[serde(default)]
@@ -121,6 +148,8 @@ pub struct Choice {
 pub struct ResponseMessage {
     pub role: String,
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<serde_json::Value>,
 }
@@ -130,6 +159,20 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CompletionTokensDetails {
+    pub reasoning_tokens: u32,
 }
 
 fn now_unix_secs() -> u64 {
@@ -139,42 +182,32 @@ fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
-fn build_parse_trace(profile: &ModelProfile, raw: &str, stripped: &str) -> String {
+pub(crate) fn end_to_end_tokens_per_second(
+    completion_tokens: Option<u32>,
+    elapsed_ms: u64,
+) -> Option<f64> {
+    if elapsed_ms == 0 {
+        return None;
+    }
+
+    completion_tokens.map(|tokens| tokens as f64 / (elapsed_ms as f64 / 1000.0))
+}
+
+pub(crate) fn build_parse_trace(profile: &ModelProfile, raw: &str, stripped: &str) -> String {
     let (tool_calls, visible_text) =
         crate::normalize::tool_extract::extract_tool_calls_for_profile(stripped, profile);
+    let reasoning_text = extract_reasoning_content_with_style(raw, profile.think_tag_style);
     serde_json::to_string_pretty(&serde_json::json!({
         "parser_type": format!("{:?}", profile.parser_type),
         "tool_call_format": format!("{:?}", profile.tool_call_format),
         "think_tag_style": format!("{:?}", profile.think_tag_style),
         "raw_response": raw,
+        "reasoning_text": reasoning_text,
         "stripped_response": stripped,
         "visible_text": visible_text,
         "tool_calls": tool_calls,
     }))
     .unwrap_or_else(|_| "Failed to serialize parse trace".to_string())
-}
-
-async fn begin_api_generation(state: &SharedState, model: String) -> tokio_util::sync::CancellationToken {
-    let mut s = state.write().await;
-    s.generation_cancel.cancel();
-    s.generation_cancel = tokio_util::sync::CancellationToken::new();
-    s.active_generation = Some(GenerationRequest {
-        id: uuid::Uuid::new_v4().to_string(),
-        source: "api".to_string(),
-        session_id: None,
-        model,
-        started_at: chrono::Utc::now().to_rfc3339(),
-        status: "running".to_string(),
-    });
-    s.generation_cancel.clone()
-}
-
-async fn finish_api_generation(state: &SharedState, status: &str) {
-    let mut s = state.write().await;
-    if let Some(active) = s.active_generation.as_mut() {
-        active.status = status.to_string();
-    }
-    s.active_generation = None;
 }
 
 async fn swap_model_for_api(state: &SharedState, model_name: &str) -> Result<(), String> {
@@ -183,7 +216,7 @@ async fn swap_model_for_api(state: &SharedState, model_name: &str) -> Result<(),
         .map(|_| ())
 }
 
-async fn resolve_loaded_model(
+pub(crate) async fn resolve_loaded_model(
     state: &SharedState,
     requested_model: &str,
 ) -> Result<String, ApiErrorResponse> {
@@ -327,7 +360,7 @@ async fn normalize_image_payload(value: &str) -> Result<String, ApiErrorResponse
     Ok(trimmed.to_string())
 }
 
-async fn normalize_api_messages(
+pub(crate) async fn normalize_api_messages(
     messages: &[ApiMessage],
 ) -> Result<(Vec<crate::templates::engine::ChatMessage>, Vec<ImageData>), ApiErrorResponse> {
     let mut normalized = Vec::with_capacity(messages.len());
@@ -435,13 +468,14 @@ fn prepend_tool_schema_message(
     );
 }
 
-async fn build_chat_request(
+pub(crate) async fn build_chat_request(
     profile: &ModelProfile,
     req: ChatCompletionRequest,
     server_defaults: (&Option<f32>, &Option<f32>, &Option<i32>, &Option<u32>),
 ) -> Result<CompletionRequest, ApiErrorResponse> {
     let (mut messages, image_data) = normalize_api_messages(&req.messages).await?;
     prepend_tool_schema_message(&mut messages, req.tools.as_ref());
+    prepend_reasoning_guidance_message(&mut messages, profile, req.reasoning.as_ref(), req.reasoning_effort.as_deref(), req.reasoning_tokens);
 
     let mut stop = profile.stop_markers.clone();
     if let Some(user_stop) = req.stop {
@@ -473,10 +507,77 @@ async fn build_chat_request(
     })
 }
 
+fn prepend_reasoning_guidance_message(
+    messages: &mut Vec<crate::templates::engine::ChatMessage>,
+    profile: &ModelProfile,
+    reasoning: Option<&ReasoningRequest>,
+    reasoning_effort: Option<&str>,
+    reasoning_tokens: Option<u32>,
+) {
+    let supports_reasoning = !matches!(profile.think_tag_style, crate::models::profiles::ThinkTagStyle::None);
+    let requested_effort = reasoning
+        .and_then(|cfg| cfg.effort.as_deref())
+        .or(reasoning_effort)
+        .map(|value| value.trim().to_ascii_lowercase());
+    let requested_reasoning_tokens = reasoning.and_then(|cfg| cfg.max_tokens).or(reasoning_tokens);
+
+    if !supports_reasoning && requested_effort.is_none() && requested_reasoning_tokens.is_none() {
+        return;
+    }
+
+    let mut guidance = Vec::new();
+    match requested_effort.as_deref() {
+        Some("none") => guidance.push("Respond directly without emitting <think> blocks.".to_string()),
+        Some("low") => guidance.push("Keep reasoning brief and concise.".to_string()),
+        Some("high") => guidance.push("Use thorough step-by-step reasoning before the final answer.".to_string()),
+        Some("xhigh") => guidance.push("Use very detailed reasoning before the final answer.".to_string()),
+        Some("medium") => {}
+        Some(other) => guidance.push(format!("Reasoning effort requested: {other}.")),
+        None => {}
+    }
+
+    if let Some(limit) = requested_reasoning_tokens {
+        guidance.push(format!("Keep reasoning under roughly {limit} tokens."));
+    }
+
+    if guidance.is_empty() {
+        return;
+    }
+
+    messages.insert(
+        0,
+        crate::templates::engine::ChatMessage {
+            role: "system".to_string(),
+            content: guidance.join(" "),
+        },
+    );
+}
+
+fn build_usage(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    reasoning_tokens: u32,
+    include_details: bool,
+) -> Usage {
+    Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+        prompt_tokens_details: include_details.then(|| PromptTokensDetails { cached_tokens: 0 }),
+        completion_tokens_details: include_details
+            .then(|| CompletionTokensDetails { reasoning_tokens }),
+    }
+}
+
 pub async fn chat_completions(
     State(state): State<SharedState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, ApiErrorResponse> {
+    let include_usage_details = req
+        .stream_options
+        .as_ref()
+        .and_then(|options| options.include_usage)
+        .unwrap_or(true);
     let requested_model = req.model.clone().unwrap_or_default();
     let model_name = resolve_loaded_model(&state, &requested_model).await?;
     let profile = crate::models::overrides::detect_effective_profile(&model_name);
@@ -515,10 +616,28 @@ pub async fn chat_completions(
         s.last_prompt = Some(request.prompt.clone());
     }
 
+    let scheduler = {
+        let s = state.read().await;
+        s.request_scheduler.clone()
+    };
+    let _permit = scheduler.acquire().await;
+
     let client = LlamaClient::new(server_defaults.4);
+    let generation_started_at = chrono::Utc::now().to_rfc3339();
+    let generation_started = std::time::Instant::now();
 
     if request.stream {
-        return stream_chat_completion(state, client, request, model_name, profile).await;
+        return stream_chat_completion(
+            state,
+            client,
+            request,
+            model_name,
+            profile,
+            generation_started_at,
+            generation_started,
+            include_usage_details,
+        )
+        .await;
     }
 
     let response = client.complete(&request).await.map_err(|e| {
@@ -526,13 +645,39 @@ pub async fn chat_completions(
         ApiErrorResponse::inference_failed(&e.to_string())
     })?;
 
-    let stripped = crate::normalize::think_strip::strip_think_tags_with_style(
-        &response.content,
-        profile.think_tag_style,
-    );
+    let reasoning_text =
+        extract_reasoning_content_with_style(&response.content, profile.think_tag_style);
+    let stripped = strip_think_tags_with_style(&response.content, profile.think_tag_style);
+    let reasoning_tokens =
+        summarize_reasoning_tokens(response.tokens_predicted, &stripped, &reasoning_text);
     {
         let mut s = state.write().await;
         s.last_parse_trace = Some(build_parse_trace(&profile, &response.content, &stripped));
+        s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
+            source: "api".to_string(),
+            model: model_name.clone(),
+            started_at: generation_started_at,
+            finished_at: chrono::Utc::now().to_rfc3339(),
+            elapsed_ms: generation_started.elapsed().as_millis() as u64,
+            prompt_tokens: response.tokens_evaluated,
+            completion_tokens: response.tokens_predicted,
+            total_tokens: match (response.tokens_evaluated, response.tokens_predicted) {
+                (Some(prompt), Some(completion)) => Some(prompt + completion),
+                _ => None,
+            },
+            prompt_tokens_per_second: response
+                .timings
+                .as_ref()
+                .and_then(|timings| timings.prompt_per_second),
+            decode_tokens_per_second: response
+                .timings
+                .as_ref()
+                .and_then(|timings| timings.predicted_per_second),
+            end_to_end_tokens_per_second: end_to_end_tokens_per_second(
+                response.tokens_predicted,
+                generation_started.elapsed().as_millis() as u64,
+            ),
+        });
     }
     let (tool_calls, text) =
         crate::normalize::tool_extract::extract_tool_calls_for_profile(&stripped, &profile);
@@ -561,6 +706,7 @@ pub async fn chat_completions(
             message: ResponseMessage {
                 role: "assistant".to_string(),
                 content,
+                reasoning: (!reasoning_text.is_empty()).then_some(reasoning_text),
                 tool_calls: api_tool_calls.clone(),
             },
             finish_reason: if api_tool_calls.is_empty() {
@@ -569,12 +715,12 @@ pub async fn chat_completions(
                 "tool_calls".to_string()
             },
         }],
-        usage: Usage {
-            prompt_tokens: response.tokens_evaluated.unwrap_or(0),
-            completion_tokens: response.tokens_predicted.unwrap_or(0),
-            total_tokens: response.tokens_evaluated.unwrap_or(0)
-                + response.tokens_predicted.unwrap_or(0),
-        },
+        usage: build_usage(
+            response.tokens_evaluated.unwrap_or(0),
+            response.tokens_predicted.unwrap_or(0),
+            reasoning_tokens,
+            include_usage_details,
+        ),
     })
     .into_response())
 }
@@ -585,6 +731,9 @@ async fn stream_chat_completion(
     request: CompletionRequest,
     model_name: String,
     profile: ModelProfile,
+    generation_started_at: String,
+    generation_started: std::time::Instant,
+    include_usage_details: bool,
 ) -> Result<Response, ApiErrorResponse> {
     let response = client.complete_stream(&request).await.map_err(|e| {
         tracing::error!(error = %e, "Stream completion failed");
@@ -637,19 +786,52 @@ async fn stream_chat_completion(
                     raw_full_text.push_str("<think>");
                     raw_full_text.push_str(&reasoning);
                     raw_full_text.push_str("</think>");
+                    let chunk_json = serde_json::json!({
+                        "id": id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": { "reasoning": reasoning },
+                            "finish_reason": serde_json::Value::Null
+                        }]
+                    });
+                    yield Ok::<Event, std::convert::Infallible>(Event::default().data(chunk_json.to_string()));
                 }
                 StreamEvent::Done {
                     full_text,
                     tokens_predicted,
                     tokens_evaluated,
-                    ..
+                    decode_tokens_per_second,
+                    prompt_tokens_per_second,
                 } => {
-                    let stripped = crate::normalize::think_strip::strip_think_tags_with_style(
-                        &full_text,
-                        profile.think_tag_style,
+                    let reasoning_text =
+                        extract_reasoning_content_with_style(&full_text, profile.think_tag_style);
+                    let stripped = strip_think_tags_with_style(&full_text, profile.think_tag_style);
+                    let reasoning_tokens = summarize_reasoning_tokens(
+                        Some(tokens_predicted),
+                        &stripped,
+                        &reasoning_text,
                     );
                     let mut s = state_for_stream.write().await;
                     s.last_parse_trace = Some(build_parse_trace(&profile, &full_text, &stripped));
+                    s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
+                        source: "api".to_string(),
+                        model: model_name.clone(),
+                        started_at: generation_started_at.clone(),
+                        finished_at: chrono::Utc::now().to_rfc3339(),
+                        elapsed_ms: generation_started.elapsed().as_millis() as u64,
+                        prompt_tokens: Some(tokens_evaluated),
+                        completion_tokens: Some(tokens_predicted),
+                        total_tokens: Some(tokens_evaluated + tokens_predicted),
+                        prompt_tokens_per_second,
+                        decode_tokens_per_second: Some(decode_tokens_per_second),
+                        end_to_end_tokens_per_second: end_to_end_tokens_per_second(
+                            Some(tokens_predicted),
+                            generation_started.elapsed().as_millis() as u64,
+                        ),
+                    });
                     drop(s);
 
                     let final_chunk = serde_json::json!({
@@ -662,11 +844,12 @@ async fn stream_chat_completion(
                             "delta": {},
                             "finish_reason": "stop"
                         }],
-                        "usage": {
-                            "prompt_tokens": tokens_evaluated,
-                            "completion_tokens": tokens_predicted,
-                            "total_tokens": tokens_evaluated + tokens_predicted,
-                        }
+                        "usage": build_usage(
+                            tokens_evaluated,
+                            tokens_predicted,
+                            reasoning_tokens,
+                            include_usage_details,
+                        )
                     });
                     yield Ok(Event::default().data(final_chunk.to_string()));
                     yield Ok(Event::default().data("[DONE]"));
@@ -689,10 +872,7 @@ async fn stream_chat_completion(
         }
 
         if !raw_full_text.is_empty() {
-            let stripped = crate::normalize::think_strip::strip_think_tags_with_style(
-                &raw_full_text,
-                profile.think_tag_style,
-            );
+            let stripped = strip_think_tags_with_style(&raw_full_text, profile.think_tag_style);
             let mut s = state_for_stream.write().await;
             s.last_parse_trace = Some(build_parse_trace(&profile, &raw_full_text, &stripped));
         }
@@ -793,16 +973,23 @@ pub async fn text_completions(
         s.last_prompt = Some(prompt);
     }
 
+    let scheduler = {
+        let s = state.read().await;
+        s.request_scheduler.clone()
+    };
+    let _permit = scheduler.acquire().await;
+
     let client = LlamaClient::new(port);
     let response = client.complete(&completion_req).await.map_err(|e| {
         tracing::error!(error = %e, "Text completion failed");
         ApiErrorResponse::inference_failed(&e.to_string())
     })?;
 
-    let text = crate::normalize::think_strip::strip_think_tags_with_style(
-        &response.content,
-        profile.think_tag_style,
-    );
+    let reasoning_text =
+        extract_reasoning_content_with_style(&response.content, profile.think_tag_style);
+    let text = strip_think_tags_with_style(&response.content, profile.think_tag_style);
+    let reasoning_tokens =
+        summarize_reasoning_tokens(response.tokens_predicted, &text, &reasoning_text);
     {
         let mut s = state.write().await;
         s.last_parse_trace = Some(build_parse_trace(&profile, &response.content, &text));
@@ -815,15 +1002,15 @@ pub async fn text_completions(
         model: model_name,
         choices: vec![TextChoice {
             index: 0,
-            text,
+            text: text.clone(),
             finish_reason: "stop".to_string(),
         }],
-        usage: Usage {
-            prompt_tokens: response.tokens_evaluated.unwrap_or(0),
-            completion_tokens: response.tokens_predicted.unwrap_or(0),
-            total_tokens: response.tokens_evaluated.unwrap_or(0)
-                + response.tokens_predicted.unwrap_or(0),
-        },
+        usage: build_usage(
+            response.tokens_evaluated.unwrap_or(0),
+            response.tokens_predicted.unwrap_or(0),
+            reasoning_tokens,
+            true,
+        ),
     })
     .into_response())
 }
@@ -910,6 +1097,42 @@ mod tests {
         .expect("request should deserialize");
 
         assert_eq!(request.max_tokens, Some(321));
+    }
+
+    #[test]
+    fn deserializes_reasoning_effort_and_tokens() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "reasoning_effort": "low",
+                "reasoning_tokens": 128,
+                "messages": [
+                    { "role": "user", "content": "hello" }
+                ]
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        assert_eq!(request.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(request.reasoning_tokens, Some(128));
+    }
+
+    #[test]
+    fn deserializes_nested_reasoning_config() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "reasoning": { "effort": "high", "max_tokens": 256 },
+                "messages": [
+                    { "role": "user", "content": "hello" }
+                ]
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        assert_eq!(
+            request.reasoning.as_ref().and_then(|value| value.effort.as_deref()),
+            Some("high")
+        );
+        assert_eq!(request.reasoning.as_ref().and_then(|value| value.max_tokens), Some(256));
     }
 
     #[tokio::test]

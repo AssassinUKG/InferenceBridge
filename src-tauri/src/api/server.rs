@@ -69,6 +69,7 @@ async fn serve_api_server(
 
     let app = Router::new()
         .nest("/v1", api_routes())
+        .nest("/api/v1", native_api_routes())
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
@@ -175,6 +176,10 @@ async fn require_api_key(
 fn api_routes() -> Router<SharedState> {
     Router::new()
         .route(
+            "/responses",
+            axum::routing::post(super::responses::responses),
+        )
+        .route(
             "/chat/completions",
             axum::routing::post(super::completions::chat_completions),
         )
@@ -224,6 +229,12 @@ fn api_routes() -> Router<SharedState> {
             "/sessions/:id/messages",
             axum::routing::get(super::extensions::get_session_messages),
         )
+        .route("/health", axum::routing::get(super::health::health_check))
+}
+
+fn native_api_routes() -> Router<SharedState> {
+    Router::new()
+        .route("/models", axum::routing::get(super::models::list_models))
         .route("/health", axum::routing::get(super::health::health_check))
 }
 

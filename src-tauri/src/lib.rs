@@ -289,6 +289,21 @@ pub fn run() {
                         if let Err(e) = s.process.shutdown().await {
                             tracing::warn!(error = %e, "Error shutting down llama-server");
                         }
+                        match crate::engine::process::LlamaProcess::kill_all_managed_processes() {
+                            Ok(killed) if killed > 0 => {
+                                tracing::info!(
+                                    killed,
+                                    "Killed stale managed llama-server process(es) on GUI exit"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "Failed to clean up managed llama-server processes on GUI exit"
+                                );
+                            }
+                        }
                     });
                 }
             }
@@ -477,6 +492,15 @@ pub fn run_headless(
             let mut s = shutdown_state.write().await;
             if let Err(e) = s.process.shutdown().await {
                 tracing::warn!(error = %e, "Error shutting down llama-server");
+            }
+        }
+        match crate::engine::process::LlamaProcess::kill_all_managed_processes() {
+            Ok(killed) if killed > 0 => {
+                tracing::info!(killed, "Killed stale managed llama-server process(es) on headless shutdown");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to clean up managed llama-server processes on headless shutdown");
             }
         }
 
@@ -1020,6 +1044,7 @@ pub fn run_model_test_cli(
     threads: Option<u32>,
     backend_preference: Option<String>,
     verbose: bool,
+    output_json: bool,
 ) {
     use crate::engine::benchmark::test_model;
     use std::sync::Arc;
@@ -1094,19 +1119,48 @@ pub fn run_model_test_cli(
                 if verbose {
                     eprintln!("[DEBUG] test_model returned Ok");
                 }
-                println!("Model: {}", stats.model);
-                println!("Context size: {}", stats.context_size);
-                println!("Prompt: {}", stats.prompt);
-                println!("Response: {}", stats.response);
-                if let Some(t) = stats.timings {
-                    if let Some(tps) = t.predicted_per_second {
-                        println!("Tokens/sec: {:.2}", tps);
+                if output_json {
+                    match serde_json::to_string_pretty(&stats) {
+                        Ok(json) => println!("{json}"),
+                        Err(error) => {
+                            eprintln!("Failed to serialize benchmark results: {error}");
+                            std::process::exit(1);
+                        }
                     }
-                    if let Some(pps) = t.prompt_per_second {
-                        println!("Prompt tokens/sec: {:.2}", pps);
+                } else {
+                    println!("Model: {}", stats.model);
+                    println!("Context size: {}", stats.context_size);
+                    println!("Prompt: {}", stats.prompt);
+                    println!("Response: {}", stats.response);
+                    println!(
+                        "Prompt tokens: {}",
+                        stats.prompt_tokens.map(|value| value.to_string()).unwrap_or_else(|| "Unknown".to_string())
+                    );
+                    println!(
+                        "Completion tokens: {}",
+                        stats.completion_tokens.map(|value| value.to_string()).unwrap_or_else(|| "Unknown".to_string())
+                    );
+                    println!(
+                        "Total tokens: {}",
+                        stats.total_tokens.map(|value| value.to_string()).unwrap_or_else(|| "Unknown".to_string())
+                    );
+                    if let Some(prompt_tps) = stats.prompt_tokens_per_second {
+                        println!("Prompt tokens/sec: {:.2}", prompt_tps);
                     }
+                    if let Some(decode_tps) = stats.decode_tokens_per_second {
+                        println!("Decode tokens/sec: {:.2}", decode_tps);
+                    }
+                    if let Some(end_to_end_tps) = stats.end_to_end_tokens_per_second {
+                        println!("End-to-end tokens/sec: {:.2}", end_to_end_tps);
+                    }
+                    if let Some(prefill_ms) = stats.prefill_ms {
+                        println!("Prefill: {:.2} ms", prefill_ms);
+                    }
+                    if let Some(decode_ms) = stats.decode_ms {
+                        println!("Decode: {:.2} ms", decode_ms);
+                    }
+                    println!("Elapsed: {} ms", stats.elapsed_ms);
                 }
-                println!("Elapsed: {} ms", stats.elapsed_ms);
             }
             Err(e) => {
                 if verbose {
