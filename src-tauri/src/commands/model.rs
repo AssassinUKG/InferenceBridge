@@ -67,16 +67,73 @@ fn normalize_requested_context_size(context_size: Option<u32>) -> Option<u32> {
     context_size.filter(|value| *value > 0)
 }
 
+/// Resolve the context size to pass to llama-server.
+///
+/// Returns `None` when no explicit override exists — the server should use the
+/// model's native context window in that case.  Only returns `Some` when the
+/// user, API request, or server config explicitly sets a value.
 fn resolve_launch_context_size(
     requested_context_size: Option<u32>,
     server_default_ctx_size: Option<u32>,
-    profile_default_ctx_size: Option<u32>,
+    _profile_default_ctx_size: Option<u32>,
     fallback_ctx_size: u32,
-) -> u32 {
-    normalize_requested_context_size(requested_context_size)
-        .or(server_default_ctx_size.filter(|value| *value > 0))
-        .or(profile_default_ctx_size)
-        .unwrap_or(fallback_ctx_size.max(1))
+) -> Option<u32> {
+    // Explicit request always wins.
+    if let Some(requested) = normalize_requested_context_size(requested_context_size) {
+        return Some(requested);
+    }
+
+    // Server config override (non-zero, different from the generic fallback).
+    let server_default_ctx_size = server_default_ctx_size.filter(|value| *value > 0);
+    let fallback_ctx_size = fallback_ctx_size.max(1);
+
+    if let Some(server_default) = server_default_ctx_size {
+        if server_default != fallback_ctx_size {
+            return Some(server_default);
+        }
+    }
+
+    // No explicit override → let llama-server decide from model metadata.
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_launch_context_size;
+
+    #[test]
+    fn prefers_requested_context_size() {
+        assert_eq!(
+            resolve_launch_context_size(Some(32768), Some(8192), Some(32768), 8192),
+            Some(32768)
+        );
+    }
+
+    #[test]
+    fn returns_none_when_no_explicit_override() {
+        // No request, server default matches fallback, profile has a value
+        // → None so llama-server uses model metadata.
+        assert_eq!(
+            resolve_launch_context_size(None, Some(8192), Some(32768), 8192),
+            None
+        );
+    }
+
+    #[test]
+    fn preserves_explicit_server_default_when_it_differs_from_fallback() {
+        assert_eq!(
+            resolve_launch_context_size(None, Some(16384), Some(32768), 8192),
+            Some(16384)
+        );
+    }
+
+    #[test]
+    fn returns_none_when_nothing_specified() {
+        assert_eq!(
+            resolve_launch_context_size(None, None, None, 8192),
+            None
+        );
+    }
 }
 
 async fn publish_model_load_progress(
@@ -269,10 +326,14 @@ pub async fn backend_load_model(
             s.config.models.default_context,
         );
 
-        s.last_context_status = Some(empty_context_status(ctx));
+        // Use a provisional context size for pre-launch state.
+        // If ctx is None (server decides), use 0 as placeholder — will be
+        // updated from /props or /slots after health check succeeds.
+        let provisional_ctx = ctx.unwrap_or(0);
+        s.last_context_status = Some(empty_context_status(provisional_ctx));
         s.model_stats = Some(crate::state::ModelStats {
             model: model.filename.clone(),
-            context_size: ctx,
+            context_size: provisional_ctx,
             tokens_per_sec: 0.0,
             memory_mb: 0,
         });
@@ -338,8 +399,10 @@ pub async fn backend_load_model(
 
     store_launch_preview(&state, launch_preview.clone()).await;
 
-    let ctx = config.context_size;
-    let size_info = format!("{} (ctx: {})", model_filename, ctx);
+    let size_info = match config.context_size {
+        Some(ctx) => format!("{} (ctx: {})", model_filename, ctx),
+        None => format!("{} (ctx: auto)", model_filename),
+    };
 
     // Phase 2: Launch process (brief write lock, then released)
     publish_model_load_progress(
@@ -488,7 +551,7 @@ pub async fn backend_load_model(
         if attempt < 5 || attempt % 10 == 0 {
             tracing::debug!(attempt, "Health check attempt");
         }
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     }
 
     // Phase 4: Mark as loaded (brief write lock)
@@ -516,6 +579,32 @@ pub async fn backend_load_model(
 
     crate::context::tracker::reset_slots_warning();
 
+    // Phase 4b: Discover actual context size from the running server.
+    // When we didn't pass --ctx-size, llama-server picks the model's native
+    // window.  Query /slots (or /props) to learn the real n_ctx.
+    {
+        let llama_client = crate::engine::client::LlamaClient::new(8801);
+        let actual_ctx = match llama_client.get_slots().await {
+            Ok(slots) if !slots.is_empty() => Some(slots[0].n_ctx),
+            _ => match llama_client.get_props().await {
+                Ok(props) => props
+                    .default_generation_settings
+                    .and_then(|s| s.n_ctx)
+                    .filter(|v| *v > 0),
+                Err(_) => None,
+            },
+        };
+
+        if let Some(real_ctx) = actual_ctx {
+            let mut s = state.write().await;
+            s.last_context_status = Some(empty_context_status(real_ctx));
+            if let Some(stats) = s.model_stats.as_mut() {
+                stats.context_size = real_ctx;
+            }
+            tracing::info!(real_ctx, "Discovered actual context size from running server");
+        }
+    }
+
     let result = format!("Loaded {size_info}");
     publish_model_load_progress(
         &state,
@@ -539,8 +628,6 @@ use crate::models::scanner;
 use crate::state::{
     EffectiveProfileInfo, GenerationRequest, LoadProgress, RuntimePerformanceMetrics, SharedState,
 };
-use tauri::Emitter;
-
 fn command_no_window(program: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
     #[cfg(windows)]
@@ -592,511 +679,58 @@ pub async fn scan_models(state: tauri::State<'_, SharedState>) -> Result<usize, 
 
 #[tauri::command]
 pub async fn load_model(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
     model_name: String,
     context_size: Option<u32>,
 ) -> Result<String, String> {
-    let emit = |stage: &str, msg: &str, progress: f32| {
-        let _ = app.emit(
-            "model-load-progress",
-            LoadProgress {
-                stage: stage.to_string(),
-                message: msg.to_string(),
-                progress,
-                done: false,
-                error: None,
-            },
-        );
-    };
-
-    let emit_done = |msg: &str| {
-        let _ = app.emit(
-            "model-load-progress",
-            LoadProgress {
-                stage: "ready".to_string(),
-                message: msg.to_string(),
-                progress: 1.0,
-                done: true,
-                error: None,
-            },
-        );
-    };
-
-    let emit_error = |msg: &str| {
-        let _ = app.emit(
-            "model-load-progress",
-            LoadProgress {
-                stage: "error".to_string(),
-                message: msg.to_string(),
-                progress: 0.0,
-                done: true,
-                error: Some(msg.to_string()),
-            },
-        );
-    };
-
-    // Phase 1: Resolve model info (brief lock) + claim loading generation
-    emit("resolving", "Resolving model...", 0.0);
-    let (config, model_filename, my_generation, launch_preview) = {
-        let mut s = state.write().await;
-        let model = s
-            .model_registry
-            .find_by_name(&model_name)
-            .ok_or_else(|| {
-                let msg = format!("Model not found: {model_name}");
-                emit_error(&msg);
-                msg
-            })?
-            .clone();
-
-        let ctx = resolve_launch_context_size(
-            context_size,
-            s.config.server.default_ctx_size,
-            model.profile.default_context_window,
-            s.config.models.default_context,
-        );
-
-        s.last_context_status = Some(empty_context_status(ctx));
-        s.model_stats = Some(crate::state::ModelStats {
-            model: model.filename.clone(),
-            context_size: ctx,
-            tokens_per_sec: 0.0,
-            memory_mb: 0,
-        });
-
-        let config = LaunchConfig {
-            model_path: model.path.clone(),
-            context_size: ctx,
-            gpu_layers: s.config.process.gpu_layers,
-            threads: s.config.process.threads,
-            threads_batch: s.config.process.threads_batch,
-            port: 8801,
-            backend_preference: s.config.process.backend_preference.clone(),
-            batch_size: s.config.process.batch_size,
-            ubatch_size: s.config.process.ubatch_size,
-            flash_attn: s.config.process.flash_attn,
-            use_mmap: s.config.process.use_mmap,
-            use_mlock: s.config.process.use_mlock,
-            cont_batching: s.config.process.cont_batching,
-            parallel_slots: s.config.process.parallel_slots,
-            main_gpu: s.config.process.main_gpu,
-            defrag_thold: s.config.process.defrag_thold,
-            rope_freq_scale: s.config.process.rope_freq_scale,
-        };
-
-        LlamaProcess::validate_launch_config(&config).map_err(|e| {
-            let msg = format!("Invalid launch configuration: {e}");
-            emit_error(&msg);
-            msg
-        })?;
-
-        let preview = s.process.build_args_preview(&config).map_err(|e| {
-            let msg = format!("Could not build launch preview: {e}");
-            emit_error(&msg);
-            msg
-        })?;
-
-        // Bump generation so older in-flight loads won't overwrite us
-        s.loading_generation += 1;
-        let gen = s.loading_generation;
-        tracing::info!(
-            model = %model.filename,
-            generation = gen,
-            ctx_size = ctx,
-            "Phase 1: Resolved model"
-        );
-
-        (config, model.filename.clone(), gen, preview)
-    }; // write lock released
-
-    store_launch_preview(state.inner(), launch_preview.clone()).await;
-
-    let ctx = config.context_size;
-    let size_info = format!("{} (ctx: {})", model_filename, ctx);
-
-    // Phase 2: Ensure llama-server binary exists, download CUDA if needed, then launch
-    emit(
-        "launching",
-        &format!("Launching llama-server for {}...", model_filename),
-        0.05,
-    );
-    {
-        let mut s = state.write().await;
-        let backend_pref = s.config.process.backend_preference.to_lowercase();
-        let found = s.process.find_server_binary_with_preference(&backend_pref);
-        let has_managed_cuda = LlamaProcess::managed_binary_dir()
-            .join("llama-server.exe")
-            .exists();
-
-        // Auto-download based on backend preference.
-        // auto: prefer managed CUDA over system binaries for best performance.
-        let should_download = match backend_pref.as_str() {
-            "cuda" => found.is_none(),
-            "cpu" | "avx2" => found.is_none(),
-            _ => found.is_none() || (!has_managed_cuda && found.is_some()),
-        };
-
-        if should_download {
-            let reason = if found.is_none() {
-                "llama-server not found"
-            } else {
-                "Preferred backend build not found — downloading"
-            };
-            // Release the write lock before downloading
-            drop(s);
-
-            emit(
-                "downloading",
-                &format!("{reason}. Checking for download..."),
-                0.02,
-            );
-
-            let pattern = match backend_pref.as_str() {
-                "cpu" | "avx2" => download::asset_pattern_for("cpu"),
-                "cuda" => download::asset_pattern_for("cuda"),
-                _ => download::asset_pattern_for("cuda"), // auto prefers CUDA
-            };
-
-            match download::find_release_asset(&pattern).await {
-                Ok((tag, url, size)) => {
-                    tracing::info!(
-                        version = %tag,
-                        backend = %backend_pref,
-                        reason,
-                        "Downloading preferred llama-server build"
-                    );
-                    match download::download_llama_server(&app, &url, &tag, size).await {
-                        Ok(server_path) => {
-                            // Re-acquire write lock to set the path
-                            let mut s = state.write().await;
-                            s.process.set_server_path(server_path);
-                        }
-                        Err(e) => {
-                            // If download fails but we have a WinGet binary, use it as fallback
-                            if found.is_some() {
-                                tracing::warn!(error = %e, "CUDA download failed, falling back to existing binary");
-                            } else {
-                                let msg = format!("Failed to download llama-server: {e}");
-                                emit_error(&msg);
-                                return Err(msg);
-                            }
-                        }
-                    }
-
-                    // For CUDA/auto, also try to install CUDA runtime DLLs when available.
-                    if backend_pref != "cpu" && backend_pref != "avx2" {
-                        match download::find_cuda_runtime_asset().await {
-                            Ok(Some((rt_tag, rt_url, rt_size))) => {
-                                tracing::info!(
-                                    version = %rt_tag,
-                                    "Also downloading CUDA runtime DLLs"
-                                );
-                                let _ = download::download_llama_server(
-                                    &app, &rt_url, &rt_tag, rt_size,
-                                )
-                                .await;
-                            }
-                            Ok(None) => tracing::debug!("No separate CUDA runtime package found"),
-                            Err(e) => {
-                                tracing::warn!(error = %e, "Could not check for CUDA runtime package")
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    if found.is_none() {
-                        let msg = "llama-server binary not found and no update available. \
-                                   Install llama.cpp manually or run: winget install ggml.llamacpp"
-                            .to_string();
-                        tracing::error!(error = %e, backend = %backend_pref, "Backend download failed");
-                        emit_error(&msg);
-                        return Err(msg);
-                    }
-                    tracing::warn!(error = %e, "Backend download failed, using existing binary");
-                }
-            }
-
-            // Re-acquire write lock for launch
-            let mut s = state.write().await;
-            emit(
-                "launching",
-                &format!("Launching llama-server for {}...", model_filename),
-                0.05,
-            );
-            s.process.launch(config).await.map_err(|e| {
-                let msg = format!("Failed to launch llama-server: {e}");
-                emit_error(&msg);
-                msg
-            })?;
-        } else {
-            s.process.launch(config).await.map_err(|e| {
-                let msg = format!("Failed to launch llama-server: {e}");
-                emit_error(&msg);
-                msg
-            })?;
-        }
-    } // write lock released
-
-    // Phase 3: Wait for healthy (NO lock held - UI can poll freely)
-    emit(
-        "loading",
-        &format!("Loading {} into memory...", model_filename),
-        0.1,
-    );
-    tracing::info!("Phase 3: Waiting for llama-server health check on port 8801...");
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
-    let health_url = format!("http://127.0.0.1:8801/health");
-    let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(300); // 5 min for large models
-    let mut attempt = 0u32;
-
-    loop {
-        if start.elapsed() > timeout {
-            let msg = format!("llama-server did not become healthy within {:?}", timeout);
-            tracing::error!("{msg}");
-            emit_error(&msg);
-            // Try to clean up
-            let mut s = state.write().await;
-            let _ = s.process.shutdown().await;
-            clear_runtime_after_backend_exit(&mut s, Some(msg.clone()));
-            return Err(msg);
-        }
-
-        // Check if the process has died
-        {
-            let mut s = state.write().await;
-            if s.process.check_crashed().await {
-                let stderr = s.process.last_stderr().await;
-                let last_lines: String = stderr
-                    .iter()
-                    .rev()
-                    .take(10)
-                    .rev()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let msg = format!(
-                    "llama-server crashed on startup.\n{}",
-                    if last_lines.is_empty() {
-                        "No stderr output captured.".to_string()
-                    } else {
-                        last_lines
-                    }
-                );
-                tracing::error!("{msg}");
-                emit_error(&msg);
-                clear_runtime_after_backend_exit(&mut s, Some(msg.clone()));
-                return Err(msg);
-            }
-        }
-
-        match client.get(&health_url).send().await {
-            Ok(resp) => {
-                let status_code = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-
-                if attempt < 5 || attempt % 10 == 0 {
-                    tracing::debug!(
-                        attempt,
-                        status = %status_code,
-                        body = %body,
-                        "Health check response"
-                    );
-                }
-
-                if status_code.is_success() {
-                    if body.contains("ok") || body.contains("\"status\":\"ok\"") {
-                        tracing::info!(
-                            "llama-server is healthy after {}s",
-                            start.elapsed().as_secs()
-                        );
-                        break; // Fully ready
-                    }
-                    // llama-server returns {"status":"loading model"} while loading
-                    if body.contains("loading") {
-                        let elapsed = start.elapsed().as_secs();
-                        let progress = (0.1 + (elapsed as f32 * 0.01)).min(0.9);
-                        emit(
-                            "loading",
-                            &format!("Loading model into GPU memory... ({}s)", elapsed),
-                            progress,
-                        );
-                    } else {
-                        // 200 but unknown body — assume ready
-                        tracing::info!(
-                            body = %body,
-                            "Got 200 with unknown body, assuming ready"
-                        );
-                        break;
-                    }
-                } else if status_code.as_u16() == 503 {
-                    // Server is up but loading weights
-                    let elapsed = start.elapsed().as_secs();
-                    let progress = (0.1 + (elapsed as f32 * 0.01)).min(0.9);
-                    emit(
-                        "loading",
-                        &format!("Loading model weights... ({}s)", elapsed),
-                        progress,
-                    );
-                    if attempt % 10 == 0 {
-                        tracing::info!("llama-server loading weights... ({elapsed}s)");
-                    }
-                } else {
-                    let elapsed = start.elapsed().as_secs();
-                    emit(
-                        "starting",
-                        &format!(
-                            "Waiting for llama-server (HTTP {})... ({}s)",
-                            status_code, elapsed
-                        ),
-                        0.08,
-                    );
-                    tracing::warn!(
-                        status = %status_code,
-                        body = %body,
-                        "Unexpected health check response"
-                    );
-                }
-            }
-            Err(e) => {
-                // Server not up yet — connection refused is normal during startup
-                let elapsed = start.elapsed().as_secs();
-                let progress = (0.02 + (elapsed as f32 * 0.005)).min(0.09);
-
-                if attempt < 5 {
-                    tracing::debug!(
-                        attempt,
-                        error = %e,
-                        "Health check connection failed (expected during startup)"
-                    );
-                    emit(
-                        "starting",
-                        &format!("Starting llama-server process... ({}s)", elapsed),
-                        progress,
-                    );
-                } else if attempt == 5 {
-                    tracing::info!(
-                        "Still waiting for llama-server to accept connections ({elapsed}s)..."
-                    );
-                    emit(
-                        "starting",
-                        &format!("Waiting for llama-server to respond... ({}s)", elapsed),
-                        progress,
-                    );
-                } else if attempt % 20 == 0 {
-                    tracing::warn!(
-                        elapsed_s = elapsed,
-                        error = %e,
-                        "llama-server still not responding"
-                    );
-                    emit(
-                        "starting",
-                        &format!("Waiting for llama-server to respond... ({}s)", elapsed),
-                        progress,
-                    );
-                } else {
-                    emit(
-                        "starting",
-                        &format!("Waiting for llama-server to respond... ({}s)", elapsed),
-                        progress,
-                    );
-                }
-            }
-        }
-
-        attempt += 1;
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    }
-
-    // Phase 4: Mark as loaded (brief write lock)
-    // Check generation — if another load started after us, we lost the race.
-    {
-        let mut s = state.write().await;
-        if s.loading_generation != my_generation {
-            tracing::warn!(
-                model = %model_filename,
-                our_gen = my_generation,
-                current_gen = s.loading_generation,
-                "Stale load completed — a newer swap is in progress, discarding"
-            );
-            return Ok(format!(
-                "Superseded by newer swap (loaded {} for gen {})",
-                model_filename, my_generation
-            ));
-        }
-        // Track previous model for swap-back
-        if let Some(prev) = s.loaded_model.take() {
-            if prev != model_filename {
-                tracing::info!(previous = %prev, new = %model_filename, "Tracking previous model for swap-back");
-                s.previous_model = Some(prev);
-            }
-        }
-        s.loaded_model = Some(model_filename.clone());
-        s.process.set_state_running();
-        s.last_known_good_config = Some(launch_preview);
-        s.last_startup_duration_ms = Some(start.elapsed().as_millis() as u64);
-    }
-
-    crate::context::tracker::reset_slots_warning();
-
-    let result = format!("Loaded {size_info}");
-    emit_done(&result);
-    tracing::info!("{result}");
-    Ok(result)
+    backend_load_model(state.inner().clone(), model_name, context_size).await
 }
 
 pub async fn backend_unload_model(state: SharedState) -> Result<String, String> {
+    let unloaded_model = {
+        let s = state.read().await;
+        s.loaded_model.clone()
+    };
+
+    if unloaded_model.is_none() {
+        let mut s = state.write().await;
+        clear_runtime_after_backend_exit(&mut s, None);
+        s.model_load_progress = None;
+        s.last_context_status = Some(crate::context::tracker::ContextStatus::empty());
+        return Ok("No model was loaded.".to_string());
+    }
+
     publish_model_load_progress(
         &state,
         crate::state::ModelLoadState::Unloading,
         "unloading",
-        "Unloading active model...",
+        "Unloading model...",
         0.0,
         false,
         None,
     )
     .await;
 
-    let mut s = state.write().await;
-    if let Err(error) = s.process.shutdown().await {
-        let msg = format!("Failed to unload: {error}");
-        drop(s);
-        publish_model_load_progress(
-            &state,
-            crate::state::ModelLoadState::Unloading,
-            "error",
-            &msg,
-            0.0,
-            true,
-            Some(msg.clone()),
-        )
-        .await;
-        return Err(msg);
-    }
-
-    let unloaded = s.loaded_model.take();
-    if let Some(name) = unloaded.clone() {
-        s.previous_model = Some(name.clone());
-    }
-    s.model_stats = None;
-    s.last_context_status = Some(crate::context::tracker::ContextStatus::empty());
-    drop(s);
-
-    #[cfg(windows)]
     {
-        let _ = crate::engine::process::LlamaProcess::kill_all_managed_processes();
+        let mut s = state.write().await;
+        s.generation_cancel.cancel();
+        s.active_generation = None;
+        s.process.shutdown().await.map_err(|error| {
+            let message = format!("Failed to shut down llama-server: {error}");
+            clear_runtime_after_backend_exit(&mut s, Some(message.clone()));
+            message
+        })?;
+        clear_runtime_after_backend_exit(&mut s, None);
+        s.model_load_progress = None;
     }
 
-    let result = match unloaded {
-        Some(name) if !name.is_empty() => format!("Unloaded {name}"),
-        _ => "Unloaded active model".to_string(),
-    };
+    crate::context::tracker::reset_slots_warning();
 
+    let result = format!(
+        "Unloaded {}",
+        unloaded_model.unwrap_or_else(|| "model".to_string())
+    );
     publish_model_load_progress(
         &state,
         crate::state::ModelLoadState::Unloading,
@@ -1107,7 +741,6 @@ pub async fn backend_unload_model(state: SharedState) -> Result<String, String> 
         None,
     )
     .await;
-
     Ok(result)
 }
 
@@ -1185,19 +818,41 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
         )
     }; // read lock released before any async I/O
 
+    let effective_loaded_model = if loaded_model.is_some() {
+        loaded_model.clone()
+    } else if is_running {
+        last_launch_preview.as_ref().and_then(|preview| {
+            std::path::Path::new(&preview.model_path)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+    } else {
+        None
+    };
+
     let state_str = format!("{process_state:?}");
-    let model_load_state_label = model_load_state_label(&model_load_state);
+    let mut effective_model_load_state = model_load_state.clone();
+    let mut effective_model_load_progress = model_load_progress.clone();
+
+    if matches!(process_state, crate::engine::process::ProcessState::Running)
+        && effective_loaded_model.is_some()
+    {
+        effective_model_load_state = crate::state::ModelLoadState::Loaded;
+        effective_model_load_progress = None;
+    }
+
+    let model_load_state_label = model_load_state_label(&effective_model_load_state);
 
     let transition_active = matches!(
         process_state,
         crate::engine::process::ProcessState::Starting
             | crate::engine::process::ProcessState::Stopping
     ) || matches!(
-        model_load_state,
+        effective_model_load_state,
         crate::state::ModelLoadState::Loading
             | crate::state::ModelLoadState::Swapping
             | crate::state::ModelLoadState::Unloading
-    ) || model_load_progress
+    ) || effective_model_load_progress
         .as_ref()
         .map(|progress| !progress.done)
         .unwrap_or(false);
@@ -1279,7 +934,7 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
 
     Ok(ProcessStatusInfo {
         state: state_str,
-        model: loaded_model,
+        model: effective_loaded_model,
         previous_model,
         crash_count,
         server_version,
@@ -1298,7 +953,7 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
         scheduler_limit: Some(scheduler_snapshot.limit),
         last_launch_preview,
         model_load_state: model_load_state_label,
-        model_load_progress,
+        model_load_progress: effective_model_load_progress,
         active_generation,
         last_generation_metrics,
     })
@@ -1800,3 +1455,4 @@ pub async fn swap_model(
     let _ = app;
     backend_load_model(state.inner().clone(), target, context_size).await
 }
+

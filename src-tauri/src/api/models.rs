@@ -55,6 +55,12 @@ pub async fn load_model(
     let model_name = req.model.clone();
     let context_size = req.requested_context_size();
 
+    tracing::info!(
+        model = %model_name,
+        requested_context_size = context_size,
+        "Native model load requested"
+    );
+
     crate::commands::model::backend_load_model(state.clone(), model_name.clone(), context_size)
         .await
         .map_err(|error| {

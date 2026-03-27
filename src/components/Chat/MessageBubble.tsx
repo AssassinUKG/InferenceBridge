@@ -39,8 +39,14 @@ function ThinkBlock({ text }: { text: string }) {
         className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs"
         style={{ color: "#a78bfa", cursor: "pointer", background: "none", border: "none" }}
       >
-        <span style={{ fontSize: "10px", transition: "transform 0.15s", transform: open ? "rotate(90deg)" : "none" }}>
-          ▶
+        <span
+          style={{
+            fontSize: "10px",
+            transition: "transform 0.15s",
+            transform: open ? "rotate(90deg)" : "none",
+          }}
+        >
+          {">"}
         </span>
         Thinking
       </button>
@@ -94,7 +100,7 @@ export function MessageBubble({ message }: Props) {
                 <ThinkBlock key={index} text={part.text} />
               ) : (
                 <MarkdownContent key={index} content={part.text} />
-              ),
+              )
             )}
           </div>
         ) : textContent && isUser ? (

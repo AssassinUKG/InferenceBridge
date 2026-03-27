@@ -34,6 +34,23 @@ function buildReachableApiUrl(settings: AppSettings | null) {
   return `http://${host}:${port}/v1`;
 }
 
+function launchPreviewMatchesLoadedModel(
+  loadedModelName: string | null,
+  previewModelPath: string | null | undefined
+) {
+  if (!loadedModelName || !previewModelPath) return false;
+  const previewName =
+    previewModelPath.split(/[\\/]/).pop()?.trim().toLowerCase() ??
+    previewModelPath.trim().toLowerCase();
+  const requested = loadedModelName.trim().toLowerCase();
+  return (
+    previewName === requested ||
+    previewName.replace(/\.gguf$/i, "") === requested ||
+    previewName === requested.replace(/\.gguf$/i, "") ||
+    (!!requested && previewName.includes(requested))
+  );
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("chat");
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -45,9 +62,21 @@ function App() {
 
   const hasModel = !!model.processStatus?.model;
   const loadedModelName = model.processStatus?.model ?? null;
-  const loadedModelSupportsVision = loadedModelName
-    ? model.models.find((entry) => entry.filename === loadedModelName)?.supports_vision ?? false
-    : false;
+  const loadedModelEntry = loadedModelName
+    ? model.models.find((entry) => entry.filename === loadedModelName) ?? null
+    : null;
+  const loadedModelVisionConfigured = loadedModelEntry?.supports_vision ?? false;
+  const loadedModelSupportsVision =
+    loadedModelVisionConfigured &&
+    launchPreviewMatchesLoadedModel(
+      loadedModelName,
+      model.processStatus?.last_launch_preview?.model_path
+    ) &&
+    !!model.processStatus?.last_launch_preview?.mmproj_path;
+  const loadedModelVisionStatusText =
+    loadedModelVisionConfigured && !loadedModelSupportsVision && loadedModelName
+      ? `The loaded model ${loadedModelName} was started without a matching mmproj sidecar, so pasted images will not be seen correctly. Reload a vision-ready model first.`
+      : null;
   const debugApiUrl =
     model.processStatus?.api_url ??
     buildReachableApiUrl(settings);
@@ -60,6 +89,7 @@ function App() {
   const modelTransitionActive =
     !!modelTransition ||
     model.isLoading ||
+    ["Starting", "Stopping"].includes(model.processStatus?.state ?? "Idle") ||
     ["Loading", "Swapping", "Unloading"].includes(
       model.processStatus?.model_load_state ?? "Idle"
     );
@@ -304,6 +334,7 @@ function App() {
               hasSession={!!session.activeId}
               loadedModel={loadedModelName}
               loadedModelSupportsVision={loadedModelSupportsVision}
+              loadedModelVisionStatusText={loadedModelVisionStatusText}
               onSend={chat.sendMessage}
               onStop={chat.stopGeneration}
             />

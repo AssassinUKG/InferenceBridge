@@ -6,7 +6,8 @@ use std::collections::HashMap;
 
 use crate::api::completions::{
     ApiMessage, ChatCompletionRequest, StopParam, TopParam, build_chat_request, build_parse_trace,
-    end_to_end_tokens_per_second, extract_context_size_from_hash_map, resolve_loaded_model,
+    end_to_end_tokens_per_second, ensure_runtime_vision_ready,
+    extract_context_size_from_hash_map, resolve_loaded_model,
 };
 use crate::api::errors::ApiErrorResponse;
 use crate::engine::client::LlamaClient;
@@ -270,11 +271,8 @@ pub async fn responses(
     )
     .await?;
 
-    if !request.image_data.is_empty() && !profile.supports_vision {
-        return Err(ApiErrorResponse::bad_request(format!(
-            "The loaded model '{model_name}' does not advertise vision support. Load a vision-capable model first."
-        )));
-    }
+    ensure_runtime_vision_ready(&state, &model_name, &profile, !request.image_data.is_empty())
+        .await?;
 
     {
         let mut s = state.write().await;

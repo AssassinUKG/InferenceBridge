@@ -100,7 +100,8 @@ pub enum ProcessState {
 #[derive(Debug, Clone)]
 pub struct LaunchConfig {
     pub model_path: PathBuf,
-    pub context_size: u32,
+    /// When `None`, llama-server uses the model's native context window.
+    pub context_size: Option<u32>,
     pub gpu_layers: i32,
     pub threads: u32,
     pub threads_batch: u32,
@@ -124,7 +125,8 @@ pub struct LaunchPreview {
     pub model_path: String,
     pub mmproj_path: Option<String>,
     pub backend_preference: String,
-    pub context_size: u32,
+    /// Actual context size: either explicitly requested or discovered from server after launch.
+    pub context_size: Option<u32>,
     pub port: u16,
     pub parallel_slots: u32,
     pub args: Vec<String>,
@@ -164,8 +166,8 @@ impl LlamaProcess {
         if !config.model_path.exists() {
             anyhow::bail!("Model file does not exist: {}", config.model_path.display());
         }
-        if config.context_size == 0 {
-            anyhow::bail!("Context size must be greater than 0");
+        if config.context_size == Some(0) {
+            anyhow::bail!("Context size must be greater than 0 when specified");
         }
         if config.parallel_slots == 0 {
             anyhow::bail!("Parallel slots must be at least 1");
@@ -201,14 +203,19 @@ impl LlamaProcess {
         let mut args = vec![
             "--model".to_string(),
             config.model_path.to_string_lossy().to_string(),
-            "--ctx-size".to_string(),
-            config.context_size.to_string(),
             "--port".to_string(),
             config.port.to_string(),
             "--parallel".to_string(),
             config.parallel_slots.max(1).to_string(),
             "--slots".to_string(),
         ];
+
+        // Only pass --ctx-size when explicitly specified; otherwise let
+        // llama-server use the model's native context window.
+        if let Some(ctx) = config.context_size {
+            args.push("--ctx-size".to_string());
+            args.push(ctx.to_string());
+        }
 
         if let Some(mmproj) = &mmproj_path {
             args.push("--mmproj".to_string());
@@ -472,9 +479,16 @@ impl LlamaProcess {
         self.shutdown().await?;
         #[cfg(windows)]
         {
-            if let Ok(killed) = Self::kill_all_managed_processes() {
-                if killed > 0 {
-                    tracing::warn!(killed, "Cleaned up stale managed llama-server processes before launch");
+            let port_still_busy = std::net::TcpListener::bind(("127.0.0.1", config.port)).is_err();
+            if port_still_busy {
+                if let Ok(killed) = Self::kill_all_managed_processes() {
+                    if killed > 0 {
+                        tracing::warn!(
+                            killed,
+                            port = config.port,
+                            "Cleaned up stale managed llama-server processes before launch"
+                        );
+                    }
                 }
             }
         }
@@ -520,7 +534,7 @@ impl LlamaProcess {
         tracing::info!(
             server = %server_path.display(),
             model = %config.model_path.display(),
-            ctx = config.context_size,
+            ctx = ?config.context_size,
             port = config.port,
             gpu_layers = config.gpu_layers,
             args = ?preview.args,

@@ -290,6 +290,7 @@ export function DebugInspector({
       : processStatus?.model_load_progress ?? null;
   const modelTransitionActive =
     (!!modelTransition && !modelTransition.done) ||
+    ["Starting", "Stopping"].includes(processStatus?.state ?? "Idle") ||
     ["Loading", "Swapping", "Unloading"].includes(
       processStatus?.model_load_state ?? "Idle"
     );

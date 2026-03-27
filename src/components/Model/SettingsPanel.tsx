@@ -9,7 +9,7 @@ interface Props {
   onSetApiServerRunning: (running: boolean) => void | Promise<void>;
 }
 
-// ─── Shared primitives ────────────────────────────────────────────────────────
+// Shared primitives
 
 function SectionPanel({ children }: { children: ReactNode }) {
   return (
@@ -219,7 +219,7 @@ function FlatBtn({
   );
 }
 
-// ─── API Key field ─────────────────────────────────────────────────────────────
+// API key field
 
 function ApiKeyRow({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   const [visible, setVisible] = useState(false);
@@ -255,7 +255,7 @@ function ApiKeyRow({ value, onChange }: { value: string; onChange: (v: string) =
             type={visible ? "text" : "password"}
             value={value}
             onChange={(e) => onChange(e.target.value)}
-            placeholder="No key set — public access"
+            placeholder="No key set - public access"
             className="flex-1 rounded px-3 py-1.5 text-sm font-mono outline-none"
             style={{
               background: "var(--surface-2)",
@@ -297,7 +297,7 @@ function ApiKeyRow({ value, onChange }: { value: string; onChange: (v: string) =
         </div>
         {value && (
           <p className="text-[10px]" style={{ color: "var(--text-2)" }}>
-            Use as: <span className="font-mono">Authorization: Bearer {visible ? value : value.slice(0, 6) + "…"}</span>
+            Use as: <span className="font-mono">Authorization: Bearer {visible ? value : value.slice(0, 6) + "..."}</span>
           </p>
         )}
       </div>
@@ -305,7 +305,7 @@ function ApiKeyRow({ value, onChange }: { value: string; onChange: (v: string) =
   );
 }
 
-// ─── Main component ───────────────────────────────────────────────────────────
+// Main component
 
 export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiServerRunning }: Props) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -377,7 +377,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
   }, [settings, loadApiAccessInfo, onSaved]);
 
   const handleDownload = async (backend: string) => {
-    setDownloadStatus(`Downloading ${backend} build…`);
+    setDownloadStatus(`Downloading ${backend} build...`);
     try {
       const result = await api.downloadLlamaBuild(backend);
       setDownloadStatus(result);
@@ -389,7 +389,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
   };
 
   const handleUpdate = async () => {
-    setDownloadStatus("Checking for updates…");
+    setDownloadStatus("Checking for updates...");
     try {
       const result = await api.updateLlamaServer();
       setDownloadStatus(result);
@@ -403,7 +403,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
   if (!settings) {
     return (
       <div className="p-4 text-sm" style={{ color: "var(--text-1)" }}>
-        {error ? `Error: ${error}` : "Loading…"}
+        {error ? `Error: ${error}` : "Loading..."}
       </div>
     );
   }
@@ -425,6 +425,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
       : processStatus?.model_load_progress ?? null;
   const modelTransitionActive =
     (!!modelTransition && !modelTransition.done) ||
+    ["Starting", "Stopping"].includes(processStatus?.state ?? "Idle") ||
     ["Loading", "Swapping", "Unloading"].includes(
       processStatus?.model_load_state ?? "Idle"
     );
@@ -485,7 +486,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
     <div className="h-full overflow-y-auto">
       <div className="p-3 flex flex-col gap-3">
 
-        {/* ── API Surface ── */}
+        {/* API Surface */}
         <SectionPanel>
           <SectionHeader title="API Surface" description="OpenAI-compatible endpoint for external clients. The desktop UI talks to InferenceBridge directly. Save API changes before starting or retrying the public endpoint." />
 
@@ -638,12 +639,12 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
         </SectionPanel>
 
         <div className="grid gap-3 xl:grid-cols-2">
-          {/* ── llama.cpp Server ── */}
+          {/* llama.cpp Server */}
           <SectionPanel>
             <SectionHeader title="llama.cpp Server" description="Managed binary details and update controls." />
 
             {llamaLoading ? (
-              <div className="px-4 py-3 text-xs" style={{ color: "var(--text-2)" }}>Loading…</div>
+              <div className="px-4 py-3 text-xs" style={{ color: "var(--text-2)" }}>Loading...</div>
             ) : (
               <>
                 <InfoTile label="Version" value={llamaInfo?.version ?? "Not installed"} />
@@ -706,7 +707,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
             )}
           </SectionPanel>
 
-          {/* ── Execution Defaults ── */}
+          {/* Execution Defaults */}
           <SectionPanel>
             <SectionHeader title="Execution Defaults" description="Runtime preferences used when launching llama-server." />
 
@@ -715,7 +716,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
                 value={settings.backend_preference}
                 onChange={(v) => setSettings({ ...settings, backend_preference: v })}
               >
-                <option value="auto">Auto (CUDA → CPU fallback)</option>
+                <option value="auto">Auto (CUDA / CPU fallback)</option>
                 <option value="cuda">Force CUDA</option>
                 <option value="cpu">CPU only (AVX2)</option>
               </FlatSelect>
@@ -765,9 +766,9 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
           </SectionPanel>
         </div>
 
-        {/* ── Inference Engine ── */}
+        {/* Inference Engine */}
         <SectionPanel>
-          <SectionHeader title="Inference Engine" description="llama-server parameters — take effect on next model load." />
+          <SectionHeader title="Inference Engine" description="llama-server parameters - take effect on next model load." />
 
           <div className="grid gap-0 xl:grid-cols-2">
             <div>
@@ -867,7 +868,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
           </div>
         </SectionPanel>
 
-        {/* ── Model Directories ── */}
+        {/* Model Directories */}
         <SectionPanel>
           <SectionHeader
             title="Model Directories"
@@ -899,7 +900,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
                   }}
                   title="Remove directory"
                 >
-                  ✕
+                  Remove
                 </button>
               </div>
             ))}
@@ -927,7 +928,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
           </div>
         </SectionPanel>
 
-        {/* ── Lifecycle ── */}
+        {/* Lifecycle */}
         <SectionPanel>
           <SectionHeader title="Lifecycle" />
           <div className="px-4 py-3">
@@ -940,10 +941,10 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
           </div>
         </SectionPanel>
 
-        {/* ── Save bar ── */}
+        {/* Save bar */}
         <div className="flex items-center gap-3 pb-2">
           <FlatBtn
-            label={saving ? "Saving…" : "Save Settings"}
+            label={saving ? "Saving..." : "Save Settings"}
             onClick={() => {
               void saveSettings();
             }}
@@ -962,3 +963,5 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
     </div>
   );
 }
+
+

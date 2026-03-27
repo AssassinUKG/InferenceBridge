@@ -17,6 +17,7 @@ interface Props {
   /** Name of the currently loaded model used to detect thinking support. */
   loadedModel?: string | null;
   loadedModelSupportsVision?: boolean;
+  loadedModelVisionStatusText?: string | null;
   onSend: (
     content: string,
     sampling?: SamplingParams,
@@ -37,6 +38,7 @@ export function ChatPanel({
   hasSession,
   loadedModel,
   loadedModelSupportsVision = false,
+  loadedModelVisionStatusText = null,
   onSend,
   onStop,
 }: Props) {
@@ -111,7 +113,10 @@ export function ChatPanel({
     const trimmed = input.trim();
     if ((!trimmed && !image) || !hasModel || !hasSession || isStreaming) return;
     if (image && !loadedModelSupportsVision) {
-      setComposerError("The current model does not advertise vision support. Load a Vision model first.");
+      setComposerError(
+        loadedModelVisionStatusText ??
+          "The current model is not vision-ready. Load a vision model with its matching mmproj sidecar first."
+      );
       return;
     }
     const params = Object.keys(sampling).length > 0 ? sampling : undefined;
@@ -442,7 +447,8 @@ export function ChatPanel({
             <span className="text-xs text-gray-500">
               {loadedModelSupportsVision
                 ? "Will be sent to the current vision model."
-                : "Current model is text-only. Load a Vision model before sending."}
+                : loadedModelVisionStatusText ??
+                  "Current model is text-only. Load a vision model before sending."}
             </span>
             <button
               onClick={handleRemoveImage}

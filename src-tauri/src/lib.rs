@@ -527,9 +527,8 @@ async fn headless_load_model(state: &state::SharedState, model_name: &str, ctx_s
             }
         };
 
-        let ctx = ctx_size
-            .or(model.profile.default_context_window)
-            .unwrap_or(s.config.models.default_context);
+        // Only pass explicit context size if the user or config asked for one.
+        let ctx = ctx_size.or(model.profile.default_context_window);
 
         LaunchConfig {
             model_path: model.path.clone(),

@@ -25,7 +25,7 @@ function sameContextStatus(a: ContextStatus, b: ContextStatus) {
   );
 }
 
-export function useContext(pollInterval = 2000) {
+export function useContext(pollInterval = 500) {
   const [status, setStatus] = useState<ContextStatus>(EMPTY_STATUS);
 
   useEffect(() => {
@@ -44,18 +44,34 @@ export function useContext(pollInterval = 2000) {
 
     poll();
     const intervalId = setInterval(poll, pollInterval);
-    let unlisten: (() => void) | null = null;
+    let unlistenPressure: (() => void) | null = null;
+    let unlistenModelLoad: (() => void) | null = null;
+    let unlistenApiState: (() => void) | null = null;
 
     listen("context-pressure", () => {
       void poll();
     }).then((dispose) => {
-      unlisten = dispose;
+      unlistenPressure = dispose;
+    }).catch(() => undefined);
+
+    listen("model-load-progress", () => {
+      void poll();
+    }).then((dispose) => {
+      unlistenModelLoad = dispose;
+    }).catch(() => undefined);
+
+    listen("api-server-state-changed", () => {
+      void poll();
+    }).then((dispose) => {
+      unlistenApiState = dispose;
     }).catch(() => undefined);
 
     return () => {
       active = false;
       clearInterval(intervalId);
-      unlisten?.();
+      unlistenPressure?.();
+      unlistenModelLoad?.();
+      unlistenApiState?.();
     };
   }, [pollInterval]);
 

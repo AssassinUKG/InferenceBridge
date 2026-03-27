@@ -1,8 +1,6 @@
 use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
-use base64::Engine as _;
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -10,14 +8,13 @@ use crate::api::errors::ApiErrorResponse;
 use crate::engine::client::{CompletionRequest, ImageData, LlamaClient};
 use crate::engine::streaming::{self, StreamEvent};
 use crate::models::profiles::ModelProfile;
+use crate::normalize::images::normalize_image_payload as normalize_image_payload_shared;
 use crate::normalize::think_strip::{
     extract_reasoning_content_with_style, strip_think_tags_with_style,
 };
 use crate::state::{
     SharedState, begin_api_generation, finish_api_generation, summarize_reasoning_tokens,
 };
-
-const MAX_REMOTE_IMAGE_BYTES: usize = 15 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -133,18 +130,68 @@ impl ChatCompletionRequest {
     }
 }
 
+const CONTEXT_SIZE_KEYS: &[&str] = &[
+    "contextLength",
+    "context_length",
+    "contextlength",
+    "context_size",
+    "ctx_size",
+    "ctxSize",
+    "n_ctx",
+    "nCtx",
+    "maxContextLength",
+    "max_context_length",
+    "contextWindow",
+    "context_window",
+];
+
+fn parse_context_size_string(text: &str) -> Option<u32> {
+    let normalized = text.trim().to_ascii_lowercase().replace('_', "");
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if let Ok(value) = normalized.parse::<u32>() {
+        return (value > 0).then_some(value);
+    }
+
+    let stripped = normalized
+        .trim_end_matches("tokens")
+        .trim_end_matches("token")
+        .trim();
+
+    if let Some(number) = stripped.strip_suffix('k') {
+        return number
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|value| (value * 1024.0).round() as u32)
+            .filter(|value| *value > 0);
+    }
+
+    if let Some(number) = stripped.strip_suffix('m') {
+        return number
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .map(|value| (value * 1024.0 * 1024.0).round() as u32)
+            .filter(|value| *value > 0);
+    }
+
+    None
+}
+
 fn extract_context_size_from_value(value: &serde_json::Value) -> Option<u32> {
     match value {
         serde_json::Value::Number(number) => number
             .as_u64()
             .and_then(|value| u32::try_from(value).ok())
             .filter(|value| *value > 0),
-        serde_json::Value::String(text) => text
-            .trim()
-            .parse::<u32>()
-            .ok()
-            .filter(|value| *value > 0),
+        serde_json::Value::String(text) => parse_context_size_string(text),
         serde_json::Value::Object(map) => extract_context_size_from_json_map(map),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(extract_context_size_from_value),
         _ => None,
     }
 }
@@ -152,35 +199,15 @@ fn extract_context_size_from_value(value: &serde_json::Value) -> Option<u32> {
 pub(crate) fn extract_context_size_from_json_map(
     map: &serde_json::Map<String, serde_json::Value>,
 ) -> Option<u32> {
-    for key in [
-        "contextLength",
-        "context_length",
-        "contextlength",
-        "context_size",
-        "ctx_size",
-        "n_ctx",
-        "maxContextLength",
-        "contextWindow",
-        "max_context_length",
-    ] {
-        if let Some(value) = map.get(key).and_then(extract_context_size_from_value) {
+    for key in CONTEXT_SIZE_KEYS {
+        if let Some(value) = map.get(*key).and_then(extract_context_size_from_value) {
             return Some(value);
         }
     }
 
-    for key in [
-        "config",
-        "load_config",
-        "loadConfig",
-        "options",
-        "model_options",
-        "runtime",
-        "params",
-    ] {
-        if let Some(serde_json::Value::Object(nested)) = map.get(key) {
-            if let Some(value) = extract_context_size_from_json_map(nested) {
-                return Some(value);
-            }
+    for value in map.values() {
+        if let Some(value) = extract_context_size_from_value(value) {
+            return Some(value);
         }
     }
 
@@ -190,35 +217,15 @@ pub(crate) fn extract_context_size_from_json_map(
 pub(crate) fn extract_context_size_from_hash_map(
     map: &HashMap<String, serde_json::Value>,
 ) -> Option<u32> {
-    for key in [
-        "contextLength",
-        "context_length",
-        "contextlength",
-        "context_size",
-        "ctx_size",
-        "n_ctx",
-        "maxContextLength",
-        "contextWindow",
-        "max_context_length",
-    ] {
-        if let Some(value) = map.get(key).and_then(extract_context_size_from_value) {
+    for key in CONTEXT_SIZE_KEYS {
+        if let Some(value) = map.get(*key).and_then(extract_context_size_from_value) {
             return Some(value);
         }
     }
 
-    for key in [
-        "config",
-        "load_config",
-        "loadConfig",
-        "options",
-        "model_options",
-        "runtime",
-        "params",
-    ] {
-        if let Some(serde_json::Value::Object(nested)) = map.get(key) {
-            if let Some(value) = extract_context_size_from_json_map(nested) {
-                return Some(value);
-            }
+    for value in map.values() {
+        if let Some(value) = extract_context_size_from_value(value) {
+            return Some(value);
         }
     }
 
@@ -401,7 +408,7 @@ pub(crate) async fn resolve_loaded_model(
     requested_model: &str,
     requested_context_size: Option<u32>,
 ) -> Result<String, ApiErrorResponse> {
-    let (target_model, needs_swap) = {
+    let (target_model, needs_swap, current_context_size) = {
         let s = state.read().await;
         let target_model = if requested_model.trim().is_empty() {
             s.loaded_model.clone().ok_or_else(ApiErrorResponse::no_model)?
@@ -413,13 +420,22 @@ pub(crate) async fn resolve_loaded_model(
             Some(loaded) => !loaded_model_matches_request(loaded, &target_model),
             None => true,
         };
-        let current_context_size = s.last_launch_preview.as_ref().map(|preview| preview.context_size);
+        let current_context_size = s.last_launch_preview.as_ref().and_then(|preview| preview.context_size);
         let context_mismatch = requested_context_size
             .map(|requested| current_context_size != Some(requested))
             .unwrap_or(false);
 
-        (target_model, model_mismatch || context_mismatch)
+        (target_model, model_mismatch || context_mismatch, current_context_size)
     };
+
+    tracing::info!(
+        requested_model = %requested_model,
+        target_model = %target_model,
+        requested_context_size = requested_context_size,
+        current_context_size = current_context_size,
+        needs_swap,
+        "Resolving model for API request"
+    );
 
     if needs_swap {
         swap_model_for_api(state, &target_model, requested_context_size).await.map_err(|e| {
@@ -433,117 +449,10 @@ pub(crate) async fn resolve_loaded_model(
     s.loaded_model.clone().ok_or_else(ApiErrorResponse::no_model)
 }
 
-async fn fetch_remote_image_as_base64(url: &str) -> Result<String, ApiErrorResponse> {
-    let parsed = reqwest::Url::parse(url).map_err(|_| {
-        ApiErrorResponse::bad_request(format!("Invalid image URL: {url}"))
-    })?;
-
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(ApiErrorResponse::bad_request(format!(
-            "Unsupported image URL scheme '{}'. Only http/https URLs are supported.",
-            parsed.scheme()
-        )));
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent("InferenceBridge/1.0")
-        .build()
-        .map_err(|e| ApiErrorResponse::service_unavailable(format!(
-            "Could not initialize remote image fetch client: {e}"
-        )))?;
-
-    let response = client
-        .get(parsed.clone())
-        .header(reqwest::header::ACCEPT, "image/*,application/octet-stream;q=0.9,*/*;q=0.1")
-        .send()
-        .await
-        .map_err(|e| {
-            ApiErrorResponse::bad_request(format!(
-                "Could not fetch remote image URL '{url}': {e}"
-            ))
-        })?;
-
-    if !response.status().is_success() {
-        return Err(ApiErrorResponse::bad_request(format!(
-            "Remote image URL '{url}' returned HTTP {}.",
-            response.status()
-        )));
-    }
-
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    if !content_type.is_empty()
-        && !content_type.starts_with("image/")
-        && !content_type.starts_with("application/octet-stream")
-    {
-        return Err(ApiErrorResponse::bad_request(format!(
-            "Remote image URL '{url}' returned unsupported content type '{content_type}'."
-        )));
-    }
-
-    if let Some(content_length) = response.content_length() {
-        if content_length as usize > MAX_REMOTE_IMAGE_BYTES {
-            return Err(ApiErrorResponse::bad_request(format!(
-                "Remote image URL '{url}' is too large ({content_length} bytes). Max allowed is {MAX_REMOTE_IMAGE_BYTES} bytes."
-            )));
-        }
-    }
-
-    let mut bytes = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            ApiErrorResponse::bad_request(format!(
-                "Failed while downloading remote image URL '{url}': {e}"
-            ))
-        })?;
-        if bytes.len() + chunk.len() > MAX_REMOTE_IMAGE_BYTES {
-            return Err(ApiErrorResponse::bad_request(format!(
-                "Remote image URL '{url}' exceeded the max allowed size of {MAX_REMOTE_IMAGE_BYTES} bytes."
-            )));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-
-    if bytes.is_empty() {
-        return Err(ApiErrorResponse::bad_request(format!(
-            "Remote image URL '{url}' returned an empty body."
-        )));
-    }
-
-    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
-}
-
 async fn normalize_image_payload(value: &str) -> Result<String, ApiErrorResponse> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(ApiErrorResponse::bad_request(
-            "Image content parts must not be empty.",
-        ));
-    }
-
-    if trimmed.starts_with("data:") {
-        return trimmed
-            .split_once(',')
-            .map(|(_, data)| data.to_string())
-            .ok_or_else(|| {
-                ApiErrorResponse::bad_request(
-                    "Image data URLs must include a base64 payload after the comma.",
-                )
-            });
-    }
-
-    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        return fetch_remote_image_as_base64(trimmed).await;
-    }
-
-    Ok(trimmed.to_string())
+    normalize_image_payload_shared(value)
+        .await
+        .map_err(ApiErrorResponse::bad_request)
 }
 
 pub(crate) async fn normalize_api_messages(
@@ -695,6 +604,58 @@ pub(crate) async fn build_chat_request(
     })
 }
 
+fn launch_preview_matches_model(model_name: &str, preview_model_path: &str) -> bool {
+    let requested = model_name.trim().to_ascii_lowercase();
+    let preview_name = std::path::Path::new(preview_model_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(preview_model_path)
+        .trim()
+        .to_ascii_lowercase();
+
+    preview_name == requested
+        || preview_name.trim_end_matches(".gguf") == requested
+        || preview_name == requested.trim_end_matches(".gguf")
+        || (!requested.is_empty() && preview_name.contains(&requested))
+}
+
+pub(crate) async fn ensure_runtime_vision_ready(
+    state: &SharedState,
+    model_name: &str,
+    profile: &ModelProfile,
+    has_images: bool,
+) -> Result<(), ApiErrorResponse> {
+    if !has_images {
+        return Ok(());
+    }
+
+    if !profile.supports_vision {
+        return Err(ApiErrorResponse::bad_request(format!(
+            "The loaded model '{model_name}' does not advertise vision support. Load a vision-capable model first."
+        )));
+    }
+
+    let launch_preview = {
+        let s = state.read().await;
+        s.last_launch_preview.clone()
+    };
+
+    let matching_preview = launch_preview
+        .as_ref()
+        .filter(|preview| launch_preview_matches_model(model_name, &preview.model_path));
+
+    if matching_preview
+        .and_then(|preview| preview.mmproj_path.as_ref())
+        .is_some()
+    {
+        return Ok(());
+    }
+
+    Err(ApiErrorResponse::bad_request(format!(
+        "The loaded model '{model_name}' was started without a matching mmproj sidecar, so image input is not actually available. Reload a vision-ready model first."
+    )))
+}
+
 fn prepend_reasoning_guidance_message(
     messages: &mut Vec<crate::templates::engine::ChatMessage>,
     profile: &ModelProfile,
@@ -794,11 +755,8 @@ pub async fn chat_completions(
     )
     .await?;
 
-    if !request.image_data.is_empty() && !profile.supports_vision {
-        return Err(ApiErrorResponse::bad_request(format!(
-            "The loaded model '{model_name}' does not advertise vision support. Load a vision-capable model first."
-        )));
-    }
+    ensure_runtime_vision_ready(&state, &model_name, &profile, !request.image_data.is_empty())
+        .await?;
 
     {
         let mut s = state.write().await;
@@ -1379,6 +1337,44 @@ mod tests {
                 ],
                 "loadConfig": {
                     "context_length": 32768
+                }
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        assert_eq!(request.requested_context_size(), Some(32768));
+    }
+
+    #[test]
+    fn finds_context_size_in_arbitrary_nested_objects() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "messages": [
+                    { "role": "user", "content": "hello" }
+                ],
+                "session": {
+                    "modelPreferences": {
+                        "runtime": {
+                            "ctxSize": 32768
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        assert_eq!(request.requested_context_size(), Some(32768));
+    }
+
+    #[test]
+    fn parses_context_size_strings_with_k_suffix() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "messages": [
+                    { "role": "user", "content": "hello" }
+                ],
+                "loadConfig": {
+                    "contextWindow": "32k"
                 }
             }"#,
         )

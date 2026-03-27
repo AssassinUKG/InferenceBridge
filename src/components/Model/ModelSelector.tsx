@@ -47,7 +47,7 @@ function fmtToolFormat(f: string) {
 }
 
 function fmtNum(v: number | null | undefined) {
-  if (!v) return "n/a";
+  if (v == null) return "n/a";
   return v.toLocaleString();
 }
 

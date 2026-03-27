@@ -53,7 +53,7 @@ pub async fn test_model(
         let mut state = shared_state.write().await;
         let config = LaunchConfig {
             model_path: model_path.clone(),
-            context_size,
+            context_size: Some(context_size),
             gpu_layers: state.config.process.gpu_layers,
             threads: state.config.process.threads,
             threads_batch: state.config.process.threads_batch,

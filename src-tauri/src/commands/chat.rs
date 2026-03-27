@@ -4,11 +4,27 @@ use crate::context::{compressor, strategy, tracker};
 use crate::engine::client::{CompletionRequest, ImageData, LlamaClient};
 use crate::engine::streaming::{self, StreamEvent};
 use crate::models::profiles::{ModelFamily, ModelProfile};
+use crate::normalize::images::normalize_inline_image_payload;
 use crate::state::{GenerationRequest, SharedState};
 use crate::templates::engine::{render_prompt, ChatMessage};
 
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+fn launch_preview_matches_model(model_name: &str, preview_model_path: &str) -> bool {
+    let requested = model_name.trim().to_ascii_lowercase();
+    let preview_name = std::path::Path::new(preview_model_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(preview_model_path)
+        .trim()
+        .to_ascii_lowercase();
+
+    preview_name == requested
+        || preview_name.trim_end_matches(".gguf") == requested
+        || preview_name == requested.trim_end_matches(".gguf")
+        || (!requested.is_empty() && preview_name.contains(&requested))
 }
 
 fn build_parse_trace(profile: &ModelProfile, raw: &str, stripped: &str, reasoning: &str) -> String {
@@ -236,18 +252,39 @@ pub async fn send_message(
 ) -> Result<String, String> {
     tracing::info!(session = %session_id, content_len = content.len(), "send_message called");
 
-    let (model_name, profile) = {
+    let normalized_inline_image = image_base64
+        .as_deref()
+        .map(normalize_inline_image_payload)
+        .transpose()
+        .map_err(|e| format!("Invalid pasted image: {e}"))?;
+
+    let (model_name, profile, vision_runtime_ready) = {
         let s = state.read().await;
         let Some(model_name) = s.loaded_model.clone() else {
             return Err("No model loaded".to_string());
         };
         let profile = crate::models::overrides::detect_effective_profile(&model_name);
-        (model_name, profile)
+        let vision_runtime_ready = if normalized_inline_image.is_some() {
+            s.last_launch_preview
+                .as_ref()
+                .filter(|preview| launch_preview_matches_model(&model_name, &preview.model_path))
+                .and_then(|preview| preview.mmproj_path.as_ref())
+                .is_some()
+        } else {
+            true
+        };
+        (model_name, profile, vision_runtime_ready)
     };
 
-    if image_base64.is_some() && !profile.supports_vision {
+    if normalized_inline_image.is_some() && !profile.supports_vision {
         return Err(format!(
             "The loaded model `{model_name}` does not advertise vision support. Load a Vision-capable model first."
+        ));
+    }
+
+    if normalized_inline_image.is_some() && !vision_runtime_ready {
+        return Err(format!(
+            "The loaded model `{model_name}` was started without a matching mmproj sidecar, so pasted images will not be seen correctly. Reload a vision-ready model first."
         ));
     }
 
@@ -280,11 +317,17 @@ pub async fn send_message(
                     format!("{marker}\n{message_content}")
                 };
 
-                let raw = image_uri.split(',').nth(1).unwrap_or(image_uri);
-                image_data.push(ImageData {
-                    data: raw.to_string(),
-                    id: image_id,
-                });
+                match normalize_inline_image_payload(image_uri) {
+                    Ok(raw) => {
+                        image_data.push(ImageData {
+                            data: raw,
+                            id: image_id,
+                        });
+                    }
+                    Err(e) => {
+                        tracing::warn!(image_id, error = %e, "Skipping invalid stored image payload");
+                    }
+                }
             }
 
             ChatMessage {

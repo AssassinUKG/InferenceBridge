@@ -56,6 +56,7 @@ export function ProcessStatus({ status, settings }: Props) {
   const modelTransition = status.model_load_progress;
   const modelTransitionActive =
     (!!modelTransition && !modelTransition.done) ||
+    ["Starting", "Stopping"].includes(status.state) ||
     ["Loading", "Swapping", "Unloading"].includes(status.model_load_state);
 
   return (

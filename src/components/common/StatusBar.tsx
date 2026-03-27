@@ -49,6 +49,7 @@ export function StatusBar({ processStatus, contextStatus, settings, loadProgress
         : null;
   const transitionActive =
     !!activeLoadProgress ||
+    ["Starting", "Stopping"].includes(processStatus?.state ?? "Idle") ||
     ["Loading", "Swapping", "Unloading"].includes(
       processStatus?.model_load_state ?? "Idle"
     );

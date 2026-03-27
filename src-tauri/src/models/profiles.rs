@@ -121,7 +121,7 @@ impl ModelProfile {
             supports_parallel_tools: true,
             supports_vision: false,
             default_max_output_tokens: Some(8192),
-            default_context_window: Some(8192),
+            default_context_window: None, // let llama-server use model metadata
             max_context_window: Some(262144),
             parser_type: ParserType::QwenStateMachine,
             renderer_type: RendererType::QwenChat,
@@ -148,7 +148,7 @@ impl ModelProfile {
                 || model_name.contains("32b"),
             supports_vision: false,
             default_max_output_tokens: Some(8192),
-            default_context_window: Some(8192),
+            default_context_window: None, // let llama-server use model metadata
             max_context_window: Some(131072),
             parser_type: ParserType::QwenStateMachine,
             renderer_type: RendererType::QwenChat,
@@ -173,7 +173,7 @@ impl ModelProfile {
             supports_parallel_tools: false,
             supports_vision: false,
             default_max_output_tokens: Some(4096),
-            default_context_window: Some(8192),
+            default_context_window: None, // let llama-server use model metadata
             max_context_window: Some(32768),
             parser_type: ParserType::NativeApi,
             renderer_type: RendererType::ChatML,
@@ -298,7 +298,7 @@ impl ModelProfile {
             supports_parallel_tools: false,
             supports_vision: false,
             default_max_output_tokens: Some(4096),
-            default_context_window: Some(8192),
+            default_context_window: None, // let llama-server use model metadata
             max_context_window: Some(131072),
             parser_type: ParserType::NativeApi,
             renderer_type: RendererType::GemmaChat,

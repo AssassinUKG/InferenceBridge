@@ -26,6 +26,7 @@ function deriveIsLoading(status: ProcessStatusInfo | null) {
   const transition = deriveLoadProgress(status);
   return (
     !!transition ||
+    ["Starting", "Stopping"].includes(status?.state ?? "Idle") ||
     ["Loading", "Swapping", "Unloading"].includes(
       status?.model_load_state ?? "Idle"
     )
@@ -135,12 +136,12 @@ export function useModel() {
         error: p.error ?? s.error,
       }));
       // When loading is done, refresh model list and status
-      if (p.done && !p.error) {
-        setTimeout(() => {
-          refresh();
-          setState((s) => ({ ...s, isLoading: false, loadProgress: null }));
-        }, 500);
-      }
+        if (p.done && !p.error) {
+          setTimeout(() => {
+            refresh();
+            setState((s) => ({ ...s, isLoading: false, loadProgress: null }));
+          }, 100);
+        }
       if (p.done && p.error) {
         setState((s) => ({ ...s, isLoading: false }));
       }
@@ -173,9 +174,9 @@ export function useModel() {
       } catch {
         // ignore polling errors
       }
-    }, 3000);
-    return () => clearInterval(interval);
-  }, []);
+      }, 500);
+      return () => clearInterval(interval);
+    }, []);
 
   // Listen for instant API server state notifications (no poll delay).
   useEffect(() => {
