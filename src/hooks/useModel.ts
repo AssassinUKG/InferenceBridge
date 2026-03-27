@@ -212,7 +212,7 @@ export function useModel() {
         },
       }));
       try {
-        const result = await api.loadModel(modelName, contextSize);
+        const result = await api.swapModel(modelName, contextSize);
         await refresh();
         setState((s) => ({ ...s, isLoading: false, loadProgress: null }));
         return result;

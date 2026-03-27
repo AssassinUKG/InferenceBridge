@@ -4,7 +4,7 @@ use axum::response::{IntoResponse, Json, Response};
 use serde::{Deserialize, Serialize};
 
 use crate::api::completions::{
-    ApiMessage, ChatCompletionRequest, build_chat_request, build_parse_trace,
+    ApiMessage, ChatCompletionRequest, StopParam, TopParam, build_chat_request, build_parse_trace,
     end_to_end_tokens_per_second, resolve_loaded_model,
 };
 use crate::api::errors::ApiErrorResponse;
@@ -36,16 +36,46 @@ pub struct ResponsesRequest {
     pub input: ResponseInput,
     #[serde(default)]
     pub stream: bool,
-    #[serde(default)]
+    #[serde(default, alias = "maxOutputTokens")]
     pub max_output_tokens: Option<u32>,
-    #[serde(default)]
+    #[serde(default, alias = "temp")]
     pub temperature: Option<f32>,
-    #[serde(default)]
+    #[serde(default, alias = "topP")]
     pub top_p: Option<f32>,
-    #[serde(default)]
+    #[serde(default, alias = "topK")]
     pub top_k: Option<i32>,
+    #[serde(default, alias = "minP")]
+    pub min_p: Option<f32>,
+    #[serde(default)]
+    pub top: Option<TopParam>,
+    #[serde(default, alias = "presencePenalty")]
+    pub presence_penalty: Option<f32>,
+    #[serde(default, alias = "frequencyPenalty")]
+    pub frequency_penalty: Option<f32>,
+    #[serde(
+        default,
+        alias = "repetitionPenalty",
+        alias = "repeatPenalty",
+        alias = "repeat_penalty"
+    )]
+    pub repetition_penalty: Option<f32>,
     #[serde(default)]
     pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(
+        default,
+        alias = "contextLength",
+        alias = "context_length",
+        alias = "contextlength",
+        alias = "context_size",
+        alias = "ctx_size",
+        alias = "n_ctx",
+        alias = "maxContextLength"
+    )]
+    pub context_size: Option<u32>,
+    #[serde(default)]
+    pub stop: Option<StopParam>,
+    #[serde(default)]
+    pub seed: Option<i64>,
     #[serde(default)]
     pub reasoning: Option<ResponseReasoningConfig>,
     #[serde(default)]
@@ -141,12 +171,15 @@ fn into_chat_request(request: ResponsesRequest) -> ChatCompletionRequest {
         temperature: request.temperature,
         top_p: request.top_p,
         top_k: request.top_k,
-        presence_penalty: None,
-        frequency_penalty: None,
-        repetition_penalty: None,
-        seed: None,
-        stop: None,
+        min_p: request.min_p,
+        presence_penalty: request.presence_penalty,
+        frequency_penalty: request.frequency_penalty,
+        repetition_penalty: request.repetition_penalty,
+        seed: request.seed,
+        stop: request.stop,
         tools: request.tools,
+        context_size: request.context_size,
+        top: request.top,
         reasoning: request.reasoning.map(|reasoning| crate::api::completions::ReasoningRequest {
             effort: reasoning.effort,
             max_tokens: reasoning.max_tokens,
@@ -195,8 +228,10 @@ pub async fn responses(
 ) -> Result<Response, ApiErrorResponse> {
     let previous_response_id = req.previous_response_id.clone();
     let chat_request = into_chat_request(req);
+    let requested_context_size = chat_request.requested_context_size();
     let requested_model = chat_request.model.clone().unwrap_or_default();
-    let model_name = resolve_loaded_model(&state, &requested_model).await?;
+    let model_name =
+        resolve_loaded_model(&state, &requested_model, requested_context_size).await?;
     let profile = crate::models::overrides::detect_effective_profile(&model_name);
 
     let server_defaults = {

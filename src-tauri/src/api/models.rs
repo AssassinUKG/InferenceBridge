@@ -11,6 +11,15 @@ use tokio::task;
 pub struct LoadModelRequest {
     pub model: String,
     /// Optional context size override. Uses model profile default when omitted.
+    #[serde(
+        default,
+        alias = "contextLength",
+        alias = "context_length",
+        alias = "contextlength",
+        alias = "ctx_size",
+        alias = "n_ctx",
+        alias = "maxContextLength"
+    )]
     pub context_size: Option<u32>,
 }
 
@@ -82,6 +91,24 @@ pub async fn load_model(
         progress: s.model_load_progress.clone(),
         model_info: s.model_stats.clone(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LoadModelRequest;
+
+    #[test]
+    fn deserializes_context_length_alias_for_model_load() {
+        let request: LoadModelRequest = serde_json::from_str(
+            r#"{
+                "model": "Qwen3.5-9B-Q4_K_S.gguf",
+                "contextLength": 32768
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        assert_eq!(request.context_size, Some(32768));
+    }
 }
 
 pub async fn unload_model(State(state): State<SharedState>) -> Json<serde_json::Value> {

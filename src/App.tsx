@@ -25,6 +25,15 @@ const TAB_LABELS: Record<Tab, string> = {
   settings: "Settings",
 };
 
+function buildReachableApiUrl(settings: AppSettings | null) {
+  const host =
+    settings?.server_host === "0.0.0.0"
+      ? "127.0.0.1"
+      : settings?.server_host ?? "127.0.0.1";
+  const port = settings?.server_port ?? 8800;
+  return `http://${host}:${port}/v1`;
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("chat");
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -41,7 +50,7 @@ function App() {
     : false;
   const debugApiUrl =
     model.processStatus?.api_url ??
-    `http://${settings?.server_host ?? "127.0.0.1"}:${settings?.server_port ?? 8800}/v1`;
+    buildReachableApiUrl(settings);
   const modelTransition =
     model.loadProgress && !model.loadProgress.done
       ? model.loadProgress
@@ -265,31 +274,6 @@ function App() {
               </button>
             )}
           </div>
-        </div>
-      )}
-
-      {!apiStartupError && modelTransitionActive && modelTransition && (
-        <div
-          className="shrink-0 border-b px-4 py-3"
-          style={{
-            borderColor: "rgba(251, 191, 36, 0.24)",
-            background: "rgba(120, 53, 15, 0.18)",
-            color: "#fde68a",
-          }}
-        >
-          <p className="text-sm font-semibold">
-            {model.processStatus?.model_load_state === "Swapping"
-              ? "Swapping model"
-              : model.processStatus?.model_load_state === "Unloading"
-                ? "Unloading model"
-                : "Loading model"}
-          </p>
-          <p className="mt-1 text-sm" style={{ color: "#fcd34d" }}>
-            {modelTransition.message}
-          </p>
-          <p className="mt-1 text-xs" style={{ color: "#fde68a" }}>
-            The API is temporarily warming up while the backend changes state. External clients should retry once loading completes.
-          </p>
         </div>
       )}
 

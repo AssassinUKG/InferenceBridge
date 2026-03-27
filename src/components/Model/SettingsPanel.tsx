@@ -408,9 +408,11 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
     );
   }
 
-  const serverUrl = `http://${settings.server_host}:${settings.server_port}/v1`;
+  const buildReachableServerUrl = (host: string, port: number) =>
+    `http://${host === "0.0.0.0" ? "127.0.0.1" : host}:${port}/v1`;
+  const serverUrl = buildReachableServerUrl(settings.server_host, settings.server_port);
   const persistedServerUrl = persistedSettings
-    ? `http://${persistedSettings.server_host}:${persistedSettings.server_port}/v1`
+    ? buildReachableServerUrl(persistedSettings.server_host, persistedSettings.server_port)
     : processStatus?.api_url ?? serverUrl;
   const apiState = processStatus?.api_state ?? "Idle";
   const apiReachable = processStatus?.api_reachable ?? false;
@@ -440,7 +442,9 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
       ? modelTransition?.message ??
         `Model transition in progress. Public API will come back on ${serverUrl} once loading finishes.`
     : apiRunning
-      ? `Public API reachable on ${serverUrl}`
+      ? isLanMode && lanUrl
+        ? `Public API reachable locally on ${serverUrl} and on your LAN at ${lanUrl}`
+        : `Public API reachable on ${serverUrl}`
       : apiStarting
         ? `Public API is starting on ${serverUrl}`
         : apiState === "Error"
@@ -576,7 +580,15 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
             style={{ background: apiReachable ? "rgba(52,211,153,0.04)" : "rgba(255,255,255,0.03)" }}
           >
             <span className="text-xs" style={{ color: "var(--text-1)" }}>
-              {apiReachable ? "Reachable at" : apiConfigDirty ? "Edited endpoint" : "Configured endpoint"}
+              {apiReachable
+                ? isLanMode
+                  ? "Local URL"
+                  : "Reachable at"
+                : apiConfigDirty
+                  ? "Edited endpoint"
+                  : isLanMode
+                    ? "Local URL"
+                    : "Configured endpoint"}
             </span>
             <span className="font-mono text-xs" style={{ color: apiReachable ? "#34d399" : "var(--text-1)" }}>{serverUrl}</span>
           </div>

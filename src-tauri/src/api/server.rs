@@ -14,6 +14,23 @@ static API_SERVER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static API_SERVER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 const PUBLIC_API_BIND_RETRIES: u32 = 40;
 
+pub(crate) fn reachable_probe_host(host: &str) -> String {
+    match host.trim() {
+        "0.0.0.0" => "127.0.0.1".to_string(),
+        "::" | "[::]" => "::1".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub(crate) fn reachable_api_url(host: &str, port: u16) -> String {
+    let probe_host = reachable_probe_host(host);
+    if probe_host.contains(':') && !probe_host.starts_with('[') {
+        format!("http://[{probe_host}]:{port}/v1")
+    } else {
+        format!("http://{probe_host}:{port}/v1")
+    }
+}
+
 /// Start the API server on the configured host and port.
 pub async fn start_api_server(
     state: SharedState,
@@ -266,7 +283,7 @@ async fn update_api_status(
 }
 
 fn format_bind_error(host: &str, port: u16, error: &std::io::Error) -> String {
-    let api_url = format!("http://{host}:{port}/v1");
+    let api_url = reachable_api_url(host, port);
     if error.kind() == std::io::ErrorKind::AddrInUse {
         if let Some(diagnostic) = diagnose_port_conflict(port) {
             return format!(
@@ -340,7 +357,7 @@ fn spawn_startup_probe(
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap_or_default();
-        let url = format!("http://{host}:{port}/v1/health");
+        let url = format!("{}/health", reachable_api_url(&host, port));
         let pid = std::process::id();
 
         for probe in 1..=8 {
@@ -374,7 +391,7 @@ fn spawn_startup_probe(
                             && app_state.api_server_error.is_none()
                         {
                             app_state.api_server_error = Some(format!(
-                                "The API server bound to {url}, but an internal startup probe could not reach it. Check firewall, host binding, or duplicate startup logs."
+                                "The API server bound on {host}:{port}, but an internal startup probe could not reach {url}. Check firewall or startup logs."
                             ));
                         }
                         return;

@@ -124,6 +124,7 @@ pub struct LaunchPreview {
     pub model_path: String,
     pub mmproj_path: Option<String>,
     pub backend_preference: String,
+    pub context_size: u32,
     pub port: u16,
     pub parallel_slots: u32,
     pub args: Vec<String>,
@@ -268,6 +269,7 @@ impl LlamaProcess {
             model_path: config.model_path.to_string_lossy().to_string(),
             mmproj_path: mmproj_path.map(|path| path.to_string_lossy().to_string()),
             backend_preference: config.backend_preference.clone(),
+            context_size: config.context_size,
             port: config.port,
             parallel_slots: config.parallel_slots.max(1),
             args,
@@ -468,6 +470,14 @@ impl LlamaProcess {
         Self::validate_launch_config(&config)?;
         // Shutdown any existing process first
         self.shutdown().await?;
+        #[cfg(windows)]
+        {
+            if let Ok(killed) = Self::kill_all_managed_processes() {
+                if killed > 0 {
+                    tracing::warn!(killed, "Cleaned up stale managed llama-server processes before launch");
+                }
+            }
+        }
 
         let preview = self.build_args_preview(&config)?;
         let server_path = PathBuf::from(&preview.server_path);
@@ -645,8 +655,8 @@ impl LlamaProcess {
                 }
             }
 
-            // Wait up to 5 seconds for the process to exit
-            let exit = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+            // Give graceful shutdown a short head start, then force-kill to keep swaps snappy.
+            let exit = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
 
             if exit.is_err() {
                 tracing::warn!("llama-server did not exit gracefully, killing");
@@ -665,8 +675,7 @@ impl LlamaProcess {
             *self.detected_backend.lock().await = None;
             self.stderr_lines.lock().await.clear();
             self.set_state(ProcessState::Idle);
-            Self::wait_for_port_release(self.current_port, Duration::from_secs(3)).await;
-            tokio::time::sleep(Duration::from_millis(350)).await;
+            Self::wait_for_port_release(self.current_port, Duration::from_millis(1500)).await;
         }
         // Abort background I/O reader tasks
         for handle in self.io_tasks.drain(..) {

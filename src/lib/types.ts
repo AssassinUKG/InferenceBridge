@@ -19,6 +19,7 @@ export interface LaunchPreview {
   model_path: string;
   mmproj_path: string | null;
   backend_preference: string;
+  context_size: number;
   port: number;
   parallel_slots: number;
   args: string[];

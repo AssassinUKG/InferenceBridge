@@ -16,7 +16,8 @@ function buildApiUrl(settings: AppSettings | null) {
   if (!settings) {
     return "http://127.0.0.1:8800/v1";
   }
-  return `http://${settings.server_host}:${settings.server_port}/v1`;
+  const host = settings.server_host === "0.0.0.0" ? "127.0.0.1" : settings.server_host;
+  return `http://${host}:${settings.server_port}/v1`;
 }
 
 function apiStateTone(state: string) {

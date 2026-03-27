@@ -24,17 +24,43 @@ pub struct ChatCompletionRequest {
     pub messages: Vec<ApiMessage>,
     #[serde(default)]
     pub stream: bool,
-    #[serde(alias = "max_completion_tokens")]
+    #[serde(default, alias = "max_completion_tokens", alias = "maxTokens")]
     pub max_tokens: Option<u32>,
+    #[serde(default, alias = "temp")]
     pub temperature: Option<f32>,
+    #[serde(default, alias = "topP")]
     pub top_p: Option<f32>,
+    #[serde(default, alias = "topK")]
     pub top_k: Option<i32>,
+    #[serde(default, alias = "minP")]
+    pub min_p: Option<f32>,
+    #[serde(default, alias = "presencePenalty")]
     pub presence_penalty: Option<f32>,
+    #[serde(default, alias = "frequencyPenalty")]
     pub frequency_penalty: Option<f32>,
+    #[serde(
+        default,
+        alias = "repetitionPenalty",
+        alias = "repeatPenalty",
+        alias = "repeat_penalty"
+    )]
     pub repetition_penalty: Option<f32>,
     pub seed: Option<i64>,
     pub stop: Option<StopParam>,
     pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(
+        default,
+        alias = "contextLength",
+        alias = "context_length",
+        alias = "contextlength",
+        alias = "context_size",
+        alias = "ctx_size",
+        alias = "n_ctx",
+        alias = "maxContextLength"
+    )]
+    pub context_size: Option<u32>,
+    #[serde(default)]
+    pub top: Option<TopParam>,
     #[serde(default)]
     pub reasoning: Option<ReasoningRequest>,
     #[serde(default)]
@@ -57,6 +83,49 @@ pub struct ReasoningRequest {
 pub struct StreamOptions {
     #[serde(default)]
     pub include_usage: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum TopParam {
+    Integer(i64),
+    Float(f64),
+}
+
+impl TopParam {
+    fn as_top_p(&self) -> Option<f32> {
+        match self {
+            TopParam::Float(value) if (0.0..=1.0).contains(value) => Some(*value as f32),
+            TopParam::Integer(value) if (0..=1).contains(value) => Some(*value as f32),
+            _ => None,
+        }
+    }
+
+    fn as_top_k(&self) -> Option<i32> {
+        match self {
+            TopParam::Integer(value) if *value > 1 => i32::try_from(*value).ok(),
+            TopParam::Float(value) if *value > 1.0 && value.fract() == 0.0 => {
+                i32::try_from(*value as i64).ok()
+            }
+            _ => None,
+        }
+    }
+}
+
+impl ChatCompletionRequest {
+    pub fn requested_context_size(&self) -> Option<u32> {
+        self.context_size.filter(|value| *value > 0)
+    }
+
+    fn requested_top_p(&self) -> Option<f32> {
+        self.top_p
+            .or_else(|| self.top.as_ref().and_then(TopParam::as_top_p))
+    }
+
+    fn requested_top_k(&self) -> Option<i32> {
+        self.top_k
+            .or_else(|| self.top.as_ref().and_then(TopParam::as_top_k))
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -210,8 +279,22 @@ pub(crate) fn build_parse_trace(profile: &ModelProfile, raw: &str, stripped: &st
     .unwrap_or_else(|_| "Failed to serialize parse trace".to_string())
 }
 
-async fn swap_model_for_api(state: &SharedState, model_name: &str) -> Result<(), String> {
-    crate::commands::model::backend_load_model(state.clone(), model_name.to_string(), None)
+fn loaded_model_matches_request(loaded: &str, requested: &str) -> bool {
+    let loaded = loaded.to_ascii_lowercase();
+    let requested = requested.trim().to_ascii_lowercase();
+
+    loaded == requested
+        || loaded.trim_end_matches(".gguf") == requested
+        || loaded == requested.trim_end_matches(".gguf")
+        || (!requested.is_empty() && loaded.contains(&requested))
+}
+
+async fn swap_model_for_api(
+    state: &SharedState,
+    model_name: &str,
+    context_size: Option<u32>,
+) -> Result<(), String> {
+    crate::commands::model::backend_load_model(state.clone(), model_name.to_string(), context_size)
         .await
         .map(|_| ())
 }
@@ -219,26 +302,32 @@ async fn swap_model_for_api(state: &SharedState, model_name: &str) -> Result<(),
 pub(crate) async fn resolve_loaded_model(
     state: &SharedState,
     requested_model: &str,
+    requested_context_size: Option<u32>,
 ) -> Result<String, ApiErrorResponse> {
-    let needs_swap = {
+    let (target_model, needs_swap) = {
         let s = state.read().await;
-        if requested_model.is_empty() {
-            if s.loaded_model.is_none() {
-                return Err(ApiErrorResponse::no_model());
-            }
-            false
+        let target_model = if requested_model.trim().is_empty() {
+            s.loaded_model.clone().ok_or_else(ApiErrorResponse::no_model)?
         } else {
-            match &s.loaded_model {
-                Some(loaded) => !loaded.to_lowercase().contains(&requested_model.to_lowercase()),
-                None => true,
-            }
-        }
+            requested_model.trim().to_string()
+        };
+
+        let model_mismatch = match &s.loaded_model {
+            Some(loaded) => !loaded_model_matches_request(loaded, &target_model),
+            None => true,
+        };
+        let current_context_size = s.last_launch_preview.as_ref().map(|preview| preview.context_size);
+        let context_mismatch = requested_context_size
+            .map(|requested| current_context_size != Some(requested))
+            .unwrap_or(false);
+
+        (target_model, model_mismatch || context_mismatch)
     };
 
     if needs_swap {
-        swap_model_for_api(state, requested_model).await.map_err(|e| {
+        swap_model_for_api(state, &target_model, requested_context_size).await.map_err(|e| {
             ApiErrorResponse::service_unavailable(format!(
-                "Could not load model '{requested_model}': {e}"
+                "Could not load model '{target_model}': {e}"
             ))
         })?;
     }
@@ -473,6 +562,8 @@ pub(crate) async fn build_chat_request(
     req: ChatCompletionRequest,
     server_defaults: (&Option<f32>, &Option<f32>, &Option<i32>, &Option<u32>),
 ) -> Result<CompletionRequest, ApiErrorResponse> {
+    let requested_top_p = req.requested_top_p();
+    let requested_top_k = req.requested_top_k();
     let (mut messages, image_data) = normalize_api_messages(&req.messages).await?;
     prepend_tool_schema_message(&mut messages, req.tools.as_ref());
     prepend_reasoning_guidance_message(&mut messages, profile, req.reasoning.as_ref(), req.reasoning_effort.as_deref(), req.reasoning_tokens);
@@ -493,9 +584,9 @@ pub(crate) async fn build_chat_request(
             .temperature
             .or(profile.default_temperature)
             .or(*server_defaults.0),
-        top_p: req.top_p.or(profile.default_top_p).or(*server_defaults.1),
-        top_k: req.top_k.or(profile.default_top_k).or(*server_defaults.2),
-        min_p: profile.default_min_p,
+        top_p: requested_top_p.or(profile.default_top_p).or(*server_defaults.1),
+        top_k: requested_top_k.or(profile.default_top_k).or(*server_defaults.2),
+        min_p: req.min_p.or(profile.default_min_p),
         presence_penalty: req.presence_penalty.or(profile.default_presence_penalty),
         frequency_penalty: req.frequency_penalty,
         repeat_penalty: req.repetition_penalty,
@@ -578,8 +669,9 @@ pub async fn chat_completions(
         .as_ref()
         .and_then(|options| options.include_usage)
         .unwrap_or(true);
+    let requested_context_size = req.requested_context_size();
     let requested_model = req.model.clone().unwrap_or_default();
-    let model_name = resolve_loaded_model(&state, &requested_model).await?;
+    let model_name = resolve_loaded_model(&state, &requested_model, requested_context_size).await?;
     let profile = crate::models::overrides::detect_effective_profile(&model_name);
 
     let server_defaults = {
@@ -891,10 +983,27 @@ pub struct TextCompletionRequest {
     pub prompt: Option<String>,
     #[serde(default)]
     pub stream: bool,
+    #[serde(default, alias = "maxTokens")]
     pub max_tokens: Option<u32>,
+    #[serde(default, alias = "temp")]
     pub temperature: Option<f32>,
+    #[serde(default, alias = "topP")]
     pub top_p: Option<f32>,
+    #[serde(default, alias = "topK")]
     pub top_k: Option<i32>,
+    #[serde(
+        default,
+        alias = "contextLength",
+        alias = "context_length",
+        alias = "contextlength",
+        alias = "context_size",
+        alias = "ctx_size",
+        alias = "n_ctx",
+        alias = "maxContextLength"
+    )]
+    pub context_size: Option<u32>,
+    #[serde(default)]
+    pub top: Option<TopParam>,
     pub seed: Option<i64>,
     pub stop: Option<StopParam>,
 }
@@ -920,8 +1029,10 @@ pub async fn text_completions(
     State(state): State<SharedState>,
     Json(req): Json<TextCompletionRequest>,
 ) -> Result<Response, ApiErrorResponse> {
+    let requested_context_size = req.context_size.filter(|value| *value > 0);
     let requested_model = req.model.clone().unwrap_or_default();
-    let model_name = resolve_loaded_model(&state, &requested_model).await?;
+    let model_name =
+        resolve_loaded_model(&state, &requested_model, requested_context_size).await?;
     let profile = crate::models::overrides::detect_effective_profile(&model_name);
 
     let prompt = req.prompt.unwrap_or_default();
@@ -955,8 +1066,16 @@ pub async fn text_completions(
             .or(profile.default_max_output_tokens)
             .map(|value| value as i32),
         temperature: req.temperature.or(srv_temp).or(profile.default_temperature),
-        top_p: req.top_p.or(srv_top_p).or(profile.default_top_p),
-        top_k: req.top_k.or(srv_top_k).or(profile.default_top_k),
+        top_p: req
+            .top_p
+            .or_else(|| req.top.as_ref().and_then(TopParam::as_top_p))
+            .or(srv_top_p)
+            .or(profile.default_top_p),
+        top_k: req
+            .top_k
+            .or_else(|| req.top.as_ref().and_then(TopParam::as_top_k))
+            .or(srv_top_k)
+            .or(profile.default_top_k),
         min_p: profile.default_min_p,
         presence_penalty: profile.default_presence_penalty,
         frequency_penalty: None,
@@ -1017,7 +1136,7 @@ pub async fn text_completions(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_api_messages, ApiMessage, ChatCompletionRequest};
+    use super::{normalize_api_messages, ApiMessage, ChatCompletionRequest, loaded_model_matches_request};
 
     #[test]
     fn deserializes_string_message_content() {
@@ -1133,6 +1252,64 @@ mod tests {
             Some("high")
         );
         assert_eq!(request.reasoning.as_ref().and_then(|value| value.max_tokens), Some(256));
+    }
+
+    #[test]
+    fn deserializes_context_length_and_vendor_sampling_aliases() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "contextLength": 32768,
+                "topK": 40,
+                "minP": 0.07,
+                "messages": [
+                    { "role": "user", "content": "hello" }
+                ]
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        assert_eq!(request.requested_context_size(), Some(32768));
+        assert_eq!(request.requested_top_k(), Some(40));
+        assert_eq!(request.min_p, Some(0.07));
+    }
+
+    #[test]
+    fn infers_top_p_or_top_k_from_generic_top_field() {
+        let top_k_request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "top": 40,
+                "messages": [
+                    { "role": "user", "content": "hello" }
+                ]
+            }"#,
+        )
+        .expect("request should deserialize");
+        assert_eq!(top_k_request.requested_top_k(), Some(40));
+        assert_eq!(top_k_request.requested_top_p(), None);
+
+        let top_p_request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "top": 0.92,
+                "messages": [
+                    { "role": "user", "content": "hello" }
+                ]
+            }"#,
+        )
+        .expect("request should deserialize");
+        assert_eq!(top_p_request.requested_top_p(), Some(0.92));
+        assert_eq!(top_p_request.requested_top_k(), None);
+    }
+
+    #[test]
+    fn matches_loaded_models_without_exact_filename_suffix() {
+        assert!(loaded_model_matches_request(
+            "Qwen3.5-9B-Q4_K_S.gguf",
+            "Qwen3.5-9B-Q4_K_S"
+        ));
+        assert!(loaded_model_matches_request(
+            "Qwen3.5-9B-Q4_K_S.gguf",
+            "Qwen3.5-9B"
+        ));
     }
 
     #[tokio::test]

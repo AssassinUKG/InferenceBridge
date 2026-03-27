@@ -63,6 +63,22 @@ fn names_match(left: &str, right: &str) -> bool {
         || left == right.trim_end_matches(".gguf")
 }
 
+fn normalize_requested_context_size(context_size: Option<u32>) -> Option<u32> {
+    context_size.filter(|value| *value > 0)
+}
+
+fn resolve_launch_context_size(
+    requested_context_size: Option<u32>,
+    server_default_ctx_size: Option<u32>,
+    profile_default_ctx_size: Option<u32>,
+    fallback_ctx_size: u32,
+) -> u32 {
+    normalize_requested_context_size(requested_context_size)
+        .or(server_default_ctx_size.filter(|value| *value > 0))
+        .or(profile_default_ctx_size)
+        .unwrap_or(fallback_ctx_size.max(1))
+}
+
 async fn publish_model_load_progress(
     state: &SharedState,
     transition: crate::state::ModelLoadState,
@@ -108,6 +124,43 @@ fn model_load_state_label(state: &crate::state::ModelLoadState) -> String {
 async fn store_launch_preview(state: &SharedState, preview: LaunchPreview) {
     let mut s = state.write().await;
     s.last_launch_preview = Some(preview);
+}
+
+fn empty_context_status(total_tokens: u32) -> crate::context::tracker::ContextStatus {
+    crate::context::tracker::ContextStatus {
+        total_tokens,
+        used_tokens: 0,
+        fill_ratio: 0.0,
+        pinned_tokens: 0,
+        rolling_tokens: 0,
+        compressed_tokens: 0,
+        last_compaction_action: None,
+    }
+}
+
+fn clear_runtime_after_backend_exit(
+    state: &mut crate::state::AppState,
+    error_message: Option<String>,
+) {
+    if let Some(loaded) = state.loaded_model.take() {
+        state.previous_model = Some(loaded);
+    }
+    state.model_stats = None;
+    state.last_context_status = Some(crate::context::tracker::ContextStatus::empty());
+
+    if let Some(error_message) = error_message {
+        state.model_load_state = crate::state::ModelLoadState::Error(error_message.clone());
+        state.model_load_progress = Some(crate::state::LoadProgress {
+            stage: "error".to_string(),
+            message: error_message.clone(),
+            progress: 0.0,
+            done: true,
+            error: Some(error_message),
+        });
+    } else {
+        state.model_load_state = crate::state::ModelLoadState::Idle;
+        state.model_load_progress = None;
+    }
 }
 
 fn effective_profile_info_from_state(
@@ -209,9 +262,20 @@ pub async fn backend_load_model(
 
         let mut s = state.write().await;
 
-        let ctx = context_size
-            .or(model.profile.default_context_window)
-            .unwrap_or(s.config.models.default_context);
+        let ctx = resolve_launch_context_size(
+            context_size,
+            s.config.server.default_ctx_size,
+            model.profile.default_context_window,
+            s.config.models.default_context,
+        );
+
+        s.last_context_status = Some(empty_context_status(ctx));
+        s.model_stats = Some(crate::state::ModelStats {
+            model: model.filename.clone(),
+            context_size: ctx,
+            tokens_per_sec: 0.0,
+            memory_mb: 0,
+        });
 
         let config = LaunchConfig {
             model_path: model.path.clone(),
@@ -575,9 +639,20 @@ pub async fn load_model(
             })?
             .clone();
 
-        let ctx = context_size
-            .or(model.profile.default_context_window)
-            .unwrap_or(s.config.models.default_context);
+        let ctx = resolve_launch_context_size(
+            context_size,
+            s.config.server.default_ctx_size,
+            model.profile.default_context_window,
+            s.config.models.default_context,
+        );
+
+        s.last_context_status = Some(empty_context_status(ctx));
+        s.model_stats = Some(crate::state::ModelStats {
+            model: model.filename.clone(),
+            context_size: ctx,
+            tokens_per_sec: 0.0,
+            memory_mb: 0,
+        });
 
         let config = LaunchConfig {
             model_path: model.path.clone(),
@@ -777,6 +852,7 @@ pub async fn load_model(
             // Try to clean up
             let mut s = state.write().await;
             let _ = s.process.shutdown().await;
+            clear_runtime_after_backend_exit(&mut s, Some(msg.clone()));
             return Err(msg);
         }
 
@@ -803,6 +879,7 @@ pub async fn load_model(
                 );
                 tracing::error!("{msg}");
                 emit_error(&msg);
+                clear_runtime_after_backend_exit(&mut s, Some(msg.clone()));
                 return Err(msg);
             }
         }
@@ -996,7 +1073,13 @@ pub async fn backend_unload_model(state: SharedState) -> Result<String, String> 
         s.previous_model = Some(name.clone());
     }
     s.model_stats = None;
+    s.last_context_status = Some(crate::context::tracker::ContextStatus::empty());
     drop(s);
+
+    #[cfg(windows)]
+    {
+        let _ = crate::engine::process::LlamaProcess::kill_all_managed_processes();
+    }
 
     let result = match unloaded {
         Some(name) if !name.is_empty() => format!("Unloaded {name}"),
@@ -1030,6 +1113,16 @@ pub async fn get_process_status(
 }
 
 pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusInfo, String> {
+    {
+        let mut s = state.write().await;
+        if s.process.check_crashed().await {
+            clear_runtime_after_backend_exit(
+                &mut s,
+                Some("llama-server exited unexpectedly.".to_string()),
+            );
+        }
+    }
+
     // Extract everything we need from the lock, then drop it before any I/O
     let (
         process_state,
@@ -1068,10 +1161,7 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
             s.process.detected_backend(),
             format!("{:?}", s.api_server_state),
             s.api_server_error.clone(),
-            format!(
-                "http://{}:{}/v1",
-                s.config.server.host, s.config.server.port
-            ),
+            crate::api::server::reachable_api_url(&s.config.server.host, s.config.server.port),
             s.config.server.port,
             s.last_launch_preview.clone(),
             s.last_startup_duration_ms,
@@ -1696,6 +1786,6 @@ pub async fn swap_model(
 
     tracing::info!(target = %target, "Hot-swap requested");
 
-    // Delegate to load_model which handles shutdown + relaunch atomically
-    load_model(app, state, target, context_size).await
+    let _ = app;
+    backend_load_model(state.inner().clone(), target, context_size).await
 }
