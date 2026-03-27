@@ -113,7 +113,7 @@ pub async fn debug_api_request(
             .await
             .into_response()
     } else if method == "POST" && path == "/v1/models/unload" {
-        crate::api::models::unload_model(AxumState(shared))
+        crate::api::models::unload_model(AxumState(shared), None)
             .await
             .into_response()
     } else if method == "POST" && path == "/v1/chat/completions" {

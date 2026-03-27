@@ -157,14 +157,16 @@ pub async fn unload_model(
     body: Option<Json<UnloadModelRequest>>,
 ) -> Json<serde_json::Value> {
     let instance_id = body
-        .and_then(|b| b.instance_id.clone().or_else(|| b.model.clone()))
-        .or_else(|| {
-            // Fall back to the currently loaded model if no body was sent.
-            futures::executor::block_on(async {
-                let s = state.read().await;
-                s.loaded_model.clone()
-            })
-        });
+        .and_then(|b| b.instance_id.clone().or_else(|| b.model.clone()));
+
+    // Fall back to the currently loaded model if no body was sent.
+    let instance_id = match instance_id {
+        Some(id) => Some(id),
+        None => {
+            let s = state.read().await;
+            s.loaded_model.clone()
+        }
+    };
 
     match crate::commands::model::backend_unload_model(state).await {
         Ok(_) => Json(serde_json::json!({
@@ -462,7 +464,7 @@ fn names_match(left: &str, right: &str) -> bool {
 fn model_object_from_scanned(
     model: &crate::models::scanner::ScannedModel,
     loaded_model: Option<&str>,
-    loaded_ctx: Option<u32>,
+    _loaded_ctx: Option<u32>,
 ) -> ModelObject {
     let is_active = loaded_model
         .map(|loaded| names_match(loaded, &model.filename))
