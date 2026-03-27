@@ -472,26 +472,42 @@ impl LlamaProcess {
             .join("bin")
     }
 
+    /// Kill any managed llama-server processes occupying `port` so launch can succeed.
+    ///
+    /// **Call this BEFORE acquiring the state write lock.**  The underlying WMIC query
+    /// can take 1-3 seconds on Windows; running it while holding the write lock would
+    /// block every concurrent reader (including in-flight API requests) for that duration.
+    #[cfg(windows)]
+    pub fn clear_stale_port_processes(port: u16) {
+        use std::net::TcpListener;
+        if TcpListener::bind(("127.0.0.1", port)).is_err() {
+            match Self::kill_all_managed_processes() {
+                Ok(killed) if killed > 0 => {
+                    tracing::warn!(
+                        killed,
+                        port,
+                        "Pre-launch: cleared stale managed llama-server processes (port was busy)"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(port, error = %e, "Pre-launch port cleanup failed");
+                }
+            }
+        }
+    }
+
     /// Launch llama-server with the given configuration.
+    ///
+    /// Port cleanup (WMIC scan) must be done **before** calling this via
+    /// [`LlamaProcess::clear_stale_port_processes`] so the write lock is not held
+    /// during a slow system scan.
     pub async fn launch(&mut self, config: LaunchConfig) -> anyhow::Result<()> {
         Self::validate_launch_config(&config)?;
         // Shutdown any existing process first
         self.shutdown().await?;
-        #[cfg(windows)]
-        {
-            let port_still_busy = std::net::TcpListener::bind(("127.0.0.1", config.port)).is_err();
-            if port_still_busy {
-                if let Ok(killed) = Self::kill_all_managed_processes() {
-                    if killed > 0 {
-                        tracing::warn!(
-                            killed,
-                            port = config.port,
-                            "Cleaned up stale managed llama-server processes before launch"
-                        );
-                    }
-                }
-            }
-        }
+        // NOTE: stale-process cleanup (kill_all_managed_processes / WMIC) was moved
+        // to `clear_stale_port_processes()` and must be called BEFORE the write lock.
 
         let preview = self.build_args_preview(&config)?;
         let server_path = PathBuf::from(&preview.server_path);
@@ -699,28 +715,15 @@ impl LlamaProcess {
     }
 
     /// Check if the process has crashed and record it.
-    pub async fn check_crashed(&mut self) -> bool {
+    /// Non-blocking crash check: calls `try_wait()` and updates internal state if the
+    /// process has exited, but does **not** sleep.  Returns `true` if the process is gone.
+    ///
+    /// Use this inside a write-lock critical section so the lock is not held during any
+    /// subsequent sleep (see health-poll loop in `commands/model.rs`).
+    pub fn poll_exited(&mut self) -> bool {
         if let Some(ref mut child) = self.child {
             match child.try_wait() {
-                Ok(Some(status)) => {
-                    // Give stderr reader a moment to flush
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    let last_lines = {
-                        let lines = self.stderr_lines.lock().await;
-                        lines
-                            .iter()
-                            .rev()
-                            .take(20)
-                            .rev()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    };
-                    tracing::error!(
-                        ?status,
-                        stderr = %last_lines,
-                        "llama-server process exited unexpectedly"
-                    );
+                Ok(Some(_status)) => {
                     self.child = None;
                     self.current_pid = None;
                     self.crash_count += 1;
@@ -736,6 +739,28 @@ impl LlamaProcess {
         } else {
             false
         }
+    }
+
+    /// Crash check with a stderr-flush wait.  Prefer `poll_exited` when inside a lock.
+    pub async fn check_crashed(&mut self) -> bool {
+        if !self.poll_exited() {
+            return false;
+        }
+        // Give the background stderr-reader task a moment to drain its buffer.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let last_lines = {
+            let lines = self.stderr_lines.lock().await;
+            lines
+                .iter()
+                .rev()
+                .take(20)
+                .rev()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        tracing::error!(stderr = %last_lines, "llama-server process exited unexpectedly");
+        true
     }
 
     /// Get captured stderr lines (for crash diagnostics).

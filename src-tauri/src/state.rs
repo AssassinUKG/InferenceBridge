@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -114,6 +115,10 @@ pub struct AppState {
     pub app_handle: Option<tauri::AppHandle>,
     pub active_downloads: HashMap<String, ActiveDownload>,
     pub request_scheduler: Arc<RequestScheduler>,
+    /// Serialises concurrent model-load requests.  Only one load runs at a time;
+    /// the others wait and then coalesce (skip the load if the right model is
+    /// already running by the time they acquire the lock).
+    pub model_load_mutex: Arc<AsyncMutex<()>>,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -147,6 +152,7 @@ impl AppState {
             app_handle: None,
             active_downloads: HashMap::new(),
             request_scheduler: Arc::new(RequestScheduler::new(scheduler_limit)),
+            model_load_mutex: Arc::new(AsyncMutex::new(())),
         })
     }
 }
