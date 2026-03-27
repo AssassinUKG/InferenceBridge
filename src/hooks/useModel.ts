@@ -3,6 +3,8 @@ import { listen } from "@tauri-apps/api/event";
 import type { ModelInfo, ProcessStatusInfo, LoadProgress } from "../lib/types";
 import * as api from "../lib/tauri";
 
+const STATUS_POLL_MS = 1500;
+
 interface ModelState {
   models: ModelInfo[];
   processStatus: ProcessStatusInfo | null;
@@ -31,24 +33,6 @@ function deriveIsLoading(status: ProcessStatusInfo | null) {
       status?.model_load_state ?? "Idle"
     )
   );
-}
-
-function sameModels(a: ModelInfo[], b: ModelInfo[]) {
-  if (a === b) {
-    return true;
-  }
-  if (a.length !== b.length) {
-    return false;
-  }
-  return a.every((model, index) => {
-    const other = b[index];
-    return (
-      model.filename === other.filename &&
-      model.path === other.path &&
-      model.family === other.family &&
-      model.quant === other.quant
-    );
-  });
 }
 
 function sameProcessStatus(
@@ -155,17 +139,13 @@ export function useModel() {
   useEffect(() => {
     const interval = setInterval(async () => {
       try {
-        const [status, models] = await Promise.all([
-          api.getProcessStatus(),
-          api.listModels(),
-        ]);
+        const status = await api.getProcessStatus();
         setState((s) =>
-          sameProcessStatus(s.processStatus, status) && sameModels(s.models, models)
+          sameProcessStatus(s.processStatus, status)
             ? s
             : {
                 ...s,
                 processStatus: status,
-                models,
                 isLoading: deriveIsLoading(status),
                 loadProgress: deriveLoadProgress(status),
                 error: status.model_load_progress?.error ?? s.error,
@@ -174,7 +154,7 @@ export function useModel() {
       } catch {
         // ignore polling errors
       }
-      }, 500);
+      }, STATUS_POLL_MS);
       return () => clearInterval(interval);
     }, []);
 

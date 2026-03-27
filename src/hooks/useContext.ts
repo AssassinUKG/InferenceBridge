@@ -3,6 +3,8 @@ import { listen } from "@tauri-apps/api/event";
 import type { ContextStatus } from "../lib/types";
 import * as api from "../lib/tauri";
 
+const CONTEXT_POLL_MS = 1500;
+
 const EMPTY_STATUS: ContextStatus = {
   total_tokens: 0,
   used_tokens: 0,
@@ -25,7 +27,7 @@ function sameContextStatus(a: ContextStatus, b: ContextStatus) {
   );
 }
 
-export function useContext(pollInterval = 500) {
+export function useContext(pollInterval = CONTEXT_POLL_MS) {
   const [status, setStatus] = useState<ContextStatus>(EMPTY_STATUS);
 
   useEffect(() => {

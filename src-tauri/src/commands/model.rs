@@ -601,6 +601,9 @@ pub async fn backend_load_model(
             if let Some(stats) = s.model_stats.as_mut() {
                 stats.context_size = real_ctx;
             }
+            if let Some(preview) = s.last_launch_preview.as_mut() {
+                preview.context_size = Some(real_ctx);
+            }
             tracing::info!(real_ctx, "Discovered actual context size from running server");
         }
     }
@@ -770,12 +773,12 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
     // Extract everything we need from the lock, then drop it before any I/O
     let (
         process_state,
-        server_path,
         is_running,
-        port,
+        _port,
         loaded_model,
         previous_model,
         crash_count,
+        configured_server_path,
         detected_arc,
         api_state,
         api_error,
@@ -791,17 +794,16 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
         last_generation_metrics,
     ) = {
         let s = state.read().await;
-        let server_path = s.process.find_server_binary();
         let process_state = s.process.state();
         let is_running = process_state != crate::engine::process::ProcessState::Idle;
         (
             process_state,
-            server_path,
             is_running,
             s.process.port(),
             s.loaded_model.clone(),
             s.previous_model.clone(),
             s.process.crash_count(),
+            s.config.process.llama_server_path.clone(),
             s.process.detected_backend(),
             format!("{:?}", s.api_server_state),
             s.api_server_error.clone(),
@@ -817,6 +819,22 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
             s.last_generation_metrics.clone(),
         )
     }; // read lock released before any async I/O
+
+    let server_path = last_launch_preview
+        .as_ref()
+        .and_then(|preview| {
+            (!preview.server_path.trim().is_empty())
+                .then(|| std::path::PathBuf::from(preview.server_path.trim()))
+        })
+        .or_else(|| {
+            let explicit = configured_server_path.trim();
+            (!explicit.is_empty()).then(|| std::path::PathBuf::from(explicit))
+        })
+        .or_else(|| {
+            let managed =
+                crate::engine::process::LlamaProcess::managed_binary_dir().join("llama-server.exe");
+            managed.exists().then_some(managed)
+        });
 
     let effective_loaded_model = if loaded_model.is_some() {
         loaded_model.clone()
@@ -878,16 +896,7 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
     };
 
     // Try managed binary version file first, then query live server /props
-    let server_version = download::current_version().or_else(|| {
-        if !is_running {
-            return None;
-        }
-        let client = crate::engine::client::LlamaClient::new(port);
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { client.get_props().await.ok().and_then(|p| p.build_info) })
-        })
-    });
+    let server_version = download::current_version();
 
     let effective_api_state = if api_reachable {
         "Running".to_string()
@@ -926,8 +935,10 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
     };
 
     let slot_count = if is_running {
-        let client = crate::engine::client::LlamaClient::new(port);
-        client.get_props().await.ok().and_then(|props| props.total_slots)
+        last_launch_preview
+            .as_ref()
+            .map(|preview| preview.parallel_slots)
+            .filter(|slots| *slots > 0)
     } else {
         None
     };
@@ -1455,4 +1466,3 @@ pub async fn swap_model(
     let _ = app;
     backend_load_model(state.inner().clone(), target, context_size).await
 }
-
