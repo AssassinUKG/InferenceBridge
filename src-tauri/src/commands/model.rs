@@ -517,7 +517,16 @@ pub async fn backend_load_model(
     crate::context::tracker::reset_slots_warning();
 
     let result = format!("Loaded {size_info}");
-    emit_load_progress(&app_handle, "ready", &result, 1.0, true, None);
+    publish_model_load_progress(
+        &state,
+        transition.clone(),
+        "ready",
+        &result,
+        1.0,
+        true,
+        None,
+    )
+    .await;
     tracing::info!("{result}");
     Ok(result)
 }

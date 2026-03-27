@@ -2,10 +2,11 @@ use axum::extract::State;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::api::completions::{
     ApiMessage, ChatCompletionRequest, StopParam, TopParam, build_chat_request, build_parse_trace,
-    end_to_end_tokens_per_second, resolve_loaded_model,
+    end_to_end_tokens_per_second, extract_context_size_from_hash_map, resolve_loaded_model,
 };
 use crate::api::errors::ApiErrorResponse;
 use crate::engine::client::LlamaClient;
@@ -84,6 +85,16 @@ pub struct ResponsesRequest {
     pub reasoning_tokens: Option<u32>,
     #[serde(default)]
     pub previous_response_id: Option<String>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl ResponsesRequest {
+    fn requested_context_size(&self) -> Option<u32> {
+        self.context_size
+            .filter(|value| *value > 0)
+            .or_else(|| extract_context_size_from_hash_map(&self.extra))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -151,6 +162,7 @@ fn now_unix_secs() -> u64 {
 }
 
 fn into_chat_request(request: ResponsesRequest) -> ChatCompletionRequest {
+    let requested_context_size = request.requested_context_size();
     let messages = match request.input {
         ResponseInput::Text(text) => vec![ApiMessage {
             role: "user".to_string(),
@@ -178,7 +190,7 @@ fn into_chat_request(request: ResponsesRequest) -> ChatCompletionRequest {
         seed: request.seed,
         stop: request.stop,
         tools: request.tools,
-        context_size: request.context_size,
+        context_size: requested_context_size,
         top: request.top,
         reasoning: request.reasoning.map(|reasoning| crate::api::completions::ReasoningRequest {
             effort: reasoning.effort,
@@ -187,6 +199,7 @@ fn into_chat_request(request: ResponsesRequest) -> ChatCompletionRequest {
         reasoning_effort: request.reasoning_effort,
         reasoning_tokens: request.reasoning_tokens,
         stream_options: None,
+        extra: request.extra,
     }
 }
 

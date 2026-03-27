@@ -4,6 +4,7 @@ use axum::response::{IntoResponse, Json, Response};
 use base64::Engine as _;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::api::errors::ApiErrorResponse;
 use crate::engine::client::{CompletionRequest, ImageData, LlamaClient};
@@ -69,6 +70,8 @@ pub struct ChatCompletionRequest {
     pub reasoning_tokens: Option<u32>,
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -114,7 +117,9 @@ impl TopParam {
 
 impl ChatCompletionRequest {
     pub fn requested_context_size(&self) -> Option<u32> {
-        self.context_size.filter(|value| *value > 0)
+        self.context_size
+            .filter(|value| *value > 0)
+            .or_else(|| extract_context_size_from_hash_map(&self.extra))
     }
 
     fn requested_top_p(&self) -> Option<f32> {
@@ -126,6 +131,98 @@ impl ChatCompletionRequest {
         self.top_k
             .or_else(|| self.top.as_ref().and_then(TopParam::as_top_k))
     }
+}
+
+fn extract_context_size_from_value(value: &serde_json::Value) -> Option<u32> {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0),
+        serde_json::Value::String(text) => text
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|value| *value > 0),
+        serde_json::Value::Object(map) => extract_context_size_from_json_map(map),
+        _ => None,
+    }
+}
+
+pub(crate) fn extract_context_size_from_json_map(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Option<u32> {
+    for key in [
+        "contextLength",
+        "context_length",
+        "contextlength",
+        "context_size",
+        "ctx_size",
+        "n_ctx",
+        "maxContextLength",
+        "contextWindow",
+        "max_context_length",
+    ] {
+        if let Some(value) = map.get(key).and_then(extract_context_size_from_value) {
+            return Some(value);
+        }
+    }
+
+    for key in [
+        "config",
+        "load_config",
+        "loadConfig",
+        "options",
+        "model_options",
+        "runtime",
+        "params",
+    ] {
+        if let Some(serde_json::Value::Object(nested)) = map.get(key) {
+            if let Some(value) = extract_context_size_from_json_map(nested) {
+                return Some(value);
+            }
+        }
+    }
+
+    None
+}
+
+pub(crate) fn extract_context_size_from_hash_map(
+    map: &HashMap<String, serde_json::Value>,
+) -> Option<u32> {
+    for key in [
+        "contextLength",
+        "context_length",
+        "contextlength",
+        "context_size",
+        "ctx_size",
+        "n_ctx",
+        "maxContextLength",
+        "contextWindow",
+        "max_context_length",
+    ] {
+        if let Some(value) = map.get(key).and_then(extract_context_size_from_value) {
+            return Some(value);
+        }
+    }
+
+    for key in [
+        "config",
+        "load_config",
+        "loadConfig",
+        "options",
+        "model_options",
+        "runtime",
+        "params",
+    ] {
+        if let Some(serde_json::Value::Object(nested)) = map.get(key) {
+            if let Some(value) = extract_context_size_from_json_map(nested) {
+                return Some(value);
+            }
+        }
+    }
+
+    None
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1271,6 +1368,23 @@ mod tests {
         assert_eq!(request.requested_context_size(), Some(32768));
         assert_eq!(request.requested_top_k(), Some(40));
         assert_eq!(request.min_p, Some(0.07));
+    }
+
+    #[test]
+    fn deserializes_nested_context_length_aliases() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "messages": [
+                    { "role": "user", "content": "hello" }
+                ],
+                "loadConfig": {
+                    "context_length": 32768
+                }
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        assert_eq!(request.requested_context_size(), Some(32768));
     }
 
     #[test]

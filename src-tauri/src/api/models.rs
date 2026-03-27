@@ -5,6 +5,7 @@ use axum::{
     response::Json,
 };
 use serde::Serialize;
+use std::collections::HashMap;
 use tokio::task;
 
 #[derive(serde::Deserialize)]
@@ -13,6 +14,7 @@ pub struct LoadModelRequest {
     /// Optional context size override. Uses model profile default when omitted.
     #[serde(
         default,
+        alias = "context_size",
         alias = "contextLength",
         alias = "context_length",
         alias = "contextlength",
@@ -21,6 +23,16 @@ pub struct LoadModelRequest {
         alias = "maxContextLength"
     )]
     pub context_size: Option<u32>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl LoadModelRequest {
+    fn requested_context_size(&self) -> Option<u32> {
+        self.context_size
+            .filter(|value| *value > 0)
+            .or_else(|| crate::api::completions::extract_context_size_from_hash_map(&self.extra))
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -53,7 +65,7 @@ pub async fn load_model(
 
     let state_clone = state.clone();
     let model_name = req.model.clone();
-    let context_size = req.context_size;
+    let context_size = req.requested_context_size();
     task::spawn(async move {
         use crate::commands::model::backend_load_model;
         use crate::context::tracker::reset_slots_warning;
@@ -107,7 +119,22 @@ mod tests {
         )
         .expect("request should deserialize");
 
-        assert_eq!(request.context_size, Some(32768));
+        assert_eq!(request.requested_context_size(), Some(32768));
+    }
+
+    #[test]
+    fn deserializes_nested_context_length_alias_for_model_load() {
+        let request: LoadModelRequest = serde_json::from_str(
+            r#"{
+                "model": "Qwen3.5-9B-Q4_K_S.gguf",
+                "load_config": {
+                    "context_size": 32768
+                }
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        assert_eq!(request.requested_context_size(), Some(32768));
     }
 }
 
