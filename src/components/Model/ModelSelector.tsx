@@ -646,6 +646,22 @@ function LoadedModelRow({
   isLoading: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
+  const liveContextSize =
+    processStatus?.model === model.filename
+      ? processStatus.last_launch_preview?.context_size ?? null
+      : null;
+  const liveContextLabel =
+    liveContextSize != null
+      ? liveContextSize >= 1024
+        ? `${(liveContextSize / 1024).toFixed(
+            liveContextSize % 1024 === 0 ? 0 : 1
+          )}K ctx`
+        : `${liveContextSize} ctx`
+      : null;
+  const profileContextLabel = formatContext(
+    model.context_window,
+    model.max_context_window
+  );
 
   return (
     <div style={{ borderLeft: "2px solid rgba(34,211,238,0.4)" }}>
@@ -681,9 +697,11 @@ function LoadedModelRow({
             <span style={{ color: "#fbbf24" }}>{model.quant}</span>
           )}
           <span>{model.size_gb.toFixed(2)} GB</span>
-          {formatContext(model.context_window, model.max_context_window) && (
-            <span>{formatContext(model.context_window, model.max_context_window)}</span>
-          )}
+          {liveContextLabel ? (
+            <span style={{ color: "#22d3ee" }}>{liveContextLabel}</span>
+          ) : profileContextLabel ? (
+            <span>{profileContextLabel}</span>
+          ) : null}
           {processStatus?.backend && (
             <span style={{ color: "#22d3ee" }}>{processStatus.backend}</span>
           )}
@@ -737,6 +755,10 @@ function LoadedModelRow({
         >
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <StatTile label="Size" value={`${model.size_gb.toFixed(2)} GB`} />
+            <StatTile
+              label="Live Context"
+              value={liveContextSize ? `${fmtNum(liveContextSize)} tokens` : "Unknown"}
+            />
             <StatTile label="Max Output" value={`${fmtNum(model.max_output_tokens)} tokens`} />
             <StatTile label="Tool Format" value={fmtToolFormat(model.tool_call_format)} />
             <StatTile label="Reasoning" value={model.think_tag_style === "None" ? "Off" : model.think_tag_style} />

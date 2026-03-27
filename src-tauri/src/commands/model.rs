@@ -388,6 +388,7 @@ pub async fn backend_load_model(
             emit_load_progress(&app_handle, "error", &msg, 0.0, true, Some(msg.clone()));
             let mut s = state.write().await;
             let _ = s.process.shutdown().await;
+            clear_runtime_after_backend_exit(&mut s, Some(msg.clone()));
             return Err(msg);
         }
 
@@ -414,6 +415,7 @@ pub async fn backend_load_model(
                 );
                 tracing::error!("{msg}");
                 emit_load_progress(&app_handle, "error", &msg, 0.0, true, Some(msg.clone()));
+                clear_runtime_after_backend_exit(&mut s, Some(msg.clone()));
                 return Err(msg);
             }
         }
