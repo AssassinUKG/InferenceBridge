@@ -243,10 +243,16 @@ pub async fn backend_load_model(
         if let Some(loaded) = &s.loaded_model {
             let req = model_name.trim().to_ascii_lowercase();
             let cur = loaded.to_ascii_lowercase();
+            let search = if req.contains('/') {
+                req.rsplit('/').next().unwrap_or(&req)
+            } else {
+                &req
+            };
             let name_ok = cur == req
                 || cur.trim_end_matches(".gguf") == req
                 || cur == req.trim_end_matches(".gguf")
-                || (!req.is_empty() && cur.contains(&req));
+                || cur.trim_end_matches(".gguf") == search
+                || (!search.is_empty() && cur.contains(search));
             if name_ok {
                 let loaded_ctx = s.model_stats.as_ref().map(|st| st.context_size).unwrap_or(0);
                 let ctx_ok = match context_size {
@@ -254,7 +260,7 @@ pub async fn backend_load_model(
                     Some(requested) => loaded_ctx == requested,
                 };
                 if ctx_ok {
-                    tracing::info!(model = %model_name, "Model already loaded with matching context");
+                    tracing::info!(model = %model_name, loaded_ctx, "Model already loaded with matching context");
                     return Ok(loaded.clone());
                 }
                 tracing::info!(

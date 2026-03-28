@@ -400,14 +400,28 @@ pub(crate) fn build_parse_trace(profile: &ModelProfile, raw: &str, stripped: &st
     .unwrap_or_else(|_| "Failed to serialize parse trace".to_string())
 }
 
+/// Public test helper — exposes model name matching logic.
+#[cfg(test)]
+pub fn loaded_model_matches_request_pub(loaded: &str, requested: &str) -> bool {
+    loaded_model_matches_request(loaded, requested)
+}
+
 fn loaded_model_matches_request(loaded: &str, requested: &str) -> bool {
     let loaded = loaded.to_ascii_lowercase();
     let requested = requested.trim().to_ascii_lowercase();
 
+    // Handle path-style names like "qwen/qwen3.5-4b" → extract "qwen3.5-4b"
+    let search = if requested.contains('/') {
+        requested.rsplit('/').next().unwrap_or(&requested)
+    } else {
+        &requested
+    };
+
     loaded == requested
         || loaded.trim_end_matches(".gguf") == requested
         || loaded == requested.trim_end_matches(".gguf")
-        || (!requested.is_empty() && loaded.contains(&requested))
+        || loaded.trim_end_matches(".gguf") == search
+        || (!search.is_empty() && loaded.contains(search))
 }
 
 async fn swap_model_for_api(

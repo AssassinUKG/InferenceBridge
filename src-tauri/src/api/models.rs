@@ -93,8 +93,11 @@ pub async fn load_model(
     let load_time_seconds = load_start.elapsed().as_secs_f64();
 
     let s = state.read().await;
-    let actual_ctx = s.model_stats.as_ref().map(|st| st.context_size).unwrap_or(0);
     let loaded_name = s.loaded_model.clone().unwrap_or_else(|| model_name.clone());
+    // Use the requested context directly — that's what we told llama-server.
+    // Fall back to model_stats only when no explicit context was requested.
+    let actual_ctx = context_size
+        .unwrap_or_else(|| s.model_stats.as_ref().map(|st| st.context_size).unwrap_or(0));
 
     Ok(Json(LoadModelResponse {
         model_type: "llm".to_string(),
@@ -124,6 +127,42 @@ mod tests {
         .expect("request should deserialize");
 
         assert_eq!(request.requested_context_size(), Some(32768));
+    }
+
+    #[test]
+    fn deserializes_helixclaw_snake_case_context_length() {
+        // Exact payload HelixClaw sends: {"context_length":32768,"model":"qwen/qwen3.5-4b"}
+        let request: LoadModelRequest = serde_json::from_str(
+            r#"{
+                "model": "qwen/qwen3.5-4b",
+                "context_length": 32768
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        assert_eq!(
+            request.requested_context_size(),
+            Some(32768),
+            "context_length should be picked up as context_size"
+        );
+        // Also verify it's not swallowed by flatten extra
+        assert!(
+            !request.extra.contains_key("context_length"),
+            "context_length should NOT end up in extra (flatten)"
+        );
+    }
+
+    #[test]
+    fn path_style_model_name_find_resolves() {
+        // Test that "qwen/qwen3.5-4b" matches "Qwen3.5-4B-Q4_K_M.gguf"
+        // This uses the completions helper
+        assert!(
+            crate::api::completions::loaded_model_matches_request_pub(
+                "Qwen3.5-4B-Q4_K_M.gguf",
+                "qwen/qwen3.5-4b"
+            ),
+            "path-style name should match loaded model"
+        );
     }
 
     #[test]
