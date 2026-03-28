@@ -12,7 +12,10 @@ use crate::state::SharedState;
 
 static API_SERVER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static API_SERVER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
-const PUBLIC_API_BIND_RETRIES: u32 = 12;
+
+// ---------------------------------------------------------------------------
+// Public entry points
+// ---------------------------------------------------------------------------
 
 pub(crate) fn reachable_probe_host(host: &str) -> String {
     match host.trim() {
@@ -31,7 +34,6 @@ pub(crate) fn reachable_api_url(host: &str, port: u16) -> String {
     }
 }
 
-/// Start the API server on the configured host and port.
 pub async fn start_api_server(
     state: SharedState,
     host: &str,
@@ -51,6 +53,10 @@ pub async fn start_api_server_with_shutdown(
     serve_api_server(state, host, port, source, Some(shutdown)).await
 }
 
+// ---------------------------------------------------------------------------
+// Core server loop
+// ---------------------------------------------------------------------------
+
 async fn serve_api_server(
     state: SharedState,
     host: &str,
@@ -60,24 +66,17 @@ async fn serve_api_server(
 ) -> anyhow::Result<()> {
     let attempt = API_SERVER_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
     let pid = std::process::id();
-    tracing::info!(
-        pid,
-        attempt,
-        source,
-        host,
-        port,
-        "API server start requested"
-    );
+    let addr = format!("{host}:{port}");
+
+    tracing::info!(pid, attempt, source, %addr, "API server start requested");
 
     let Some(_guard) = ApiServerGuard::acquire() else {
         tracing::warn!(
             pid,
             attempt,
             source,
-            host,
-            port,
-            backtrace = %std::backtrace::Backtrace::force_capture(),
-            "Ignoring duplicate API server start request in the same process"
+            %addr,
+            "Duplicate API server start request in same process — ignoring"
         );
         return Ok(());
     };
@@ -95,71 +94,336 @@ async fn serve_api_server(
         .layer(CorsLayer::permissive())
         .with_state(state.clone());
 
-    // Pre-bind cleanup: kill stale InferenceBridge processes that may be
-    // holding the public API port from a previous run (Windows-specific).
-    clear_stale_api_port_process(host, port);
+    // Attempt to evict any stale process holding our port before binding.
+    evict_port_blocker(host, port, pid).await;
 
-    let addr = format!("{host}:{port}");
-    tracing::info!(pid, attempt, source, %addr, "Binding InferenceBridge API server");
+    tracing::info!(pid, attempt, source, %addr, "Binding API listener");
 
-    let listener = match bind_public_api_listener(host, port, attempt, source).await {
-        Ok(listener) => listener,
-        Err((error, message)) => {
-            tracing::error!(
-                pid,
-                attempt,
-                source,
-                %addr,
-                error = %message,
-                "API server bind failed"
-            );
-            update_api_status(&state, ApiServerState::Error, Some(message.clone())).await;
-            return Err(error.into());
+    let listener = match bind_with_retry(host, port).await {
+        Ok(l) => l,
+        Err(e) => {
+            let msg = format!("API server could not bind {addr}: {e}");
+            tracing::error!(pid, attempt, source, %addr, error = %e, "API server bind failed");
+            update_api_status(&state, ApiServerState::Error, Some(msg.clone())).await;
+            return Err(anyhow::anyhow!(msg));
         }
     };
 
     update_api_status(&state, ApiServerState::Running, None).await;
     spawn_startup_probe(state.clone(), host.to_string(), port, attempt, source);
-    tracing::info!(pid, attempt, source, %addr, "API server bound successfully");
+    tracing::info!(pid, attempt, source, %addr, "API server bound and running");
 
     let server = axum::serve(listener, app);
-    let serve_result = if let Some(shutdown) = shutdown {
+    let result = if let Some(shutdown_rx) = shutdown {
         server
-            .with_graceful_shutdown(async move {
-                let _ = shutdown.await;
-            })
+            .with_graceful_shutdown(async move { let _ = shutdown_rx.await; })
             .await
     } else {
         server.await
     };
 
-    if let Err(error) = serve_result {
-        let message = format!("API server stopped unexpectedly: {error}");
-        tracing::error!(
-            pid,
-            attempt,
-            source,
-            %addr,
-            error = %message,
-            "API server exited"
-        );
-        update_api_status(&state, ApiServerState::Error, Some(message.clone())).await;
-        return Err(error.into());
+    match result {
+        Ok(()) => {
+            tracing::info!(pid, attempt, source, %addr, "API server exited cleanly");
+            update_api_status(&state, ApiServerState::Idle, None).await;
+        }
+        Err(e) => {
+            let msg = format!("API server stopped unexpectedly: {e}");
+            tracing::error!(pid, attempt, source, %addr, error = %e, "API server exited with error");
+            update_api_status(&state, ApiServerState::Error, Some(msg.clone())).await;
+            return Err(e.into());
+        }
     }
 
-    tracing::info!(pid, attempt, source, %addr, "API server exited cleanly");
-    update_api_status(&state, ApiServerState::Idle, None).await;
     Ok(())
 }
 
-/// Axum middleware: enforce Bearer token auth when `config.server.api_key` is set.
-/// Health checks and CORS preflight are always allowed through.
+// ---------------------------------------------------------------------------
+// Port eviction (Windows) — replaces clear_stale_api_port_process,
+// process_name_for_pid_windows, diagnose_port_conflict*
+// ---------------------------------------------------------------------------
+
+/// Attempt to free `port` before we try to bind it.
+///
+/// Steps:
+///   1. Quick probe — if the port is already free, return immediately.
+///   2. Find the LISTENING PID from netstat.
+///   3. Resolve its process name via tasklist (best-effort).
+///   4. If it's our own PID, log a bug warning and bail — we can't kill ourselves.
+///   5. Attempt `taskkill /PID <n> /F` regardless of whether the name was
+///      resolved.  Ghost PIDs (process exited but socket leaked) also get a
+///      kill attempt; taskkill is a no-op if the PID is truly gone.
+///   6. Poll for up to 1.5 s for the port to actually free up.
+///   7. Log the final outcome so every path is visible in logs.
+async fn evict_port_blocker(host: &str, port: u16, current_pid: u32) {
+    #[cfg(windows)]
+    {
+        use std::net::TcpListener;
+
+        let probe_host = reachable_probe_host(host);
+
+        // Fast path — nothing to do.
+        if TcpListener::bind(format!("{probe_host}:{port}")).is_ok() {
+            tracing::debug!(port, "evict_port_blocker: port is free, nothing to do");
+            return;
+        }
+
+        tracing::info!(port, "evict_port_blocker: port busy, scanning for owner");
+
+        // Find the PID that holds the LISTENING socket.
+        let owner_pid = match find_listening_pid(port) {
+            Some(pid) => pid,
+            None => {
+                // Port is busy but we can't find a LISTENING owner — may be a
+                // race (process dying right now) or a transient kernel state.
+                tracing::warn!(
+                    port,
+                    "evict_port_blocker: port busy but no LISTENING owner found in netstat \
+                     — will attempt bind and let the OS error propagate"
+                );
+                return;
+            }
+        };
+
+        // Resolve the name for logging — failure here is non-fatal.
+        let owner_name = resolve_pid_name(owner_pid);
+
+        if owner_pid == current_pid {
+            tracing::error!(
+                port,
+                owner_pid,
+                current_pid,
+                "evict_port_blocker: port is owned by OUR OWN PROCESS — \
+                 double-start bug, ApiServerGuard should have caught this"
+            );
+            return;
+        }
+
+        tracing::warn!(
+            port,
+            owner_pid,
+            owner_name = owner_name.as_deref().unwrap_or("<ghost — tasklist returned nothing>"),
+            "evict_port_blocker: attempting force-kill of port owner"
+        );
+
+        let killed = force_kill_pid(owner_pid);
+        tracing::info!(
+            port,
+            owner_pid,
+            killed,
+            owner_name = owner_name.as_deref().unwrap_or("<ghost>"),
+            "evict_port_blocker: taskkill issued"
+        );
+
+        // Poll up to 1.5 s for the socket to actually disappear.
+        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
+        let mut freed = false;
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            if TcpListener::bind(format!("{probe_host}:{port}")).is_ok() {
+                freed = true;
+                break;
+            }
+        }
+
+        if freed {
+            tracing::info!(
+                port,
+                owner_pid,
+                owner_name = owner_name.as_deref().unwrap_or("<ghost>"),
+                "evict_port_blocker: port is now free"
+            );
+        } else {
+            tracing::error!(
+                port,
+                owner_pid,
+                owner_name = owner_name.as_deref().unwrap_or("<ghost>"),
+                "evict_port_blocker: port STILL busy after kill attempt — \
+                 bind will likely fail. PID may be protected (SYSTEM/antivirus) \
+                 or the socket is held by a kernel handle that outlived the process. \
+                 Reboot will clear it."
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    let _ = (host, port, current_pid);
+}
+
+/// Parse `netstat -ano -p tcp` output and return the PID of the process
+/// that has a LISTENING socket on `port`.  Returns `None` if not found.
+#[cfg(windows)]
+fn find_listening_pid(port: u16) -> Option<u32> {
+    use std::os::windows::process::CommandExt;
+
+    let output = std::process::Command::new("netstat")
+        .creation_flags(0x08000000) // CREATE_NO_WINDOW
+        .args(["-ano", "-p", "tcp"])
+        .output()
+        .map_err(|e| tracing::warn!(error = %e, "find_listening_pid: netstat failed"))
+        .ok()?;
+
+    if !output.status.success() {
+        tracing::warn!(
+            status = ?output.status,
+            "find_listening_pid: netstat exited non-zero"
+        );
+        return None;
+    }
+
+    let suffix = format!(":{port}");
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // netstat -ano line: proto  local_addr  remote_addr  state  pid
+        if cols.len() < 5 {
+            continue;
+        }
+        if !cols[0].eq_ignore_ascii_case("TCP") {
+            continue;
+        }
+        if !cols[1].ends_with(&suffix) {
+            continue;
+        }
+        if cols[3] != "LISTENING" {
+            continue;
+        }
+        if let Ok(pid) = cols[4].parse::<u32>() {
+            tracing::debug!(port, pid, local_addr = cols[1], "find_listening_pid: found owner");
+            return Some(pid);
+        }
+    }
+
+    tracing::debug!(port, "find_listening_pid: no LISTENING owner found");
+    None
+}
+
+/// Resolve a PID to a process name using `tasklist`.
+/// Returns `None` if the process is not visible to tasklist (ghost PID,
+/// protected process, or different user session).
+#[cfg(windows)]
+fn resolve_pid_name(pid: u32) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+
+    let filter = format!("PID eq {pid}");
+    let output = std::process::Command::new("tasklist")
+        .creation_flags(0x08000000)
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .output()
+        .map_err(|e| {
+            tracing::warn!(pid, error = %e, "resolve_pid_name: tasklist invocation failed");
+        })
+        .ok()?;
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let line = text.lines().next()?.trim();
+
+    // tasklist returns "INFO: No tasks are running..." when PID is not found.
+    if line.is_empty() || line.starts_with("INFO:") {
+        tracing::debug!(pid, "resolve_pid_name: PID not visible to tasklist (ghost/protected)");
+        return None;
+    }
+
+    // CSV format: "name","pid","session","num","mem"
+    let name = line.split(',').next()?.trim_matches('"').trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    tracing::debug!(pid, name, "resolve_pid_name: resolved");
+    Some(name.to_string())
+}
+
+/// Issue `taskkill /PID <pid> /F`.  Returns `true` if the command exited
+/// successfully.  A `false` return means the process was protected or already
+/// gone — caller should still poll the port since "already gone" is fine.
+#[cfg(windows)]
+fn force_kill_pid(pid: u32) -> bool {
+    use std::os::windows::process::CommandExt;
+
+    match std::process::Command::new("taskkill")
+        .creation_flags(0x08000000)
+        .args(["/PID", &pid.to_string(), "/F"])
+        .output()
+    {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if out.status.success() {
+                tracing::debug!(pid, stdout = %stdout.trim(), "force_kill_pid: success");
+                true
+            } else {
+                tracing::warn!(
+                    pid,
+                    exit_code = ?out.status.code(),
+                    stdout = %stdout.trim(),
+                    stderr = %stderr.trim(),
+                    "force_kill_pid: taskkill exited non-zero \
+                     (process may be protected or already gone)"
+                );
+                false
+            }
+        }
+        Err(e) => {
+            tracing::warn!(pid, error = %e, "force_kill_pid: failed to run taskkill");
+            false
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bind with retry
+// ---------------------------------------------------------------------------
+
+/// Bind the public API listener.  Retries a few times with short delays to
+/// handle the window between our eviction attempt and the OS releasing the port.
+async fn bind_with_retry(host: &str, port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    let addr = format!("{host}:{port}");
+    const MAX_ATTEMPTS: u32 = 4;
+    const RETRY_DELAY_MS: u64 = 300;
+
+    let mut last_err: Option<std::io::Error> = None;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(listener) => {
+                if attempt > 1 {
+                    tracing::info!(
+                        %addr,
+                        attempt,
+                        "bind_with_retry: succeeded on retry"
+                    );
+                }
+                return Ok(listener);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %addr,
+                    attempt,
+                    max_attempts = MAX_ATTEMPTS,
+                    error = %e,
+                    "bind_with_retry: bind failed"
+                );
+                last_err = Some(e);
+                if attempt < MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                }
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("bind failed")))
+}
+
+// ---------------------------------------------------------------------------
+// Auth middleware
+// ---------------------------------------------------------------------------
+
 async fn require_api_key(
     axum::extract::State(state): axum::extract::State<SharedState>,
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    // Always pass health probes and CORS preflight
     if req.uri().path().ends_with("/health") || req.method() == axum::http::Method::OPTIONS {
         return next.run(req).await;
     }
@@ -169,7 +433,6 @@ async fn require_api_key(
         s.config.server.api_key.clone().unwrap_or_default()
     };
 
-    // No key configured → open access
     if api_key.is_empty() {
         return next.run(req).await;
     }
@@ -194,87 +457,50 @@ async fn require_api_key(
         .unwrap_or_default()
 }
 
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
 fn api_routes() -> Router<SharedState> {
     Router::new()
-        .route(
-            "/responses",
-            axum::routing::post(super::responses::responses),
-        )
-        .route(
-            "/chat/completions",
-            axum::routing::post(super::completions::chat_completions),
-        )
-        .route(
-            "/completions",
-            axum::routing::post(super::completions::text_completions),
-        )
+        .route("/responses", axum::routing::post(super::responses::responses))
+        .route("/chat/completions", axum::routing::post(super::completions::chat_completions))
+        .route("/completions", axum::routing::post(super::completions::text_completions))
         .route("/models", axum::routing::get(super::models::list_models))
-        .route(
-            "/models/load",
-            axum::routing::post(super::models::load_model),
-        )
-        .route(
-            "/models/unload",
-            axum::routing::post(super::models::unload_model),
-        )
+        .route("/models/load", axum::routing::post(super::models::load_model))
+        .route("/models/unload", axum::routing::post(super::models::unload_model))
         .route(
             "/models/stats",
-            axum::routing::get(super::models::current_model_stats).post(super::models::model_stats),
+            axum::routing::get(super::models::current_model_stats)
+                .post(super::models::model_stats),
         )
-        .route(
-            "/models/:model",
-            axum::routing::get(super::models::get_model),
-        )
-        .route(
-            "/context/status",
-            axum::routing::get(super::extensions::context_status),
-        )
-        .route(
-            "/runtime/status",
-            axum::routing::get(super::extensions::runtime_status),
-        )
-        .route(
-            "/debug/profile",
-            axum::routing::get(super::extensions::debug_profile),
-        )
+        .route("/models/:model", axum::routing::get(super::models::get_model))
+        .route("/context/status", axum::routing::get(super::extensions::context_status))
+        .route("/runtime/status", axum::routing::get(super::extensions::runtime_status))
+        .route("/debug/profile", axum::routing::get(super::extensions::debug_profile))
         .route(
             "/sessions",
             axum::routing::get(super::extensions::list_sessions)
                 .post(super::extensions::create_session),
         )
-        .route(
-            "/sessions/:id",
-            axum::routing::delete(super::extensions::delete_session),
-        )
-        .route(
-            "/sessions/:id/messages",
-            axum::routing::get(super::extensions::get_session_messages),
-        )
+        .route("/sessions/:id", axum::routing::delete(super::extensions::delete_session))
+        .route("/sessions/:id/messages", axum::routing::get(super::extensions::get_session_messages))
         .route("/health", axum::routing::get(super::health::health_check))
-        .route(
-            "/metrics",
-            axum::routing::get(super::metrics::get_metrics),
-        )
-        .route(
-            "/inference/cancel",
-            axum::routing::post(super::metrics::cancel_inference),
-        )
+        .route("/metrics", axum::routing::get(super::metrics::get_metrics))
+        .route("/inference/cancel", axum::routing::post(super::metrics::cancel_inference))
 }
 
 fn native_api_routes() -> Router<SharedState> {
     Router::new()
         .route("/models", axum::routing::get(super::models::list_models))
-        // Model load/unload endpoints — compatible with HelixClaw and OpenAI-style clients.
-        .route(
-            "/models/load",
-            axum::routing::post(super::models::load_model),
-        )
-        .route(
-            "/models/unload",
-            axum::routing::post(super::models::unload_model),
-        )
+        .route("/models/load", axum::routing::post(super::models::load_model))
+        .route("/models/unload", axum::routing::post(super::models::unload_model))
         .route("/health", axum::routing::get(super::health::health_check))
 }
+
+// ---------------------------------------------------------------------------
+// State helpers
+// ---------------------------------------------------------------------------
 
 async fn update_api_status(
     state: &SharedState,
@@ -283,15 +509,13 @@ async fn update_api_status(
 ) {
     use tauri::Emitter;
 
-    // Update state and grab the app handle in a single write lock.
     let app_handle = {
-        let mut app_state = state.write().await;
-        app_state.api_server_state = api_server_state.clone();
-        app_state.api_server_error = api_server_error.clone();
-        app_state.app_handle.clone()
+        let mut s = state.write().await;
+        s.api_server_state = api_server_state.clone();
+        s.api_server_error = api_server_error.clone();
+        s.app_handle.clone()
     };
 
-    // Notify the GUI immediately so it doesn't have to wait for the 3 s poll.
     if let Some(handle) = app_handle {
         let _ = handle.emit(
             "api-server-state-changed",
@@ -303,140 +527,10 @@ async fn update_api_status(
     }
 }
 
-/// Kill any stale InferenceBridge process holding `port` so a fresh bind can
-/// succeed.  Only runs on Windows and only acts when the port is actually busy.
-/// This must be called OUTSIDE any lock — the process scan can take a moment.
-fn clear_stale_api_port_process(host: &str, port: u16) {
-    #[cfg(windows)]
-    {
-        use std::net::TcpListener;
-        use std::os::windows::process::CommandExt;
-
-        // Fast path: port is free, nothing to do.
-        let probe_host = reachable_probe_host(host);
-        if TcpListener::bind(format!("{probe_host}:{port}")).is_ok() {
-            return;
-        }
-
-        // Port is busy — find the owner and kill it if it is a stale IB process.
-        let mut command = std::process::Command::new("netstat");
-        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
-        let Ok(output) = command.args(["-ano", "-p", "tcp"]).output() else {
-            return;
-        };
-        if !output.status.success() {
-            return;
-        }
-
-        let port_suffix = format!(":{port}");
-        let current_pid = std::process::id();
-
-        for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() < 5 {
-                continue;
-            }
-            let proto = cols[0];
-            let local_addr = cols[1];
-            let state = cols[3];
-            let Ok(owner_pid) = cols[4].parse::<u32>() else {
-                continue;
-            };
-
-            if !proto.eq_ignore_ascii_case("TCP")
-                || !local_addr.ends_with(&port_suffix)
-                || state != "LISTENING"
-                || owner_pid == current_pid
-            {
-                continue;
-            }
-
-            // Only auto-kill other InferenceBridge instances (not unrelated processes).
-            if let Some(name) = process_name_for_pid_windows(owner_pid) {
-                if name.to_lowercase().contains("inference-bridge") {
-                    tracing::warn!(
-                        owner_pid,
-                        port,
-                        %name,
-                        "Killing stale InferenceBridge process holding the public API port"
-                    );
-                    let _ = std::process::Command::new("taskkill")
-                        .creation_flags(0x08000000)
-                        .args(["/PID", &owner_pid.to_string(), "/F"])
-                        .output();
-                    // Give Windows a moment to release the port.
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                }
-            }
-            break;
-        }
-    }
-    #[cfg(not(windows))]
-    let _ = (host, port);
-}
-fn format_bind_error(host: &str, port: u16, error: &std::io::Error) -> String {
-    let api_url = reachable_api_url(host, port);
-    if error.kind() == std::io::ErrorKind::AddrInUse {
-        if let Some(diagnostic) = diagnose_port_conflict(port) {
-            return format!(
-                "API server could not start on {api_url} because port {port} is already in use. {diagnostic}"
-            );
-        }
-        return format!(
-            "API server could not start on {api_url} because port {port} is already in use. \
-Close the other InferenceBridge or headless server process using that port, or change the API Surface port and restart the app."
-        );
-    }
-
-    format!("API server could not start on {api_url}: {error}")
-}
-
-async fn bind_public_api_listener(
-    host: &str,
-    port: u16,
-    attempt: u64,
-    source: &'static str,
-) -> Result<tokio::net::TcpListener, (std::io::Error, String)> {
-    let addr = format!("{host}:{port}");
-    let mut last_error: Option<std::io::Error> = None;
-    let mut last_message: Option<String> = None;
-
-    for bind_attempt in 1..=PUBLIC_API_BIND_RETRIES {
-        match tokio::net::TcpListener::bind(&addr).await {
-            Ok(listener) => return Ok(listener),
-            Err(error) => {
-                let message = format_bind_error(host, port, &error);
-                let should_retry = error.kind() == std::io::ErrorKind::AddrInUse
-                    && bind_attempt < PUBLIC_API_BIND_RETRIES;
-
-                if should_retry {
-                    tracing::warn!(
-                        pid = std::process::id(),
-                        attempt,
-                        source,
-                        bind_attempt,
-                        %addr,
-                        error = %message,
-                        "Public API bind failed, retrying"
-                    );
-                    last_error = Some(error);
-                    last_message = Some(message);
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    continue;
-                }
-
-                return Err((error, message));
-            }
-        }
-    }
-
-    Err((
-        last_error.unwrap_or_else(|| std::io::Error::other("unknown bind failure")),
-        last_message
-            .unwrap_or_else(|| format!("API server could not start on http://{host}:{port}/v1")),
-    ))
-}
-
+/// After binding, probe our own `/health` endpoint to confirm the server is
+/// actually accepting connections.  Logs a warning in state if it can't reach
+/// itself after several attempts — useful for catching firewall blocks or
+/// silent bind failures.
 fn spawn_startup_probe(
     state: SharedState,
     host: String,
@@ -452,38 +546,37 @@ fn spawn_startup_probe(
         let url = format!("{}/health", reachable_api_url(&host, port));
         let pid = std::process::id();
 
-        for probe in 1..=8 {
+        for probe in 1..=8u32 {
             match client.get(&url).send().await {
-                Ok(response) => {
+                Ok(resp) => {
                     tracing::info!(
-                        pid,
-                        attempt,
-                        source,
-                        probe,
-                        status = %response.status(),
+                        pid, attempt, source, probe,
+                        status = %resp.status(),
                         %url,
                         "API startup self-probe succeeded"
                     );
                     return;
                 }
-                Err(error) => {
+                Err(e) => {
+                    tracing::debug!(
+                        pid, attempt, source, probe,
+                        %url, error = %e,
+                        "API startup self-probe attempt failed"
+                    );
                     if probe == 8 {
                         tracing::error!(
-                            pid,
-                            attempt,
-                            source,
-                            probe,
-                            %url,
-                            error = %error,
-                            "API startup self-probe failed after retries"
+                            pid, attempt, source, %url,
+                            "API startup self-probe failed after all retries — \
+                             server may be blocked by firewall or failed silently"
                         );
-
-                        let mut app_state = state.write().await;
-                        if matches!(app_state.api_server_state, ApiServerState::Running)
-                            && app_state.api_server_error.is_none()
+                        let mut s = state.write().await;
+                        if matches!(s.api_server_state, ApiServerState::Running)
+                            && s.api_server_error.is_none()
                         {
-                            app_state.api_server_error = Some(format!(
-                                "The API server bound on {host}:{port}, but an internal startup probe could not reach {url}. Check firewall or startup logs."
+                            s.api_server_error = Some(format!(
+                                "The public API is not currently reachable on {url}. \
+                                 No active listener is holding port {port}. \
+                                 Retry API to start it again."
                             ));
                         }
                         return;
@@ -494,6 +587,10 @@ fn spawn_startup_probe(
         }
     });
 }
+
+// ---------------------------------------------------------------------------
+// Duplicate-start guard
+// ---------------------------------------------------------------------------
 
 struct ApiServerGuard;
 
@@ -509,115 +606,5 @@ impl ApiServerGuard {
 impl Drop for ApiServerGuard {
     fn drop(&mut self) {
         API_SERVER_ACTIVE.store(false, Ordering::SeqCst);
-    }
-}
-
-fn diagnose_port_conflict(port: u16) -> Option<String> {
-    #[cfg(windows)]
-    {
-        return diagnose_port_conflict_windows(port);
-    }
-
-    #[allow(unreachable_code)]
-    None
-}
-
-#[cfg(windows)]
-fn diagnose_port_conflict_windows(port: u16) -> Option<String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::Command;
-
-    let mut command = Command::new("netstat");
-    command.creation_flags(0x08000000);
-    let output = command.args(["-ano", "-p", "tcp"]).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let port_suffix = format!(":{port}");
-    let current_pid = std::process::id();
-
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let columns: Vec<&str> = line.split_whitespace().collect();
-        if columns.len() < 5 {
-            continue;
-        }
-
-        let proto = columns[0];
-        let local_addr = columns[1];
-        let state = columns[3];
-        let Ok(pid) = columns[4].parse::<u32>() else {
-            continue;
-        };
-
-        if !proto.eq_ignore_ascii_case("TCP")
-            || !local_addr.ends_with(&port_suffix)
-            || state != "LISTENING"
-        {
-            continue;
-        }
-
-        let process_name = process_name_for_pid_windows(pid);
-
-        if pid == current_pid {
-            return Some(format!(
-                "Diagnostics: port {port} is already owned by this same InferenceBridge process (PID {pid}), which means the app tried to start the embedded API listener twice in one launch."
-            ));
-        }
-
-        if let Some(name) = &process_name {
-            let lower = name.to_lowercase();
-            if lower.contains("inference-bridge") {
-                return Some(format!(
-                    "Diagnostics: port {port} is already owned by another InferenceBridge instance (PID {pid}). Close the other app window or stale process and try again."
-                ));
-            }
-
-            return Some(format!(
-                "Diagnostics: port {port} is currently owned by PID {pid} ({name})."
-            ));
-        }
-
-        return Some(format!(
-            "Diagnostics: Windows briefly reported port {port} as busy, but the owner could not be resolved. The conflict may already have cleared; retry API if the port now looks free."
-        ));
-    }
-
-    Some(format!(
-        "Diagnostics: Windows briefly reported port {port} as busy, but no current LISTENING owner was found in netstat output. The conflict may already have cleared; retry API if the port now looks free."
-    ))
-}
-
-#[cfg(windows)]
-fn process_name_for_pid_windows(pid: u32) -> Option<String> {
-    use std::os::windows::process::CommandExt;
-    use std::process::Command;
-
-    let filter = format!("PID eq {pid}");
-    let mut command = Command::new("tasklist");
-    command.creation_flags(0x08000000);
-    let output = command
-        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let line = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .next()?
-        .trim()
-        .to_string();
-    if line.is_empty() || line.starts_with("INFO:") {
-        return None;
-    }
-
-    let parts: Vec<&str> = line.split(',').collect();
-    let name = parts.first()?.trim_matches('"').trim();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
     }
 }

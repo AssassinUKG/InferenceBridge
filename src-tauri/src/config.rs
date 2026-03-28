@@ -203,6 +203,26 @@ fn directory_is_writable(path: &PathBuf) -> bool {
 }
 
 impl AppConfig {
+    /// Ensure the internal llama-server `backend_port` does not collide with
+    /// the public-facing `server.port`.  If they are the same, `backend_port`
+    /// is bumped to `server.port + 1`.
+    ///
+    /// Call this:
+    ///   - after loading config from disk
+    ///   - after any settings change that touches `server.port`
+    pub fn fix_port_conflict(&mut self) {
+        if self.process.backend_port == self.server.port {
+            let new_backend = self.server.port.saturating_add(1);
+            tracing::warn!(
+                server_port = self.server.port,
+                old_backend_port = self.process.backend_port,
+                new_backend_port = new_backend,
+                "backend_port collides with API server port — auto-bumping to avoid conflict"
+            );
+            self.process.backend_port = new_backend;
+        }
+    }
+
     /// Load config, checking multiple locations in priority order:
     /// 1. `./inference-bridge.toml` (current working directory / project root)
     /// 2. app support directory config file
@@ -226,6 +246,7 @@ impl AppConfig {
                                     );
                                 }
                             }
+                            config.fix_port_conflict();
                             return config;
                         }
                         Err(e) => {
@@ -264,6 +285,7 @@ impl AppConfig {
                 config.models.scan_dirs
             );
         }
+        config.fix_port_conflict();
         config
     }
 
