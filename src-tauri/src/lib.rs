@@ -527,8 +527,7 @@ async fn headless_load_model(state: &state::SharedState, model_name: &str, ctx_s
             }
         };
 
-        // Only pass explicit context size if the user or config asked for one.
-        let ctx = ctx_size.or(model.profile.default_context_window);
+        let ctx = ctx_size;
 
         LaunchConfig {
             model_path: model.path.clone(),
@@ -536,7 +535,7 @@ async fn headless_load_model(state: &state::SharedState, model_name: &str, ctx_s
             gpu_layers: s.config.process.gpu_layers,
             threads: s.config.process.threads,
             threads_batch: s.config.process.threads_batch,
-            port: 8801,
+            port: s.config.process.backend_port,
             backend_preference: s.config.process.backend_preference.clone(),
             batch_size: s.config.process.batch_size,
             ubatch_size: s.config.process.ubatch_size,
@@ -551,6 +550,7 @@ async fn headless_load_model(state: &state::SharedState, model_name: &str, ctx_s
         }
     };
 
+    let backend_port = config.port;
     let model_display = config
         .model_path
         .file_name()
@@ -614,7 +614,7 @@ async fn headless_load_model(state: &state::SharedState, model_name: &str, ctx_s
     // Wait for healthy
     tracing::info!("Waiting for llama-server to become healthy...");
     let client = reqwest::Client::new();
-    let health_url = "http://127.0.0.1:8801/health";
+    let health_url = format!("http://127.0.0.1:{}/health", backend_port);
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(300);
 
@@ -626,7 +626,7 @@ async fn headless_load_model(state: &state::SharedState, model_name: &str, ctx_s
             return;
         }
 
-        match client.get(health_url).send().await {
+        match client.get(&health_url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 if let Ok(body) = resp.text().await {
                     if body.contains("ok") {

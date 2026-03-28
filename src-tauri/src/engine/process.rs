@@ -795,7 +795,12 @@ impl LlamaProcess {
     }
 
     #[cfg(not(windows))]
-    fn force_kill_process_tree(_pid: u32) -> anyhow::Result<()> {
+    fn force_kill_process_tree(pid: u32) -> anyhow::Result<()> {
+        use std::process::Command;
+        // Kill the process group (negative PID) to get all children.
+        let _ = Command::new("kill").args(["-9", &format!("-{pid}")]).output();
+        // Also kill the PID directly in case it's not a process group leader.
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
         Ok(())
     }
 

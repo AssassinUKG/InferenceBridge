@@ -304,10 +304,10 @@ pub async fn responses(
             ApiErrorResponse::inference_failed(&e.to_string())
         })?;
 
-        let cancel = begin_api_generation(&state, model_name.clone()).await;
+        let gen = begin_api_generation(&state, model_name.clone()).await;
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {
-            let _ = streaming::consume_sse_stream(response, tx, cancel).await;
+            let _ = streaming::consume_sse_stream(response, tx, gen.cancel).await;
         });
 
         let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
@@ -368,9 +368,11 @@ pub async fn responses(
                         s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
                             source: "responses-api".to_string(),
                             model: model_name.clone(),
+                            request_id: String::new(),
                             started_at: generation_started_at.clone(),
                             finished_at: chrono::Utc::now().to_rfc3339(),
                             elapsed_ms: generation_started.elapsed().as_millis() as u64,
+                            time_to_first_token_ms: None,
                             prompt_tokens: Some(tokens_evaluated),
                             completion_tokens: Some(tokens_predicted),
                             total_tokens: Some(tokens_evaluated + tokens_predicted),
@@ -446,9 +448,11 @@ pub async fn responses(
         s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
             source: "responses-api".to_string(),
             model: model_name.clone(),
+            request_id: String::new(),
             started_at: generation_started_at,
             finished_at: chrono::Utc::now().to_rfc3339(),
             elapsed_ms: generation_started.elapsed().as_millis() as u64,
+            time_to_first_token_ms: None,
             prompt_tokens: response.tokens_evaluated,
             completion_tokens: response.tokens_predicted,
             total_tokens: match (response.tokens_evaluated, response.tokens_predicted) {

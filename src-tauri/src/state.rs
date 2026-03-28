@@ -65,9 +65,11 @@ pub struct GenerationRequest {
 pub struct RuntimePerformanceMetrics {
     pub source: String,
     pub model: String,
+    pub request_id: String,
     pub started_at: String,
     pub finished_at: String,
     pub elapsed_ms: u64,
+    pub time_to_first_token_ms: Option<u64>,
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub total_tokens: Option<u32>,
@@ -90,6 +92,17 @@ pub struct ActiveDownload {
     pub cancel_token: CancellationToken,
 }
 
+/// Cumulative API metrics for the /v1/metrics endpoint.
+#[derive(Debug, Clone, serde::Serialize, Default)]
+pub struct CumulativeMetrics {
+    pub total_requests: u64,
+    pub total_errors: u64,
+    pub total_cancellations: u64,
+    pub total_model_loads: u64,
+    pub total_model_unloads: u64,
+    pub backend_restart_count: u64,
+}
+
 pub struct AppState {
     pub config: AppConfig,
     pub process: LlamaProcess,
@@ -99,6 +112,7 @@ pub struct AppState {
     pub loading_generation: u64,
     pub previous_model: Option<String>,
     pub generation_cancel: CancellationToken,
+    pub model_load_cancel: CancellationToken,
     pub active_generation: Option<GenerationRequest>,
     pub last_prompt: Option<String>,
     pub last_parse_trace: Option<String>,
@@ -115,10 +129,8 @@ pub struct AppState {
     pub app_handle: Option<tauri::AppHandle>,
     pub active_downloads: HashMap<String, ActiveDownload>,
     pub request_scheduler: Arc<RequestScheduler>,
-    /// Serialises concurrent model-load requests.  Only one load runs at a time;
-    /// the others wait and then coalesce (skip the load if the right model is
-    /// already running by the time they acquire the lock).
     pub model_load_mutex: Arc<AsyncMutex<()>>,
+    pub cumulative_metrics: CumulativeMetrics,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -136,6 +148,7 @@ impl AppState {
             loading_generation: 0,
             previous_model: None,
             generation_cancel: CancellationToken::new(),
+            model_load_cancel: CancellationToken::new(),
             active_generation: None,
             last_prompt: None,
             last_parse_trace: None,
@@ -153,26 +166,37 @@ impl AppState {
             active_downloads: HashMap::new(),
             request_scheduler: Arc::new(RequestScheduler::new(scheduler_limit)),
             model_load_mutex: Arc::new(AsyncMutex::new(())),
+            cumulative_metrics: CumulativeMetrics::default(),
         })
     }
+}
+
+pub struct GenerationHandle {
+    pub cancel: CancellationToken,
+    pub request_id: String,
 }
 
 pub async fn begin_api_generation(
     state: &SharedState,
     model: String,
-) -> tokio_util::sync::CancellationToken {
+) -> GenerationHandle {
     let mut s = state.write().await;
     s.generation_cancel.cancel();
-    s.generation_cancel = tokio_util::sync::CancellationToken::new();
+    s.generation_cancel = CancellationToken::new();
+    s.cumulative_metrics.total_requests += 1;
+    let request_id = uuid::Uuid::new_v4().to_string();
     s.active_generation = Some(GenerationRequest {
-        id: uuid::Uuid::new_v4().to_string(),
+        id: request_id.clone(),
         source: "api".to_string(),
         session_id: None,
         model,
         started_at: chrono::Utc::now().to_rfc3339(),
         status: "running".to_string(),
     });
-    s.generation_cancel.clone()
+    GenerationHandle {
+        cancel: s.generation_cancel.clone(),
+        request_id,
+    }
 }
 
 pub async fn finish_api_generation(state: &SharedState, status: &str) {

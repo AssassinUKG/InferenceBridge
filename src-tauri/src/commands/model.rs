@@ -69,12 +69,10 @@ fn normalize_requested_context_size(context_size: Option<u32>) -> Option<u32> {
 
 /// Resolve the context size to pass to llama-server.
 ///
-/// Returns `None` when no explicit override exists — the server should use the
-/// model's native context window in that case.  Only returns `Some` when the
-/// user, API request, or server config explicitly sets a value.
+/// Returns only what was explicitly requested. No defaults, no fallbacks.
+/// If nothing was requested, returns `None` and llama-server uses whatever
+/// the GGUF model metadata specifies.
 fn resolve_launch_context_size(requested_context_size: Option<u32>) -> Option<u32> {
-    // Only override context if explicitly requested. Otherwise llama-server
-    // reads the context window from the model's GGUF metadata.
     normalize_requested_context_size(requested_context_size)
 }
 
@@ -83,12 +81,12 @@ mod tests {
     use super::resolve_launch_context_size;
 
     #[test]
-    fn uses_requested_context_size() {
+    fn passes_through_requested_context() {
         assert_eq!(resolve_launch_context_size(Some(32768)), Some(32768));
     }
 
     #[test]
-    fn returns_none_when_nothing_requested() {
+    fn none_when_nothing_requested() {
         assert_eq!(resolve_launch_context_size(None), None);
     }
 
@@ -220,24 +218,26 @@ pub async fn backend_load_model(
     model_name: String,
     context_size: Option<u32>,
 ) -> Result<String, String> {
-    // Serialize concurrent model-load requests with a per-app mutex.
-    //
-    // Without this, two simultaneous requests for the same (or different) model both
-    // enter the load path, the second one calls shutdown() + kill() on the process the
-    // first one just started, and they race indefinitely.  With the mutex the second
-    // caller waits, then coalesces — if the first load already loaded the right model
-    // it returns immediately without touching the process at all.
+    // Cancel any active inference before starting a new load.
+    {
+        let mut s = state.write().await;
+        if s.active_generation.is_some() {
+            s.generation_cancel.cancel();
+            s.cumulative_metrics.total_cancellations += 1;
+            tracing::info!("Cancelled active inference for new model load");
+        }
+        s.cumulative_metrics.total_model_loads += 1;
+        // Fresh cancellation token for this load.
+        s.model_load_cancel = tokio_util::sync::CancellationToken::new();
+    }
+
     let load_mutex = {
         let s = state.read().await;
         s.model_load_mutex.clone()
     };
     let _load_guard = load_mutex.lock().await;
 
-    // Coalesce: if the right model is already loaded, return immediately.
-    // Only check the model name — never force a reload just because the
-    // requested context_size differs from what is running.  LM Studio never
-    // reloads for context either; the model serves with whatever context it
-    // was originally loaded with.
+    // Skip reload only if same model AND same context (or no context requested).
     {
         let s = state.read().await;
         if let Some(loaded) = &s.loaded_model {
@@ -248,11 +248,21 @@ pub async fn backend_load_model(
                 || cur == req.trim_end_matches(".gguf")
                 || (!req.is_empty() && cur.contains(&req));
             if name_ok {
+                let loaded_ctx = s.model_stats.as_ref().map(|st| st.context_size).unwrap_or(0);
+                let ctx_ok = match context_size {
+                    None | Some(0) => true,
+                    Some(requested) => loaded_ctx == requested,
+                };
+                if ctx_ok {
+                    tracing::info!(model = %model_name, "Model already loaded with matching context");
+                    return Ok(loaded.clone());
+                }
                 tracing::info!(
                     model = %model_name,
-                    "Coalesced: model already loaded, skipping reload"
+                    loaded_ctx,
+                    requested_ctx = context_size,
+                    "Reloading model — context size mismatch"
                 );
-                return Ok(loaded.clone());
             }
         }
     }
@@ -320,9 +330,8 @@ pub async fn backend_load_model(
 
         let ctx = resolve_launch_context_size(context_size);
 
-        // Use a provisional context size for pre-launch state.
-        // If ctx is None (server decides), use 0 as placeholder — will be
-        // updated from /props or /slots after health check succeeds.
+        // If ctx is None (no one specified), use 0 as placeholder — will be
+        // updated from /slots or /props after health check succeeds.
         let provisional_ctx = ctx.unwrap_or(0);
         s.last_context_status = Some(empty_context_status(provisional_ctx));
         s.model_stats = Some(crate::state::ModelStats {
@@ -338,7 +347,7 @@ pub async fn backend_load_model(
             gpu_layers: s.config.process.gpu_layers,
             threads: s.config.process.threads,
             threads_batch: s.config.process.threads_batch,
-            port: 8801,
+            port: s.config.process.backend_port,
             backend_preference: s.config.process.backend_preference.clone(),
             batch_size: s.config.process.batch_size,
             ubatch_size: s.config.process.ubatch_size,
@@ -395,7 +404,7 @@ pub async fn backend_load_model(
 
     let size_info = match config.context_size {
         Some(ctx) => format!("{} (ctx: {})", model_filename, ctx),
-        None => format!("{} (ctx: auto)", model_filename),
+        None => format!("{} (ctx: model-default)", model_filename),
     };
 
     // Phase 2: Launch process (brief write lock, then released)
@@ -423,6 +432,7 @@ pub async fn backend_load_model(
         None,
     )
     .await;
+    let backend_port = config.port;
     {
         let mut s = state.write().await;
         s.process.launch(config).await.map_err(|e| {
@@ -432,7 +442,6 @@ pub async fn backend_load_model(
         })?;
     } // write lock released
 
-    // Phase 3: Wait for llama-server /health (NO lock held — UI can poll freely)
     emit_load_progress(
         &app_handle,
         "loading",
@@ -441,15 +450,23 @@ pub async fn backend_load_model(
         false,
         None,
     );
-    tracing::info!("Phase 3: Waiting for llama-server health check on port 8801...");
+    let (load_timeout_secs, health_poll_ms, load_cancel) = {
+        let s = state.read().await;
+        (
+            s.config.process.model_load_timeout_secs,
+            s.config.process.health_poll_interval_ms,
+            s.model_load_cancel.clone(),
+        )
+    };
+    tracing::info!(port = backend_port, timeout_secs = load_timeout_secs, "Phase 3: Waiting for llama-server health check...");
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .unwrap_or_default();
-    let health_url = "http://127.0.0.1:8801/health";
+    let health_url = format!("http://127.0.0.1:{}/health", backend_port);
     let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(300); // 5 min for large models
+    let timeout = std::time::Duration::from_secs(load_timeout_secs);
     let mut attempt = 0u32;
 
     loop {
@@ -463,14 +480,21 @@ pub async fn backend_load_model(
             return Err(msg);
         }
 
-        // Check if process crashed.
-        //
-        // Use poll_exited() (non-blocking, no sleep) under the write lock so the lock
-        // is not held during the 100ms stderr-flush wait.  That 100ms sleep previously
-        // blocked every concurrent reader on every crash detection.
-        let process_exited = {
+        if load_cancel.is_cancelled() {
+            let msg = "Model load cancelled by new request".to_string();
+            tracing::info!("{msg}");
+            let mut s = state.write().await;
+            let _ = s.process.shutdown().await;
+            clear_runtime_after_backend_exit(&mut s, Some(msg.clone()));
+            return Err(msg);
+        }
+
+        // Check if process crashed — every ~13 iterations (~2 seconds).
+        let process_exited = if attempt % 13 == 0 {
             let mut s = state.write().await;
             s.process.poll_exited()
+        } else {
+            false
         };
         if process_exited {
             // Give the background stderr-reader task a moment to drain — outside the lock.
@@ -499,7 +523,7 @@ pub async fn backend_load_model(
             return Err(msg);
         }
 
-        match client.get(health_url).send().await {
+        match client.get(&health_url).send().await {
             Ok(resp) => {
                 let status_code = resp.status();
                 let body = resp.text().await.unwrap_or_default();
@@ -567,7 +591,7 @@ pub async fn backend_load_model(
         if attempt < 5 || attempt % 10 == 0 {
             tracing::debug!(attempt, "Health check attempt");
         }
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(health_poll_ms)).await;
     }
 
     // Phase 4: Mark as loaded (brief write lock)
@@ -599,7 +623,7 @@ pub async fn backend_load_model(
     // When we didn't pass --ctx-size, llama-server picks the model's native
     // window.  Query /slots (or /props) to learn the real n_ctx.
     {
-        let llama_client = crate::engine::client::LlamaClient::new(8801);
+        let llama_client = crate::engine::client::LlamaClient::new(backend_port);
         let actual_ctx = match llama_client.get_slots().await {
             Ok(slots) if !slots.is_empty() => Some(slots[0].n_ctx),
             _ => match llama_client.get_props().await {
@@ -712,6 +736,23 @@ pub async fn load_model(
 }
 
 pub async fn backend_unload_model(state: SharedState) -> Result<String, String> {
+    // Serialize with load mutex to prevent race with concurrent loads.
+    let load_mutex = {
+        let s = state.read().await;
+        s.model_load_mutex.clone()
+    };
+    let _load_guard = load_mutex.lock().await;
+
+    // Cancel active inference.
+    {
+        let mut s = state.write().await;
+        if s.active_generation.is_some() {
+            s.generation_cancel.cancel();
+            tracing::info!("Cancelled active inference for model unload");
+        }
+        s.cumulative_metrics.total_model_unloads += 1;
+    }
+
     let unloaded_model = {
         let s = state.read().await;
         s.loaded_model.clone()

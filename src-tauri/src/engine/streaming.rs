@@ -111,6 +111,16 @@ pub async fn consume_sse_stream(
     tx: mpsc::Sender<StreamEvent>,
     cancel: CancellationToken,
 ) -> anyhow::Result<String> {
+    consume_sse_stream_with_timeouts(response, tx, cancel, 300, 120).await
+}
+
+pub async fn consume_sse_stream_with_timeouts(
+    response: reqwest::Response,
+    tx: mpsc::Sender<StreamEvent>,
+    cancel: CancellationToken,
+    first_token_timeout_secs: u64,
+    inter_token_timeout_secs: u64,
+) -> anyhow::Result<String> {
     let mut full_text = String::new();
     let mut stream = response.bytes_stream();
     let mut buffer = String::new();
@@ -122,8 +132,8 @@ pub async fn consume_sse_stream(
     let mut prompt_tokens_per_second: Option<f64> = None;
     let mut got_first_token = false;
 
-    let first_token_timeout = std::time::Duration::from_secs(300);
-    let inter_token_timeout = std::time::Duration::from_secs(120);
+    let first_token_timeout = std::time::Duration::from_secs(first_token_timeout_secs);
+    let inter_token_timeout = std::time::Duration::from_secs(inter_token_timeout_secs);
 
     loop {
         if cancel.is_cancelled() {

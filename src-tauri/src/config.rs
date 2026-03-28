@@ -38,8 +38,6 @@ pub struct ServerConfig {
 pub struct ModelsConfig {
     /// Directories to scan for .gguf model files.
     pub scan_dirs: Vec<PathBuf>,
-    /// Default context size when model metadata doesn't specify one.
-    pub default_context: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +75,16 @@ pub struct ProcessConfig {
     pub defrag_thold: f32,
     /// RoPE frequency scaling factor (--rope-freq-scale). 0 = auto.
     pub rope_freq_scale: f32,
+    /// Port for the internal llama-server backend process. Default 8801.
+    pub backend_port: u16,
+    /// Maximum time (seconds) to wait for a model to load. Default 300 (5 min).
+    pub model_load_timeout_secs: u64,
+    /// Maximum time (seconds) to wait for the first token during inference. Default 300.
+    pub first_token_timeout_secs: u64,
+    /// Maximum time (seconds) to wait between tokens during inference. Default 120.
+    pub inter_token_timeout_secs: u64,
+    /// Health check polling interval (milliseconds) during model load. Default 150.
+    pub health_poll_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,7 +124,6 @@ impl Default for ModelsConfig {
     fn default() -> Self {
         Self {
             scan_dirs: vec![],
-            default_context: 8192,
         }
     }
 }
@@ -140,6 +147,11 @@ impl Default for ProcessConfig {
             main_gpu: 0,
             defrag_thold: 0.1,
             rope_freq_scale: 0.0,
+            backend_port: 8801,
+            model_load_timeout_secs: 300,
+            first_token_timeout_secs: 300,
+            inter_token_timeout_secs: 120,
+            health_poll_interval_ms: 150,
         }
     }
 }

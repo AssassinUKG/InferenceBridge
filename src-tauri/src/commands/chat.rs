@@ -488,9 +488,11 @@ pub async fn send_message(
                 .loaded_model
                 .clone()
                 .unwrap_or_else(|| "Unknown".to_string()),
+            request_id: String::new(),
             started_at: generation_started_at,
             finished_at: now_rfc3339(),
             elapsed_ms: generation_started.elapsed().as_millis() as u64,
+            time_to_first_token_ms: None,
             prompt_tokens: tokens_evaluated,
             completion_tokens: tokens_predicted,
             total_tokens: match (tokens_evaluated, tokens_predicted) {

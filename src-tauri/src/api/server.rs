@@ -251,13 +251,20 @@ fn api_routes() -> Router<SharedState> {
             axum::routing::get(super::extensions::get_session_messages),
         )
         .route("/health", axum::routing::get(super::health::health_check))
+        .route(
+            "/metrics",
+            axum::routing::get(super::metrics::get_metrics),
+        )
+        .route(
+            "/inference/cancel",
+            axum::routing::post(super::metrics::cancel_inference),
+        )
 }
 
 fn native_api_routes() -> Router<SharedState> {
     Router::new()
         .route("/models", axum::routing::get(super::models::list_models))
-        // LM Studio-compatible load/unload endpoints at /api/v1/models/load and /api/v1/models/unload.
-        // HelixClaw and other LM Studio clients POST model-load requests (with context_length) here.
+        // Model load/unload endpoints — compatible with HelixClaw and OpenAI-style clients.
         .route(
             "/models/load",
             axum::routing::post(super::models::load_model),

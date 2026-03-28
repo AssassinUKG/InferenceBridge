@@ -807,9 +807,11 @@ pub async fn chat_completions(
         s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
             source: "api".to_string(),
             model: model_name.clone(),
+            request_id: String::new(),
             started_at: generation_started_at,
             finished_at: chrono::Utc::now().to_rfc3339(),
             elapsed_ms: generation_started.elapsed().as_millis() as u64,
+            time_to_first_token_ms: None,
             prompt_tokens: response.tokens_evaluated,
             completion_tokens: response.tokens_predicted,
             total_tokens: match (response.tokens_evaluated, response.tokens_predicted) {
@@ -891,10 +893,11 @@ async fn stream_chat_completion(
         ApiErrorResponse::inference_failed(&e.to_string())
     })?;
 
-    let cancel = begin_api_generation(&state, model_name.clone()).await;
+    let gen = begin_api_generation(&state, model_name.clone()).await;
+    let request_id = gen.request_id.clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move {
-        let _ = streaming::consume_sse_stream(response, tx, cancel).await;
+        let _ = streaming::consume_sse_stream(response, tx, gen.cancel).await;
     });
 
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -903,6 +906,7 @@ async fn stream_chat_completion(
 
     let stream = async_stream::stream! {
         let mut raw_full_text = String::new();
+        let mut first_token_at: Option<std::time::Instant> = None;
 
         let opening_chunk = serde_json::json!({
             "id": id,
@@ -920,6 +924,9 @@ async fn stream_chat_completion(
         while let Some(event) = rx.recv().await {
             match event {
                 StreamEvent::Token(token) => {
+                    if first_token_at.is_none() {
+                        first_token_at = Some(std::time::Instant::now());
+                    }
                     let chunk_json = serde_json::json!({
                         "id": id,
                         "object": "chat.completion.chunk",
@@ -970,9 +977,11 @@ async fn stream_chat_completion(
                     s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
                         source: "api".to_string(),
                         model: model_name.clone(),
+                        request_id: request_id.clone(),
                         started_at: generation_started_at.clone(),
                         finished_at: chrono::Utc::now().to_rfc3339(),
                         elapsed_ms: generation_started.elapsed().as_millis() as u64,
+                        time_to_first_token_ms: first_token_at.map(|t| t.duration_since(generation_started).as_millis() as u64),
                         prompt_tokens: Some(tokens_evaluated),
                         completion_tokens: Some(tokens_predicted),
                         total_tokens: Some(tokens_evaluated + tokens_predicted),
