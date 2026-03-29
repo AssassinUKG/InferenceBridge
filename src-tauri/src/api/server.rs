@@ -86,6 +86,13 @@ async fn serve_api_server(
     let app = Router::new()
         .nest("/v1", api_routes())
         .nest("/api/v1", native_api_routes())
+        // Transparent proxy: any route NOT matched above is forwarded to the
+        // internal llama-server process on its auto-assigned ephemeral port.
+        // This means ALL llama-server native endpoints (/props, /slots,
+        // /tokenize, /detokenize, /embedding, etc.) work through IB
+        // automatically — no explicit proxy routes needed.
+        // The /v1/* and /api/v1/* routes take priority (.nest() before .fallback()).
+        .fallback(backend_proxy_fallback)
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
@@ -416,6 +423,110 @@ async fn bind_with_retry(host: &str, port: u16) -> std::io::Result<tokio::net::T
 }
 
 // ---------------------------------------------------------------------------
+// Transparent backend proxy (single-port architecture)
+// ---------------------------------------------------------------------------
+
+/// Transparent proxy: forwards any unmatched request to the internal
+/// llama-server process on its auto-assigned ephemeral port.
+///
+/// This is the core of InferenceBridge's single-port architecture: the Axum
+/// server owns the only external port, and llama-server runs on an internal
+/// ephemeral port invisible to clients.  Any llama-server endpoint (current
+/// or future: /props, /slots, /tokenize, /detokenize, /embedding, etc.)
+/// works automatically.  The `/v1/*` and `/api/v1/*` Axum routes take
+/// priority; this only fires for paths that don't match those.
+async fn backend_proxy_fallback(
+    axum::extract::State(state): axum::extract::State<SharedState>,
+    req: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    let backend_port = {
+        let s = state.read().await;
+        s.process.port()
+    };
+
+    let method = req.method().clone();
+    let path = req.uri().path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+    let url = format!("http://127.0.0.1:{}{}", backend_port, path);
+
+    tracing::debug!(
+        %method,
+        %path,
+        backend_port,
+        "backend_proxy_fallback: forwarding unmatched request to llama-server"
+    );
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .connect_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    // Read the request body (if any)
+    let body_bytes = match axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "backend_proxy_fallback: failed to read request body");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+
+    let backend_req = client
+        .request(method.clone(), &url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body_bytes);
+
+    match backend_req.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let headers = resp.headers().clone();
+            match resp.bytes().await {
+                Ok(body) => {
+                    let mut builder = axum::http::Response::builder().status(status);
+                    // Forward content-type from backend
+                    if let Some(ct) = headers.get(reqwest::header::CONTENT_TYPE) {
+                        builder = builder.header(axum::http::header::CONTENT_TYPE, ct.as_bytes());
+                    } else {
+                        builder = builder.header(
+                            axum::http::header::CONTENT_TYPE,
+                            "application/json",
+                        );
+                    }
+                    builder
+                        .body(axum::body::Body::from(body))
+                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+                }
+                Err(e) => {
+                    tracing::warn!(%path, error = %e, "backend_proxy_fallback: failed to read backend response");
+                    StatusCode::BAD_GATEWAY.into_response()
+                }
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                %path,
+                backend_port,
+                error = %e,
+                "backend_proxy_fallback: backend unreachable (no model loaded?)"
+            );
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(serde_json::json!({
+                    "error": format!("llama-server backend unreachable on port {backend_port}: {e}"),
+                    "path": path,
+                    "hint": "No model is loaded or the backend process is not running."
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Auth middleware
 // ---------------------------------------------------------------------------
 
@@ -424,7 +535,15 @@ async fn require_api_key(
     req: axum::http::Request<axum::body::Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if req.uri().path().ends_with("/health") || req.method() == axum::http::Method::OPTIONS {
+    let path = req.uri().path();
+    // Bypass auth for health endpoints and llama-server native endpoints.
+    // The /v1/* prefix routes always require auth; root-level paths (e.g.
+    // /props, /slots, /tokenize) are transparently proxied to llama-server
+    // and should be open (matching native llama-server behavior).
+    if path.ends_with("/health")
+        || !path.starts_with("/v1")
+        || req.method() == axum::http::Method::OPTIONS
+    {
         return next.run(req).await;
     }
 

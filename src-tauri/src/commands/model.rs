@@ -353,7 +353,7 @@ pub async fn backend_load_model(
             gpu_layers: s.config.process.gpu_layers,
             threads: s.config.process.threads,
             threads_batch: s.config.process.threads_batch,
-            port: s.config.process.backend_port,
+            port: 0, // auto-assign ephemeral port at launch
             backend_preference: s.config.process.backend_preference.clone(),
             batch_size: s.config.process.batch_size,
             ubatch_size: s.config.process.ubatch_size,
@@ -415,14 +415,13 @@ pub async fn backend_load_model(
 
     // Phase 2: Launch process (brief write lock, then released)
     //
-    // Pre-launch cleanup: kill any stale port occupants BEFORE acquiring the write lock.
-    // The WMIC scan inside kill_all_managed_processes() can take 1-3 seconds on Windows.
-    // Running it under the write lock would freeze every concurrent reader for that duration.
+    // Pre-launch cleanup: kill any stale managed llama-server processes BEFORE
+    // acquiring the write lock.  The WMIC scan can take 1-3 seconds on Windows;
+    // running it under the write lock would block concurrent readers.
     #[cfg(windows)]
     {
-        let port = config.port;
         tokio::task::spawn_blocking(move || {
-            crate::engine::process::LlamaProcess::clear_stale_port_processes(port);
+            crate::engine::process::LlamaProcess::clear_stale_managed_processes();
         })
         .await
         .ok();
@@ -438,7 +437,6 @@ pub async fn backend_load_model(
         None,
     )
     .await;
-    let backend_port = config.port;
     {
         let mut s = state.write().await;
         s.process.launch(config).await.map_err(|e| {
@@ -447,6 +445,13 @@ pub async fn backend_load_model(
             msg
         })?;
     } // write lock released
+
+    // Read the actual port assigned by the OS (resolved from 0 during launch).
+    let backend_port = {
+        let s = state.read().await;
+        s.process.port()
+    };
+    tracing::info!(backend_port, "llama-server launched on auto-assigned port");
 
     emit_load_progress(
         &app_handle,

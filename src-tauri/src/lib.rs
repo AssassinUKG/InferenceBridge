@@ -535,7 +535,7 @@ async fn headless_load_model(state: &state::SharedState, model_name: &str, ctx_s
             gpu_layers: s.config.process.gpu_layers,
             threads: s.config.process.threads,
             threads_batch: s.config.process.threads_batch,
-            port: s.config.process.backend_port,
+            port: 0, // auto-assign ephemeral port at launch
             backend_preference: s.config.process.backend_preference.clone(),
             batch_size: s.config.process.batch_size,
             ubatch_size: s.config.process.ubatch_size,
@@ -550,7 +550,6 @@ async fn headless_load_model(state: &state::SharedState, model_name: &str, ctx_s
         }
     };
 
-    let backend_port = config.port;
     let model_display = config
         .model_path
         .file_name()
@@ -610,6 +609,13 @@ async fn headless_load_model(state: &state::SharedState, model_name: &str, ctx_s
             return;
         }
     }
+
+    // Read the actual port assigned by the OS after launch.
+    let backend_port = {
+        let s = state.read().await;
+        s.process.port()
+    };
+    tracing::info!(backend_port, "llama-server launched on auto-assigned port");
 
     // Wait for healthy
     tracing::info!("Waiting for llama-server to become healthy...");

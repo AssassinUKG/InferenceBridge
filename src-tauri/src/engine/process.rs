@@ -172,9 +172,7 @@ impl LlamaProcess {
         if config.parallel_slots == 0 {
             anyhow::bail!("Parallel slots must be at least 1");
         }
-        if config.port == 0 {
-            anyhow::bail!("Port must be greater than 0");
-        }
+        // port == 0 is valid: means "auto-assign a free ephemeral port at launch time"
         if config.main_gpu < 0 {
             anyhow::bail!("Main GPU index cannot be negative");
         }
@@ -402,6 +400,15 @@ impl LlamaProcess {
             .find(|p| Self::matches_backend_preference(p, backend_preference))
     }
 
+    /// Find a free TCP port by binding to port 0 and reading the OS-assigned port.
+    /// The listener is dropped immediately, freeing the port for llama-server to use.
+    fn find_free_port() -> anyhow::Result<u16> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
+        drop(listener);
+        Ok(port)
+    }
+
     pub fn new() -> Self {
         let (state_tx, state_rx) = watch::channel(ProcessState::Idle);
         Self {
@@ -410,7 +417,7 @@ impl LlamaProcess {
             llama_server_path: None,
             current_model: None,
             current_pid: None,
-            current_port: 8801,
+            current_port: 0,
             crash_count: 0,
             state_tx,
             state_rx,
@@ -472,42 +479,45 @@ impl LlamaProcess {
             .join("bin")
     }
 
-    /// Kill any managed llama-server processes occupying `port` so launch can succeed.
+    /// Kill any stale managed llama-server processes before launching a new one.
     ///
     /// **Call this BEFORE acquiring the state write lock.**  The underlying WMIC query
     /// can take 1-3 seconds on Windows; running it while holding the write lock would
     /// block every concurrent reader (including in-flight API requests) for that duration.
     #[cfg(windows)]
-    pub fn clear_stale_port_processes(port: u16) {
-        use std::net::TcpListener;
-        if TcpListener::bind(("127.0.0.1", port)).is_err() {
-            match Self::kill_all_managed_processes() {
-                Ok(killed) if killed > 0 => {
-                    tracing::warn!(
-                        killed,
-                        port,
-                        "Pre-launch: cleared stale managed llama-server processes (port was busy)"
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(port, error = %e, "Pre-launch port cleanup failed");
-                }
+    pub fn clear_stale_managed_processes() {
+        match Self::kill_all_managed_processes() {
+            Ok(killed) if killed > 0 => {
+                tracing::warn!(
+                    killed,
+                    "Pre-launch: cleared stale managed llama-server processes"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "Pre-launch managed process cleanup failed");
             }
         }
     }
 
     /// Launch llama-server with the given configuration.
     ///
-    /// Port cleanup (WMIC scan) must be done **before** calling this via
-    /// [`LlamaProcess::clear_stale_port_processes`] so the write lock is not held
-    /// during a slow system scan.
-    pub async fn launch(&mut self, config: LaunchConfig) -> anyhow::Result<()> {
+    /// When `config.port` is 0, an ephemeral port is auto-assigned by the OS.
+    /// Stale-process cleanup (WMIC scan) should be done **before** calling this
+    /// via [`LlamaProcess::clear_stale_managed_processes`] so the write lock is
+    /// not held during a slow system scan.
+    pub async fn launch(&mut self, mut config: LaunchConfig) -> anyhow::Result<()> {
         Self::validate_launch_config(&config)?;
         // Shutdown any existing process first
         self.shutdown().await?;
         // NOTE: stale-process cleanup (kill_all_managed_processes / WMIC) was moved
-        // to `clear_stale_port_processes()` and must be called BEFORE the write lock.
+        // to `clear_stale_managed_processes()` and must be called BEFORE the write lock.
+
+        // Auto-assign a free ephemeral port when port is 0.
+        if config.port == 0 {
+            config.port = Self::find_free_port()?;
+            tracing::info!(port = config.port, "Auto-assigned free port for llama-server");
+        }
 
         let preview = self.build_args_preview(&config)?;
         let server_path = PathBuf::from(&preview.server_path);

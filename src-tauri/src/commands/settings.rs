@@ -128,8 +128,6 @@ pub async fn update_settings(
         s.config.process.backend_preference = settings.backend_preference;
         s.config.server.host = host.clone();
         s.config.server.port = settings.server_port;
-        // Keep the internal backend port from colliding with the API server port.
-        s.config.fix_port_conflict();
         // Update model scan directories (deduplicate, filter non-empty paths).
         s.config.models.scan_dirs = settings
             .scan_dirs
