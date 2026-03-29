@@ -33,26 +33,13 @@ function apiStateTone(state: string) {
   return "border-white/8 bg-white/5 text-slate-400";
 }
 
-export function StatusBar({ processStatus, contextStatus, settings, loadProgress }: Props) {
+export function StatusBar({ processStatus, contextStatus, settings }: Props) {
   const model = processStatus?.model ?? "No model loaded";
   const state = processStatus?.state ?? "Idle";
   const crashes = processStatus?.crash_count ?? 0;
   const pct = Math.round(contextStatus.fill_ratio * 100);
   const apiUrl = processStatus?.api_url ?? buildApiUrl(settings);
   const apiState = processStatus?.api_state ?? "Idle";
-  const apiReachable = processStatus?.api_reachable ?? false;
-  const activeLoadProgress =
-    loadProgress && !loadProgress.done
-      ? loadProgress
-      : processStatus?.model_load_progress && !processStatus.model_load_progress.done
-        ? processStatus.model_load_progress
-        : null;
-  const transitionActive =
-    !!activeLoadProgress ||
-    ["Starting", "Stopping"].includes(processStatus?.state ?? "Idle") ||
-    ["Loading", "Swapping", "Unloading"].includes(
-      processStatus?.model_load_state ?? "Idle"
-    );
 
   const kvColor =
     pct > 95
@@ -99,25 +86,19 @@ export function StatusBar({ processStatus, contextStatus, settings, loadProgress
             <span className="text-orange-300">Crashes: {crashes}</span>
           )}
 
-          <span className={`rounded-full border px-3 py-1 ${apiStateTone(transitionActive ? "Starting" : apiState)}`}>
-            {transitionActive
-              ? processStatus?.model_load_state ?? "Loading"
-              : `API ${apiReachable ? "Running" : apiState}`}
+          <span className={`rounded-full border px-3 py-1 ${apiStateTone(apiState)}`}>
+            API {apiState}
           </span>
         </div>
 
         <div className="flex flex-wrap items-center gap-3">
-          <span className={apiReachable ? "text-emerald-300" : "text-slate-500"}>{apiUrl}</span>
+          <span className="text-slate-500">{apiUrl}</span>
 
-          {transitionActive && activeLoadProgress ? (
-            <span className="max-w-[28rem] truncate text-amber-300" title={activeLoadProgress.message}>
-              {activeLoadProgress.message}
-            </span>
-          ) : processStatus?.api_error ? (
+          {processStatus?.api_error && (
             <span className="max-w-[28rem] truncate text-rose-300" title={processStatus.api_error}>
               {processStatus.api_error}
             </span>
-          ) : null}
+          )}
 
           {contextStatus.total_tokens > 0 ? (
             <span className={contextStatus.used_tokens > 0 ? kvColor : "text-slate-400"}>

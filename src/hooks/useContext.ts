@@ -3,8 +3,6 @@ import { listen } from "@tauri-apps/api/event";
 import type { ContextStatus } from "../lib/types";
 import * as api from "../lib/tauri";
 
-const CONTEXT_POLL_MS = 1500;
-
 const EMPTY_STATUS: ContextStatus = {
   total_tokens: 0,
   used_tokens: 0,
@@ -27,7 +25,7 @@ function sameContextStatus(a: ContextStatus, b: ContextStatus) {
   );
 }
 
-export function useContext(pollInterval = CONTEXT_POLL_MS) {
+export function useContext(pollInterval = 2000) {
   const [status, setStatus] = useState<ContextStatus>(EMPTY_STATUS);
 
   useEffect(() => {
@@ -46,34 +44,18 @@ export function useContext(pollInterval = CONTEXT_POLL_MS) {
 
     poll();
     const intervalId = setInterval(poll, pollInterval);
-    let unlistenPressure: (() => void) | null = null;
-    let unlistenModelLoad: (() => void) | null = null;
-    let unlistenApiState: (() => void) | null = null;
+    let unlisten: (() => void) | null = null;
 
     listen("context-pressure", () => {
       void poll();
     }).then((dispose) => {
-      unlistenPressure = dispose;
-    }).catch(() => undefined);
-
-    listen("model-load-progress", () => {
-      void poll();
-    }).then((dispose) => {
-      unlistenModelLoad = dispose;
-    }).catch(() => undefined);
-
-    listen("api-server-state-changed", () => {
-      void poll();
-    }).then((dispose) => {
-      unlistenApiState = dispose;
+      unlisten = dispose;
     }).catch(() => undefined);
 
     return () => {
       active = false;
       clearInterval(intervalId);
-      unlistenPressure?.();
-      unlistenModelLoad?.();
-      unlistenApiState?.();
+      unlisten?.();
     };
   }, [pollInterval]);
 

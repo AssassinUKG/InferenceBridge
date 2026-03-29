@@ -971,9 +971,19 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
     // Try managed binary version file first, then query live server /props
     let server_version = download::current_version();
 
+    let api_port_owner = if !api_reachable && !transition_active {
+        detect_api_port_owner(api_port)
+    } else {
+        None
+    };
+    let api_owned_by_self = api_port_owner
+        .as_ref()
+        .map(|owner| owner.kind == "self")
+        .unwrap_or(false);
+
     let effective_api_state = if api_reachable {
         "Running".to_string()
-    } else if transition_active {
+    } else if transition_active || api_owned_by_self {
         "Starting".to_string()
     } else if api_state == "Running" {
         "Error".to_string()
@@ -981,23 +991,19 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
         api_state.clone()
     };
 
-    let api_port_owner = if effective_api_state == "Error" && !api_reachable && !transition_active {
-        detect_api_port_owner(api_port)
-    } else {
-        None
-    };
-
-    let effective_api_error = if api_reachable {
-        None
-    } else if transition_active {
+    let effective_api_error = if api_reachable || transition_active || api_owned_by_self {
         None
     } else if effective_api_state == "Error" {
-        if api_port_owner.is_some() {
-            api_error.clone().or_else(|| {
-                Some(format!(
-                    "The public API is not currently reachable on {api_url}. Another process appears to be holding port {api_port}."
-                ))
-            })
+        if let Some(owner) = api_port_owner.as_ref() {
+            if owner.kind == "self" {
+                None
+            } else {
+                api_error.clone().or_else(|| {
+                    Some(format!(
+                        "The public API is not currently reachable on {api_url}. Another process appears to be holding port {api_port}."
+                    ))
+                })
+            }
         } else {
             Some(format!(
                 "The public API is not currently reachable on {api_url}. No active listener is holding port {api_port}. Retry API to start it again."
@@ -1539,3 +1545,4 @@ pub async fn swap_model(
     let _ = app;
     backend_load_model(state.inner().clone(), target, context_size).await
 }
+

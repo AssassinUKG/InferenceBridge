@@ -91,7 +91,7 @@ fn extract_qwen_function_calls(text: &mut String, calls: &mut Vec<ToolCall>) {
 
     for cap in re.captures_iter(text) {
         let full_match = cap.get(0).unwrap();
-        let name = cap.get(1).unwrap().as_str().trim();
+        let outer_name = cap.get(1).unwrap().as_str().trim();
         let body = cap.get(2).unwrap().as_str();
 
         // Parse parameters from <parameter=key>value</parameter> pairs
@@ -113,10 +113,11 @@ fn extract_qwen_function_calls(text: &mut String, calls: &mut Vec<ToolCall>) {
             args.insert(key.to_string(), json_val);
         }
 
+        let (name, arguments) = unwrap_meta_tool_call(outer_name, args);
         calls.push(ToolCall {
             id: uuid::Uuid::new_v4().to_string(),
-            name: name.to_string(),
-            arguments: serde_json::Value::Object(args),
+            name,
+            arguments,
             raw_text: Some(full_match.as_str().to_string()),
         });
 
@@ -124,6 +125,46 @@ fn extract_qwen_function_calls(text: &mut String, calls: &mut Vec<ToolCall>) {
     }
 
     *text = new_text;
+}
+
+fn unwrap_meta_tool_call(
+    outer_name: &str,
+    mut args: serde_json::Map<String, serde_json::Value>,
+) -> (String, serde_json::Value) {
+    if outer_name != "tool_call" {
+        return (outer_name.to_string(), serde_json::Value::Object(args));
+    }
+
+    let Some(inner_name) = args
+        .get("name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+    else {
+        return (outer_name.to_string(), serde_json::Value::Object(args));
+    };
+
+    if let Some(nested_arguments) = args.remove("arguments") {
+        let arguments = match nested_arguments {
+            serde_json::Value::String(raw) => {
+                let trimmed = raw.trim();
+                let looks_like_json = (trimmed.starts_with('{') && trimmed.ends_with('}'))
+                    || (trimmed.starts_with('[') && trimmed.ends_with(']'));
+                if looks_like_json {
+                    serde_json::from_str(trimmed)
+                        .unwrap_or_else(|_| serde_json::Value::String(raw))
+                } else {
+                    serde_json::Value::String(raw)
+                }
+            }
+            other => other,
+        };
+        return (inner_name.to_string(), arguments);
+    }
+
+    args.remove("name");
+    (inner_name.to_string(), serde_json::Value::Object(args))
 }
 
 #[cfg(test)]
@@ -192,4 +233,27 @@ mod tests {
         assert!(calls.is_empty());
         assert_eq!(remaining, "Answer");
     }
+
+    #[test]
+    fn qwen_tool_call_wrapper_uses_inner_tool_name_with_flattened_args() {
+        let text = "<function=tool_call><parameter=name>submit_helix_graph</parameter><parameter=nodes>[{\"id\":\"plan\"}]</parameter></function>";
+        let (calls, remaining) = extract_tool_calls_for_profile(text, &qwen_profile());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "submit_helix_graph");
+        assert_eq!(calls[0].arguments["nodes"][0]["id"], "plan");
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn qwen_tool_call_wrapper_uses_inner_tool_name_with_nested_arguments() {
+        let text = "<function=tool_call><parameter=name>agent_message</parameter><parameter=arguments>{\"agent_id\":\"Barry\",\"task\":\"Build the app\"}</parameter></function>";
+        let (calls, remaining) = extract_tool_calls_for_profile(text, &qwen_profile());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "agent_message");
+        assert_eq!(calls[0].arguments["agent_id"], "Barry");
+        assert_eq!(calls[0].arguments["task"], "Build the app");
+        assert!(remaining.is_empty());
+    }
 }
+
+
