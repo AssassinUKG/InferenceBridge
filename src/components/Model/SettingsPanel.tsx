@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
-import type { ApiAccessInfo, AppSettings, LlamaServerInfo, LoadProgress, ProcessStatusInfo } from "../../lib/types";
+import type { ApiAccessInfo, AppSettings, LlamaServerInfo, LoadProgress, ProcessStatusInfo, RuntimeDoctorReport } from "../../lib/types";
 import * as api from "../../lib/tauri";
 
 interface Props {
@@ -317,6 +317,8 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
   const [llamaInfo, setLlamaInfo] = useState<LlamaServerInfo | null>(null);
   const [llamaLoading, setLlamaLoading] = useState(false);
   const [downloadStatus, setDownloadStatus] = useState<string | null>(null);
+  const [providerCheck, setProviderCheck] = useState<RuntimeDoctorReport | null>(null);
+  const [providerChecking, setProviderChecking] = useState(false);
 
   const loadSettings = useCallback(async () => {
     try {
@@ -400,6 +402,17 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
     }
   };
 
+  const checkProviders = async () => {
+    setProviderChecking(true);
+    try {
+      setProviderCheck(await api.getRuntimeDoctor());
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setProviderChecking(false);
+    }
+  };
+
   if (!settings) {
     return (
       <div className="p-4 text-sm" style={{ color: "var(--text-1)" }}>
@@ -456,6 +469,17 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
     : apiState === "Error"
       ? apiConfigDirty ? "Save & Retry API" : "Retry API"
       : apiConfigDirty ? "Save & Start API" : "Start API";
+  const providerDirty =
+    !!persistedSettings &&
+    (persistedSettings.active_provider !== settings.active_provider ||
+      persistedSettings.lm_studio_enabled !== settings.lm_studio_enabled ||
+      persistedSettings.lm_studio_base_url !== settings.lm_studio_base_url ||
+      (persistedSettings.lm_studio_api_key ?? "") !== (settings.lm_studio_api_key ?? ""));
+  const lmStudioBaseUrl = settings.lm_studio_base_url.trim() || "http://127.0.0.1:1234/v1";
+  const normalizedLmStudioUrl = lmStudioBaseUrl.endsWith("/v1")
+    ? lmStudioBaseUrl
+    : `${lmStudioBaseUrl.replace(/\/$/, "")}/v1`;
+  const configuredLmStudioProbe = providerCheck?.providers.find((provider) => provider.id === "lm-studio-configured");
 
   const handleApiServerToggle = async () => {
     const shouldStart = !(apiRunning || apiStarting);
@@ -638,6 +662,83 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
           </div>
         </SectionPanel>
 
+        {/* Providers */}
+        <SectionPanel>
+          <SectionHeader
+            title="Providers"
+            description="Choose the backend behind InferenceBridge's own API. Keep the API server running as the stable front door."
+          />
+          <FieldRow label="Active Provider" hint="Routes /v1/chat/completions">
+            <FlatSelect
+              value={settings.active_provider}
+              onChange={(v) => setSettings({ ...settings, active_provider: v })}
+            >
+              <option value="managed_llamacpp">Managed llama.cpp</option>
+              <option value="lm_studio">LM Studio</option>
+            </FlatSelect>
+          </FieldRow>
+          <Divider />
+          <FieldRow label="LM Studio" hint="OpenAI-compatible local server">
+            <div className="flex items-center gap-3">
+              <Toggle
+                checked={settings.lm_studio_enabled}
+                onChange={() =>
+                  setSettings({
+                    ...settings,
+                    lm_studio_enabled: !settings.lm_studio_enabled,
+                    active_provider: !settings.lm_studio_enabled ? "lm_studio" : settings.active_provider,
+                  })
+                }
+              />
+              <span className="text-sm" style={{ color: "var(--text-1)" }}>
+                {settings.lm_studio_enabled ? "Enabled" : "Disabled"}
+              </span>
+            </div>
+          </FieldRow>
+          <Divider />
+          <FieldRow label="LM Studio URL" hint="Usually ends with /v1">
+            <FlatInput
+              value={settings.lm_studio_base_url}
+              onChange={(v) => setSettings({ ...settings, lm_studio_base_url: v })}
+              placeholder="http://127.0.0.1:1234/v1"
+            />
+            <p className="mt-1 text-xs font-mono" style={{ color: "var(--text-2)" }}>
+              Target: {normalizedLmStudioUrl}
+            </p>
+          </FieldRow>
+          <Divider />
+          <FieldRow label="LM Studio Key" hint="Usually blank">
+            <FlatInput
+              value={settings.lm_studio_api_key ?? ""}
+              onChange={(v) => setSettings({ ...settings, lm_studio_api_key: v || null })}
+              placeholder="Optional Bearer token"
+            />
+          </FieldRow>
+          <Divider />
+          <div className="flex items-center justify-between gap-3 px-4 py-3">
+            <span className="text-xs" style={{ color: providerDirty ? "#fbbf24" : "var(--text-2)" }}>
+              {providerDirty
+                ? "Save Settings before requests use this provider config."
+                : settings.active_provider === "lm_studio"
+                  ? "Chat completions and model listing will route through LM Studio."
+                  : "Chat completions use the managed llama.cpp runtime."}
+            </span>
+            <div className="flex items-center gap-2">
+              <FlatBtn label={providerChecking ? "Checking..." : "Test"} onClick={() => void checkProviders()} disabled={providerChecking || providerDirty} />
+              <FlatBtn label={saving ? "Saving..." : "Save Settings"} onClick={() => void saveSettings()} disabled={saving} primary />
+            </div>
+          </div>
+          {configuredLmStudioProbe && (
+            <>
+              <Divider />
+              <div className="px-4 py-2.5 text-xs" style={{ color: configuredLmStudioProbe.reachable ? "#34d399" : "#f87171", background: configuredLmStudioProbe.reachable ? "rgba(52,211,153,0.05)" : "rgba(248,113,113,0.06)" }}>
+                LM Studio {configuredLmStudioProbe.status}: {configuredLmStudioProbe.model_count} model{configuredLmStudioProbe.model_count === 1 ? "" : "s"} at {configuredLmStudioProbe.base_url}
+                {configuredLmStudioProbe.error ? ` (${configuredLmStudioProbe.error})` : ""}
+              </div>
+            </>
+          )}
+        </SectionPanel>
+
         <div className="grid gap-3 xl:grid-cols-2">
           {/* llama.cpp Server */}
           <SectionPanel>
@@ -768,7 +869,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
 
         {/* Inference Engine */}
         <SectionPanel>
-          <SectionHeader title="Inference Engine" description="llama-server parameters - take effect on next model load." />
+          <SectionHeader title="Inference Engine" description="llama-server parameters and template controls. These take effect on the next model load or swap." />
 
           <div className="grid gap-0 xl:grid-cols-2">
             <div>
@@ -821,6 +922,44 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
                   placeholder="0"
                 />
               </FieldRow>
+              <Divider />
+              <FieldRow label="Fit Mode" hint="--fit: on, off, or auto (blank = unset)">
+                <FlatInput
+                  value={settings.fit_mode}
+                  onChange={(v) => setSettings({ ...settings, fit_mode: v })}
+                  placeholder="on"
+                />
+              </FieldRow>
+              <Divider />
+              <FieldRow label="Cache RAM (MiB)" hint="--cache-ram: RAM budget for KV cache">
+                <FlatInput
+                  type="number"
+                  value={settings.cache_ram_mb ?? ""}
+                  onChange={(v) =>
+                    setSettings({
+                      ...settings,
+                      cache_ram_mb: v.trim() ? Math.max(0, Number(v) || 0) : null,
+                    })
+                  }
+                  min={0}
+                  placeholder="4096"
+                />
+              </FieldRow>
+              <Divider />
+              <FieldRow label="Ctx Copy" hint="-ctxcp: context copy checkpoints (blank = unset)">
+                <FlatInput
+                  type="number"
+                  value={settings.ctxcp ?? ""}
+                  onChange={(v) =>
+                    setSettings({
+                      ...settings,
+                      ctxcp: v.trim() ? Math.max(0, Number(v) || 0) : null,
+                    })
+                  }
+                  min={0}
+                  placeholder="2"
+                />
+              </FieldRow>
             </div>
 
             <div>
@@ -845,6 +984,11 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
                   hint: "-cb: process multiple requests together",
                   key: "cont_batching" as const,
                 },
+                {
+                  label: "Use Jinja",
+                  hint: "--jinja: let llama.cpp render repo/custom templates",
+                  key: "use_jinja" as const,
+                },
               ].map((item, i) => (
                 <div key={item.key}>
                   {i > 0 && <Divider />}
@@ -864,6 +1008,78 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
                   </div>
                 </div>
               ))}
+
+              <Divider />
+              <FieldRow label="Reasoning Mode" hint="--reasoning: on, off, or auto (blank = unset)">
+                <FlatInput
+                  value={settings.reasoning_mode}
+                  onChange={(v) => setSettings({ ...settings, reasoning_mode: v })}
+                  placeholder="on"
+                />
+              </FieldRow>
+              <Divider />
+              <FieldRow label="Template Mode" hint="repo, custom, or builtin">
+                <FlatInput
+                  value={settings.template_mode}
+                  onChange={(v) => setSettings({ ...settings, template_mode: v })}
+                  placeholder="repo"
+                />
+              </FieldRow>
+              <Divider />
+              <FieldRow label="Built-in Template" hint="Used when template mode is builtin">
+                <FlatInput
+                  value={settings.template_name ?? ""}
+                  onChange={(v) =>
+                    setSettings({
+                      ...settings,
+                      template_name: v.trim() ? v : null,
+                    })
+                  }
+                  placeholder="chatml"
+                />
+              </FieldRow>
+              <Divider />
+              <FieldRow label="Custom Template Path" hint="Used when template mode is custom">
+                <FlatInput
+                  value={settings.custom_template_path ?? ""}
+                  onChange={(v) =>
+                    setSettings({
+                      ...settings,
+                      custom_template_path: v.trim() ? v : null,
+                    })
+                  }
+                  placeholder="C:\\path\\to\\chat_template.jinja"
+                />
+              </FieldRow>
+              <Divider />
+              <FieldRow label="Template Kwargs JSON" hint="Passed to --chat-template-kwargs">
+                <FlatInput
+                  value={settings.chat_template_kwargs_json ?? ""}
+                  onChange={(v) =>
+                    setSettings({
+                      ...settings,
+                      chat_template_kwargs_json: v.trim() ? v : null,
+                    })
+                  }
+                  placeholder='{"preserve_thinking": true}'
+                />
+              </FieldRow>
+              <Divider />
+              <FieldRow label="Extra Args" hint="Comma-separated raw llama-server args appended last">
+                <FlatInput
+                  value={(settings.extra_args ?? []).join(", ")}
+                  onChange={(v) =>
+                    setSettings({
+                      ...settings,
+                      extra_args: v
+                        .split(",")
+                        .map((item) => item.trim())
+                        .filter(Boolean),
+                    })
+                  }
+                  placeholder="--some-flag, value"
+                />
+              </FieldRow>
             </div>
           </div>
         </SectionPanel>

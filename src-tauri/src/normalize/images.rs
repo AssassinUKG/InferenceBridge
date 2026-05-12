@@ -3,7 +3,10 @@ use base64::Engine as _;
 const MAX_REMOTE_IMAGE_BYTES: usize = 15 * 1024 * 1024;
 
 fn normalize_base64_bytes(value: &str) -> Result<String, String> {
-    let compact = value.chars().filter(|ch| !ch.is_whitespace()).collect::<String>();
+    let compact = value
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
     if compact.is_empty() {
         return Err("Image payload must not be empty.".to_string());
     }
@@ -29,7 +32,9 @@ pub fn normalize_inline_image_payload(value: &str) -> Result<String, String> {
     }
 
     if trimmed.starts_with("file:") {
-        return Err("File URLs are not supported here. Paste or upload the image instead.".to_string());
+        return Err(
+            "File URLs are not supported here. Paste or upload the image instead.".to_string(),
+        );
     }
 
     if trimmed.starts_with("http://") || trimmed.starts_with("https://") {

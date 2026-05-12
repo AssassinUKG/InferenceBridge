@@ -10,7 +10,10 @@ pub async fn get_context_status(
         let s = state.read().await;
         (
             s.loaded_model.is_some(),
-            matches!(s.process.state(), crate::engine::process::ProcessState::Running),
+            matches!(
+                s.process.state(),
+                crate::engine::process::ProcessState::Running
+            ),
             s.process.port(),
             s.last_context_status.clone(),
         )

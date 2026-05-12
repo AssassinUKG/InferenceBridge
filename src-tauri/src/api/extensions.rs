@@ -46,6 +46,12 @@ pub async fn runtime_status(
         .map_err(ApiErrorResponse::service_unavailable)
 }
 
+pub async fn runtime_doctor(
+    State(state): State<SharedState>,
+) -> Json<crate::providers::RuntimeDoctorReport> {
+    Json(crate::providers::collect_runtime_doctor(state).await)
+}
+
 #[derive(Debug, Deserialize)]
 pub struct DebugProfileQuery {
     pub model: Option<String>,
@@ -93,11 +99,13 @@ pub async fn create_session(
 
     let id = db
         .create_session(&name, req.model_id.as_deref())
-        .map_err(|e| ApiErrorResponse::service_unavailable(format!("Failed to create session: {e}")))?;
+        .map_err(|e| {
+            ApiErrorResponse::service_unavailable(format!("Failed to create session: {e}"))
+        })?;
 
-    let sessions = db
-        .list_sessions()
-        .map_err(|e| ApiErrorResponse::service_unavailable(format!("Failed to fetch session: {e}")))?;
+    let sessions = db.list_sessions().map_err(|e| {
+        ApiErrorResponse::service_unavailable(format!("Failed to fetch session: {e}"))
+    })?;
 
     sessions
         .into_iter()
@@ -116,10 +124,13 @@ pub async fn delete_session(
         .lock()
         .map_err(|_| ApiErrorResponse::service_unavailable("Session DB lock poisoned"))?;
 
-    db.delete_session(&session_id)
-        .map_err(|e| ApiErrorResponse::service_unavailable(format!("Failed to delete session: {e}")))?;
+    db.delete_session(&session_id).map_err(|e| {
+        ApiErrorResponse::service_unavailable(format!("Failed to delete session: {e}"))
+    })?;
 
-    Ok(Json(serde_json::json!({ "deleted": true, "id": session_id })))
+    Ok(Json(
+        serde_json::json!({ "deleted": true, "id": session_id }),
+    ))
 }
 
 pub async fn get_session_messages(

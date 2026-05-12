@@ -126,6 +126,16 @@ curl http://127.0.0.1:8800/v1/runtime/status
 }
 ```
 
+### GET /v1/runtime/doctor
+
+Probe managed llama.cpp plus common local providers.
+
+```bash
+curl http://127.0.0.1:8800/v1/runtime/doctor
+```
+
+The doctor reports provider reachability, model listing support, context limits when discoverable, endpoint support, and next-step hints for managed llama.cpp, standalone llama.cpp, Ollama, and LM Studio.
+
 ### GET /v1/context/status
 
 Live KV cache context status from the running llama-server.
@@ -635,6 +645,7 @@ curl -X POST http://127.0.0.1:8800/v1/inference/cancel
 | GET | `/v1/metrics` | | Cumulative metrics |
 | GET | `/v1/context/status` | | Live KV cache status |
 | GET | `/v1/runtime/status` | | Full runtime status |
+| GET | `/v1/runtime/doctor` | | Local provider preflight diagnostics |
 | GET | `/v1/debug/profile` | | Model profile debug |
 | GET | `/v1/sessions` | | List sessions |
 | POST | `/v1/sessions` | | Create session |

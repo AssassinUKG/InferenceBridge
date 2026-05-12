@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::api::errors::ApiErrorResponse;
+use crate::commands::model::RuntimeLoadOverrides;
 use crate::engine::client::{CompletionRequest, ImageData, LlamaClient};
 use crate::engine::streaming::{self, StreamEvent};
 use crate::models::profiles::ModelProfile;
@@ -13,7 +14,7 @@ use crate::normalize::think_strip::{
     extract_reasoning_content_with_style, strip_think_tags_with_style,
 };
 use crate::state::{
-    SharedState, begin_api_generation, finish_api_generation, summarize_reasoning_tokens,
+    begin_api_generation, finish_api_generation, summarize_reasoning_tokens, SharedState,
 };
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +163,29 @@ const CONTEXT_SIZE_KEYS: &[&str] = &[
     "context_window",
 ];
 
+const HF_REPO_KEYS: &[&str] = &["hf_repo", "hfRepo", "repo_id", "repoId", "repository"];
+const HF_FILE_KEYS: &[&str] = &["hf_file", "hfFile", "file", "filename", "quant"];
+const FIT_MODE_KEYS: &[&str] = &["fit_mode", "fitMode", "fit"];
+const CACHE_RAM_KEYS: &[&str] = &["cache_ram_mb", "cacheRamMb", "cache_ram", "cacheRam"];
+const CTXCP_KEYS: &[&str] = &["ctxcp", "ctx_cp"];
+const JINJA_KEYS: &[&str] = &["use_jinja", "useJinja", "jinja"];
+const REASONING_MODE_KEYS: &[&str] = &["reasoning_mode", "reasoningMode"];
+const TEMPLATE_MODE_KEYS: &[&str] = &["template_mode", "templateMode"];
+const TEMPLATE_NAME_KEYS: &[&str] = &["template_name", "templateName", "chat_template"];
+const CUSTOM_TEMPLATE_PATH_KEYS: &[&str] = &[
+    "custom_template_path",
+    "customTemplatePath",
+    "chat_template_file",
+    "chatTemplateFile",
+];
+const TEMPLATE_KWARGS_KEYS: &[&str] = &[
+    "chat_template_kwargs_json",
+    "chatTemplateKwargsJson",
+    "chat_template_kwargs",
+    "chatTemplateKwargs",
+];
+const EXTRA_ARGS_KEYS: &[&str] = &["extra_args", "extraArgs"];
+
 fn parse_context_size_string(text: &str) -> Option<u32> {
     let normalized = text.trim().to_ascii_lowercase().replace('_', "");
     if normalized.is_empty() {
@@ -198,6 +222,157 @@ fn parse_context_size_string(text: &str) -> Option<u32> {
     None
 }
 
+fn find_named_value_in_value(
+    value: &serde_json::Value,
+    keys: &[&str],
+) -> Option<serde_json::Value> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in keys {
+                if let Some(value) = map.get(*key) {
+                    return Some(value.clone());
+                }
+            }
+            for value in map.values() {
+                if let Some(found) = find_named_value_in_value(value, keys) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .find_map(|value| find_named_value_in_value(value, keys)),
+        _ => None,
+    }
+}
+
+fn find_named_value_in_hash_map(
+    map: &HashMap<String, serde_json::Value>,
+    keys: &[&str],
+) -> Option<serde_json::Value> {
+    for key in keys {
+        if let Some(value) = map.get(*key) {
+            return Some(value.clone());
+        }
+    }
+    for value in map.values() {
+        if let Some(found) = find_named_value_in_value(value, keys) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn parse_string_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        _ => None,
+    }
+}
+
+fn parse_u32_value(value: &serde_json::Value) -> Option<u32> {
+    extract_context_size_from_value(value)
+}
+
+fn parse_bool_value(value: &serde_json::Value) -> Option<bool> {
+    match value {
+        serde_json::Value::Bool(value) => Some(*value),
+        serde_json::Value::String(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Some(true),
+            "false" | "0" | "no" | "off" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn parse_string_array(value: &serde_json::Value) -> Option<Vec<String>> {
+    match value {
+        serde_json::Value::Array(items) => {
+            let parsed = items
+                .iter()
+                .filter_map(parse_string_value)
+                .collect::<Vec<_>>();
+            (!parsed.is_empty()).then_some(parsed)
+        }
+        serde_json::Value::String(text) => {
+            let parsed = text
+                .split(|ch| ch == ',' || ch == '\n')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            (!parsed.is_empty()).then_some(parsed)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn extract_runtime_load_overrides(
+    options: Option<&serde_json::Value>,
+    extra: &HashMap<String, serde_json::Value>,
+) -> RuntimeLoadOverrides {
+    let lookup = |keys: &[&str]| {
+        options
+            .and_then(|value| find_named_value_in_value(value, keys))
+            .or_else(|| find_named_value_in_hash_map(extra, keys))
+    };
+
+    RuntimeLoadOverrides {
+        hf_repo: lookup(HF_REPO_KEYS).as_ref().and_then(parse_string_value),
+        hf_file: lookup(HF_FILE_KEYS).as_ref().and_then(parse_string_value),
+        fit_mode: lookup(FIT_MODE_KEYS).as_ref().and_then(parse_string_value),
+        cache_ram_mb: lookup(CACHE_RAM_KEYS).as_ref().and_then(parse_u32_value),
+        ctxcp: lookup(CTXCP_KEYS).as_ref().and_then(parse_u32_value),
+        use_jinja: lookup(JINJA_KEYS).as_ref().and_then(parse_bool_value),
+        reasoning_mode: lookup(REASONING_MODE_KEYS)
+            .as_ref()
+            .and_then(parse_string_value),
+        template_mode: lookup(TEMPLATE_MODE_KEYS)
+            .as_ref()
+            .and_then(parse_string_value),
+        template_name: lookup(TEMPLATE_NAME_KEYS)
+            .as_ref()
+            .and_then(parse_string_value),
+        custom_template_path: lookup(CUSTOM_TEMPLATE_PATH_KEYS)
+            .as_ref()
+            .and_then(parse_string_value),
+        chat_template_kwargs_json: lookup(TEMPLATE_KWARGS_KEYS).map(|value| {
+            if let Some(text) = parse_string_value(&value) {
+                text
+            } else {
+                value.to_string()
+            }
+        }),
+        extra_args: lookup(EXTRA_ARGS_KEYS)
+            .as_ref()
+            .and_then(parse_string_array),
+    }
+}
+
+fn has_runtime_load_overrides(overrides: &RuntimeLoadOverrides) -> bool {
+    overrides.hf_repo.is_some()
+        || overrides.hf_file.is_some()
+        || overrides.fit_mode.is_some()
+        || overrides.cache_ram_mb.is_some()
+        || overrides.ctxcp.is_some()
+        || overrides.use_jinja.is_some()
+        || overrides.reasoning_mode.is_some()
+        || overrides.template_mode.is_some()
+        || overrides.template_name.is_some()
+        || overrides.custom_template_path.is_some()
+        || overrides.chat_template_kwargs_json.is_some()
+        || overrides
+            .extra_args
+            .as_ref()
+            .map(|value| !value.is_empty())
+            .unwrap_or(false)
+}
+
 pub(crate) fn extract_context_size_from_value(value: &serde_json::Value) -> Option<u32> {
     match value {
         serde_json::Value::Number(number) => number
@@ -206,9 +381,7 @@ pub(crate) fn extract_context_size_from_value(value: &serde_json::Value) -> Opti
             .filter(|value| *value > 0),
         serde_json::Value::String(text) => parse_context_size_string(text),
         serde_json::Value::Object(map) => extract_context_size_from_json_map(map),
-        serde_json::Value::Array(values) => values
-            .iter()
-            .find_map(extract_context_size_from_value),
+        serde_json::Value::Array(values) => values.iter().find_map(extract_context_size_from_value),
         _ => None,
     }
 }
@@ -274,9 +447,15 @@ pub enum ApiMessageContent {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ApiContentPart {
-    Text { text: String },
-    InputText { text: String },
-    ImageUrl { image_url: ApiImageUrl },
+    Text {
+        text: String,
+    },
+    InputText {
+        text: String,
+    },
+    ImageUrl {
+        image_url: ApiImageUrl,
+    },
     InputImage {
         #[serde(default)]
         image_url: Option<ApiImageUrl>,
@@ -428,30 +607,41 @@ async fn swap_model_for_api(
     state: &SharedState,
     model_name: &str,
     context_size: Option<u32>,
+    overrides: RuntimeLoadOverrides,
 ) -> Result<(), String> {
-    crate::commands::model::backend_load_model(state.clone(), model_name.to_string(), context_size)
-        .await
-        .map(|_| ())
+    crate::commands::model::backend_load_model_with_overrides(
+        state.clone(),
+        model_name.to_string(),
+        context_size,
+        overrides,
+    )
+    .await
+    .map(|_| ())
 }
 
 pub(crate) async fn resolve_loaded_model(
     state: &SharedState,
     requested_model: &str,
     requested_context_size: Option<u32>,
+    requested_overrides: RuntimeLoadOverrides,
 ) -> Result<String, ApiErrorResponse> {
+    let has_overrides = has_runtime_load_overrides(&requested_overrides);
     let (target_model, needs_swap) = {
         let s = state.read().await;
         let target_model = if requested_model.trim().is_empty() {
-            s.loaded_model.clone().ok_or_else(ApiErrorResponse::no_model)?
+            s.loaded_model
+                .clone()
+                .ok_or_else(ApiErrorResponse::no_model)?
         } else {
             requested_model.trim().to_string()
         };
 
-        // Only reload if the model NAME mismatches. Never reload just because
-        // the request includes a different context size — that would cause a
-        // full multi-minute reload on every call (LM Studio never does this).
         let needs_swap = match &s.loaded_model {
-            Some(loaded) => !loaded_model_matches_request(loaded, &target_model),
+            Some(loaded) => {
+                !loaded_model_matches_request(loaded, &target_model)
+                    || requested_context_size.is_some()
+                    || has_overrides
+            }
             None => true,
         };
 
@@ -459,7 +649,14 @@ pub(crate) async fn resolve_loaded_model(
     };
 
     if needs_swap {
-        swap_model_for_api(state, &target_model, requested_context_size).await.map_err(|e| {
+        swap_model_for_api(
+            state,
+            &target_model,
+            requested_context_size,
+            requested_overrides,
+        )
+        .await
+        .map_err(|e| {
             ApiErrorResponse::service_unavailable(format!(
                 "Could not load model '{target_model}': {e}"
             ))
@@ -467,7 +664,9 @@ pub(crate) async fn resolve_loaded_model(
     }
 
     let s = state.read().await;
-    s.loaded_model.clone().ok_or_else(ApiErrorResponse::no_model)
+    s.loaded_model
+        .clone()
+        .ok_or_else(ApiErrorResponse::no_model)
 }
 
 async fn normalize_image_payload(value: &str) -> Result<String, ApiErrorResponse> {
@@ -526,7 +725,10 @@ pub(crate) async fn normalize_api_messages(
                             let image_id = next_image_id;
                             next_image_id += 1;
                             content_parts.push(format!("[img-{image_id}]"));
-                            image_data.push(ImageData { data: raw, id: image_id });
+                            image_data.push(ImageData {
+                                data: raw,
+                                id: image_id,
+                            });
                         }
                     }
                 }
@@ -549,8 +751,8 @@ pub(crate) async fn normalize_api_messages(
 
         if let Some(tool_calls) = &message.tool_calls {
             if !tool_calls.is_empty() {
-                let serialized = serde_json::to_string_pretty(tool_calls)
-                    .unwrap_or_else(|_| "[]".to_string());
+                let serialized =
+                    serde_json::to_string_pretty(tool_calls).unwrap_or_else(|_| "[]".to_string());
                 content_parts.push(format!("[tool_calls]\n{serialized}"));
             }
         }
@@ -566,6 +768,7 @@ pub(crate) async fn normalize_api_messages(
 
 fn prepend_tool_schema_message(
     messages: &mut Vec<crate::templates::engine::ChatMessage>,
+    profile: &ModelProfile,
     tools: Option<&Vec<serde_json::Value>>,
 ) {
     let Some(tools) = tools.filter(|tools| !tools.is_empty()) else {
@@ -573,12 +776,17 @@ fn prepend_tool_schema_message(
     };
 
     let serialized = serde_json::to_string_pretty(tools).unwrap_or_else(|_| "[]".to_string());
+    let no_think_guidance = if profile.disable_thinking_for_tools {
+        "\n\nWhen deciding whether to call a tool, do not emit <think> blocks. Either produce a tool call directly or answer normally."
+    } else {
+        ""
+    };
     messages.insert(
         0,
         crate::templates::engine::ChatMessage {
             role: "system".to_string(),
             content: format!(
-                "Available tools (OpenAI-style schema):\n{serialized}\n\nIf a tool is needed, reply using the tool-calling format appropriate for your model family."
+                "Available tools (OpenAI-style schema):\n{serialized}\n\nIf a tool is needed, reply using the tool-calling format appropriate for your model family.{no_think_guidance}"
             ),
         },
     );
@@ -592,8 +800,14 @@ pub(crate) async fn build_chat_request(
     let requested_top_p = req.requested_top_p();
     let requested_top_k = req.requested_top_k();
     let (mut messages, image_data) = normalize_api_messages(&req.messages).await?;
-    prepend_tool_schema_message(&mut messages, req.tools.as_ref());
-    prepend_reasoning_guidance_message(&mut messages, profile, req.reasoning.as_ref(), req.reasoning_effort.as_deref(), req.reasoning_tokens);
+    prepend_tool_schema_message(&mut messages, profile, req.tools.as_ref());
+    prepend_reasoning_guidance_message(
+        &mut messages,
+        profile,
+        req.reasoning.as_ref(),
+        req.reasoning_effort.as_deref(),
+        req.reasoning_tokens,
+    );
 
     let mut stop = profile.stop_markers.clone();
     if let Some(user_stop) = req.stop {
@@ -611,8 +825,12 @@ pub(crate) async fn build_chat_request(
             .temperature
             .or(profile.default_temperature)
             .or(*server_defaults.0),
-        top_p: requested_top_p.or(profile.default_top_p).or(*server_defaults.1),
-        top_k: requested_top_k.or(profile.default_top_k).or(*server_defaults.2),
+        top_p: requested_top_p
+            .or(profile.default_top_p)
+            .or(*server_defaults.1),
+        top_k: requested_top_k
+            .or(profile.default_top_k)
+            .or(*server_defaults.2),
         min_p: req.min_p.or(profile.default_min_p),
         presence_penalty: req.presence_penalty.or(profile.default_presence_penalty),
         frequency_penalty: req.frequency_penalty,
@@ -684,12 +902,17 @@ fn prepend_reasoning_guidance_message(
     reasoning_effort: Option<&str>,
     reasoning_tokens: Option<u32>,
 ) {
-    let supports_reasoning = !matches!(profile.think_tag_style, crate::models::profiles::ThinkTagStyle::None);
+    let supports_reasoning = !matches!(
+        profile.think_tag_style,
+        crate::models::profiles::ThinkTagStyle::None
+    );
     let requested_effort = reasoning
         .and_then(|cfg| cfg.effort.as_deref())
         .or(reasoning_effort)
         .map(|value| value.trim().to_ascii_lowercase());
-    let requested_reasoning_tokens = reasoning.and_then(|cfg| cfg.max_tokens).or(reasoning_tokens);
+    let requested_reasoning_tokens = reasoning
+        .and_then(|cfg| cfg.max_tokens)
+        .or(reasoning_tokens);
 
     if !supports_reasoning && requested_effort.is_none() && requested_reasoning_tokens.is_none() {
         return;
@@ -697,10 +920,15 @@ fn prepend_reasoning_guidance_message(
 
     let mut guidance = Vec::new();
     match requested_effort.as_deref() {
-        Some("none") => guidance.push("Respond directly without emitting <think> blocks.".to_string()),
+        Some("none") => {
+            guidance.push("Respond directly without emitting <think> blocks.".to_string())
+        }
         Some("low") => guidance.push("Keep reasoning brief and concise.".to_string()),
-        Some("high") => guidance.push("Use thorough step-by-step reasoning before the final answer.".to_string()),
-        Some("xhigh") => guidance.push("Use very detailed reasoning before the final answer.".to_string()),
+        Some("high") => guidance
+            .push("Use thorough step-by-step reasoning before the final answer.".to_string()),
+        Some("xhigh") => {
+            guidance.push("Use very detailed reasoning before the final answer.".to_string())
+        }
         Some("medium") => {}
         Some(other) => guidance.push(format!("Reasoning effort requested: {other}.")),
         None => {}
@@ -741,8 +969,19 @@ fn build_usage(
 
 pub async fn chat_completions(
     State(state): State<SharedState>,
-    Json(req): Json<ChatCompletionRequest>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ApiErrorResponse> {
+    if let Some(upstream) = crate::api::upstream::active_openai_provider(&state).await {
+        return crate::api::upstream::proxy_json_to_openai_provider(
+            upstream,
+            "/chat/completions",
+            body,
+        )
+        .await;
+    }
+
+    let req: ChatCompletionRequest = serde_json::from_value(body)
+        .map_err(|error| ApiErrorResponse::bad_request(error.to_string()))?;
     let include_usage_details = req
         .stream_options
         .as_ref()
@@ -750,7 +989,14 @@ pub async fn chat_completions(
         .unwrap_or(true);
     let requested_context_size = req.requested_context_size();
     let requested_model = req.model.clone().unwrap_or_default();
-    let model_name = resolve_loaded_model(&state, &requested_model, requested_context_size).await?;
+    let requested_overrides = extract_runtime_load_overrides(req.options.as_ref(), &req.extra);
+    let model_name = resolve_loaded_model(
+        &state,
+        &requested_model,
+        requested_context_size,
+        requested_overrides,
+    )
+    .await?;
     let profile = crate::models::overrides::detect_effective_profile(&model_name);
 
     let (server_defaults, scheduler, llama_port) = {
@@ -779,8 +1025,13 @@ pub async fn chat_completions(
     )
     .await?;
 
-    ensure_runtime_vision_ready(&state, &model_name, &profile, !request.image_data.is_empty())
-        .await?;
+    ensure_runtime_vision_ready(
+        &state,
+        &model_name,
+        &profile,
+        !request.image_data.is_empty(),
+    )
+    .await?;
     {
         let mut s = state.write().await;
         s.last_prompt = Some(request.prompt.clone());
@@ -1008,6 +1259,48 @@ async fn stream_chat_completion(
                     });
                     drop(s);
 
+                    let (stream_tool_calls, _) =
+                        crate::normalize::tool_extract::extract_tool_calls_for_profile(
+                            &stripped,
+                            &profile,
+                        );
+                    let api_stream_tool_calls: Vec<serde_json::Value> = stream_tool_calls
+                        .iter()
+                        .enumerate()
+                        .map(|(i, tc)| {
+                            serde_json::json!({
+                                "index": i,
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": serde_json::to_string(&tc.arguments)
+                                        .unwrap_or_default()
+                                }
+                            })
+                        })
+                        .collect();
+                    if !api_stream_tool_calls.is_empty() {
+                        let tool_calls_chunk = serde_json::json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": { "tool_calls": api_stream_tool_calls },
+                                "finish_reason": serde_json::Value::Null
+                            }]
+                        });
+                        yield Ok::<Event, std::convert::Infallible>(
+                            Event::default().data(tool_calls_chunk.to_string()),
+                        );
+                    }
+                    let finish_reason = if api_stream_tool_calls.is_empty() {
+                        "stop"
+                    } else {
+                        "tool_calls"
+                    };
                     let final_chunk = serde_json::json!({
                         "id": id,
                         "object": "chat.completion.chunk",
@@ -1016,7 +1309,7 @@ async fn stream_chat_completion(
                         "choices": [{
                             "index": 0,
                             "delta": {},
-                            "finish_reason": "stop"
+                            "finish_reason": finish_reason
                         }],
                         "usage": build_usage(
                             tokens_evaluated,
@@ -1088,6 +1381,23 @@ pub struct TextCompletionRequest {
     pub top: Option<TopParam>,
     pub seed: Option<i64>,
     pub stop: Option<StopParam>,
+    #[serde(default)]
+    pub options: Option<serde_json::Value>,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl TextCompletionRequest {
+    fn requested_context_size(&self) -> Option<u32> {
+        self.context_size
+            .filter(|value| *value > 0)
+            .or_else(|| {
+                self.options
+                    .as_ref()
+                    .and_then(extract_context_size_from_value)
+            })
+            .or_else(|| extract_context_size_from_hash_map(&self.extra))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1109,12 +1419,25 @@ pub struct TextChoice {
 
 pub async fn text_completions(
     State(state): State<SharedState>,
-    Json(req): Json<TextCompletionRequest>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ApiErrorResponse> {
-    let requested_context_size = req.context_size.filter(|value| *value > 0);
+    if let Some(upstream) = crate::api::upstream::active_openai_provider(&state).await {
+        return crate::api::upstream::proxy_json_to_openai_provider(upstream, "/completions", body)
+            .await;
+    }
+
+    let req: TextCompletionRequest = serde_json::from_value(body)
+        .map_err(|error| ApiErrorResponse::bad_request(error.to_string()))?;
+    let requested_context_size = req.requested_context_size();
     let requested_model = req.model.clone().unwrap_or_default();
-    let model_name =
-        resolve_loaded_model(&state, &requested_model, requested_context_size).await?;
+    let requested_overrides = extract_runtime_load_overrides(req.options.as_ref(), &req.extra);
+    let model_name = resolve_loaded_model(
+        &state,
+        &requested_model,
+        requested_context_size,
+        requested_overrides,
+    )
+    .await?;
     let profile = crate::models::overrides::detect_effective_profile(&model_name);
 
     let prompt = req.prompt.unwrap_or_default();
@@ -1214,7 +1537,9 @@ pub async fn text_completions(
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_api_messages, ApiMessage, ChatCompletionRequest, loaded_model_matches_request};
+    use super::{
+        loaded_model_matches_request, normalize_api_messages, ApiMessage, ChatCompletionRequest,
+    };
 
     #[test]
     fn deserializes_string_message_content() {
@@ -1259,13 +1584,15 @@ mod tests {
     async fn normalizes_data_url_images() {
         let messages = vec![ApiMessage {
             role: "user".to_string(),
-            content: Some(serde_json::from_str(
-                r#"[
+            content: Some(
+                serde_json::from_str(
+                    r#"[
                     { "type": "text", "text": "what is in this image?" },
                     { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }
                 ]"#,
-            )
-            .expect("content should deserialize")),
+                )
+                .expect("content should deserialize"),
+            ),
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -1326,10 +1653,19 @@ mod tests {
         .expect("request should deserialize");
 
         assert_eq!(
-            request.reasoning.as_ref().and_then(|value| value.effort.as_deref()),
+            request
+                .reasoning
+                .as_ref()
+                .and_then(|value| value.effort.as_deref()),
             Some("high")
         );
-        assert_eq!(request.reasoning.as_ref().and_then(|value| value.max_tokens), Some(256));
+        assert_eq!(
+            request
+                .reasoning
+                .as_ref()
+                .and_then(|value| value.max_tokens),
+            Some(256)
+        );
     }
 
     #[test]

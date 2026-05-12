@@ -53,6 +53,11 @@ pub async fn test_model(
         let mut state = shared_state.write().await;
         let config = LaunchConfig {
             model_path: model_path.clone(),
+            hf_repo: None,
+            hf_file: model
+                .hf_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.file.clone()),
             context_size: Some(context_size),
             gpu_layers: state.config.process.gpu_layers,
             threads: state.config.process.threads,
@@ -69,6 +74,19 @@ pub async fn test_model(
             main_gpu: state.config.process.main_gpu,
             defrag_thold: state.config.process.defrag_thold,
             rope_freq_scale: state.config.process.rope_freq_scale,
+            fit_mode: Some(state.config.process.fit_mode.clone())
+                .filter(|value| !value.trim().is_empty()),
+            cache_ram_mb: state.config.process.cache_ram_mb,
+            ctxcp: state.config.process.ctxcp,
+            use_jinja: state.config.process.use_jinja,
+            reasoning_mode: Some(state.config.process.reasoning_mode.clone())
+                .filter(|value| !value.trim().is_empty()),
+            template_mode: state.config.process.template_mode.clone(),
+            template_source: None,
+            template_file: None,
+            template_name: state.config.process.template_name.clone(),
+            chat_template_kwargs_json: state.config.process.chat_template_kwargs_json.clone(),
+            extra_args: state.config.process.extra_args.clone(),
         };
         state.process.launch(config).await?;
         state.loaded_model = Some(model.filename.clone());
@@ -116,9 +134,14 @@ pub async fn test_model(
         (Some(prompt_tokens), Some(completion_tokens)) => Some(prompt_tokens + completion_tokens),
         _ => None,
     };
-    let prompt_tokens_per_second = resp.timings.as_ref().and_then(|timings| timings.prompt_per_second);
-    let decode_tokens_per_second =
-        resp.timings.as_ref().and_then(|timings| timings.predicted_per_second);
+    let prompt_tokens_per_second = resp
+        .timings
+        .as_ref()
+        .and_then(|timings| timings.prompt_per_second);
+    let decode_tokens_per_second = resp
+        .timings
+        .as_ref()
+        .and_then(|timings| timings.predicted_per_second);
     let prefill_ms = match (prompt_tokens, prompt_tokens_per_second) {
         (Some(tokens), Some(tokens_per_second)) if tokens_per_second > 0.0 => {
             Some((tokens as f64 / tokens_per_second) * 1000.0)

@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::api::completions::{
-    ApiMessage, ChatCompletionRequest, StopParam, TopParam, build_chat_request, build_parse_trace,
-    end_to_end_tokens_per_second, ensure_runtime_vision_ready,
-    extract_context_size_from_hash_map, resolve_loaded_model,
+    build_chat_request, build_parse_trace, end_to_end_tokens_per_second,
+    ensure_runtime_vision_ready, extract_context_size_from_hash_map,
+    extract_runtime_load_overrides, resolve_loaded_model, ApiMessage, ChatCompletionRequest,
+    StopParam, TopParam,
 };
 use crate::api::errors::ApiErrorResponse;
 use crate::engine::client::LlamaClient;
@@ -15,7 +16,9 @@ use crate::engine::streaming::{self, StreamEvent};
 use crate::normalize::think_strip::{
     estimate_token_count, extract_reasoning_content_with_style, strip_think_tags_with_style,
 };
-use crate::state::{SharedState, begin_api_generation, finish_api_generation, summarize_reasoning_tokens};
+use crate::state::{
+    begin_api_generation, finish_api_generation, summarize_reasoning_tokens, SharedState,
+};
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
@@ -201,10 +204,12 @@ fn into_chat_request(request: ResponsesRequest) -> ChatCompletionRequest {
         tools: request.tools,
         context_size: requested_context_size,
         top: request.top,
-        reasoning: request.reasoning.map(|reasoning| crate::api::completions::ReasoningRequest {
-            effort: reasoning.effort,
-            max_tokens: reasoning.max_tokens,
-        }),
+        reasoning: request
+            .reasoning
+            .map(|reasoning| crate::api::completions::ReasoningRequest {
+                effort: reasoning.effort,
+                max_tokens: reasoning.max_tokens,
+            }),
         reasoning_effort: request.reasoning_effort,
         reasoning_tokens: request.reasoning_tokens,
         stream_options: None,
@@ -216,17 +221,23 @@ fn into_chat_request(request: ResponsesRequest) -> ChatCompletionRequest {
 fn build_response_output(visible_text: String, reasoning_text: String) -> Vec<serde_json::Value> {
     let mut content = Vec::new();
     if !reasoning_text.is_empty() {
-        content.push(serde_json::to_value(ResponsesOutputReasoning {
-            kind: "reasoning",
-            text: reasoning_text,
-        }).unwrap_or_default());
+        content.push(
+            serde_json::to_value(ResponsesOutputReasoning {
+                kind: "reasoning",
+                text: reasoning_text,
+            })
+            .unwrap_or_default(),
+        );
     }
     if !visible_text.is_empty() {
-        content.push(serde_json::to_value(ResponsesOutputText {
-            kind: "output_text",
-            text: visible_text,
-            annotations: Vec::new(),
-        }).unwrap_or_default());
+        content.push(
+            serde_json::to_value(ResponsesOutputText {
+                kind: "output_text",
+                text: visible_text,
+                annotations: Vec::new(),
+            })
+            .unwrap_or_default(),
+        );
     }
     content
 }
@@ -247,14 +258,28 @@ fn build_usage(
 
 pub async fn responses(
     State(state): State<SharedState>,
-    Json(req): Json<ResponsesRequest>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ApiErrorResponse> {
+    if let Some(upstream) = crate::api::upstream::active_openai_provider(&state).await {
+        return crate::api::upstream::proxy_json_to_openai_provider(upstream, "/responses", body)
+            .await;
+    }
+
+    let req: ResponsesRequest = serde_json::from_value(body)
+        .map_err(|error| ApiErrorResponse::bad_request(error.to_string()))?;
     let previous_response_id = req.previous_response_id.clone();
     let chat_request = into_chat_request(req);
     let requested_context_size = chat_request.requested_context_size();
     let requested_model = chat_request.model.clone().unwrap_or_default();
-    let model_name =
-        resolve_loaded_model(&state, &requested_model, requested_context_size).await?;
+    let requested_overrides =
+        extract_runtime_load_overrides(chat_request.options.as_ref(), &chat_request.extra);
+    let model_name = resolve_loaded_model(
+        &state,
+        &requested_model,
+        requested_context_size,
+        requested_overrides,
+    )
+    .await?;
     let profile = crate::models::overrides::detect_effective_profile(&model_name);
 
     let server_defaults = {
@@ -280,8 +305,13 @@ pub async fn responses(
     )
     .await?;
 
-    ensure_runtime_vision_ready(&state, &model_name, &profile, !request.image_data.is_empty())
-        .await?;
+    ensure_runtime_vision_ready(
+        &state,
+        &model_name,
+        &profile,
+        !request.image_data.is_empty(),
+    )
+    .await?;
 
     {
         let mut s = state.write().await;
@@ -426,7 +456,9 @@ pub async fn responses(
             }
         };
 
-        return Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response());
+        return Ok(Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response());
     }
 
     let response = client.complete(&request).await.map_err(|e| {
@@ -435,16 +467,23 @@ pub async fn responses(
     })?;
 
     let visible_text = strip_think_tags_with_style(&response.content, profile.think_tag_style);
-    let reasoning_text = extract_reasoning_content_with_style(&response.content, profile.think_tag_style);
+    let reasoning_text =
+        extract_reasoning_content_with_style(&response.content, profile.think_tag_style);
     let reasoning_tokens = summarize_reasoning_tokens(
-        response.tokens_predicted.or_else(|| Some(estimate_token_count(&response.content))),
+        response
+            .tokens_predicted
+            .or_else(|| Some(estimate_token_count(&response.content))),
         &visible_text,
         &reasoning_text,
     );
 
     {
         let mut s = state.write().await;
-        s.last_parse_trace = Some(build_parse_trace(&profile, &response.content, &visible_text));
+        s.last_parse_trace = Some(build_parse_trace(
+            &profile,
+            &response.content,
+            &visible_text,
+        ));
         s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
             source: "responses-api".to_string(),
             model: model_name.clone(),
@@ -459,8 +498,14 @@ pub async fn responses(
                 (Some(prompt), Some(completion)) => Some(prompt + completion),
                 _ => None,
             },
-            prompt_tokens_per_second: response.timings.as_ref().and_then(|timings| timings.prompt_per_second),
-            decode_tokens_per_second: response.timings.as_ref().and_then(|timings| timings.predicted_per_second),
+            prompt_tokens_per_second: response
+                .timings
+                .as_ref()
+                .and_then(|timings| timings.prompt_per_second),
+            decode_tokens_per_second: response
+                .timings
+                .as_ref()
+                .and_then(|timings| timings.predicted_per_second),
             end_to_end_tokens_per_second: end_to_end_tokens_per_second(
                 response.tokens_predicted,
                 generation_started.elapsed().as_millis() as u64,
@@ -489,5 +534,6 @@ pub async fn responses(
             reasoning_tokens,
         ),
         previous_response_id,
-    }).into_response())
+    })
+    .into_response())
 }

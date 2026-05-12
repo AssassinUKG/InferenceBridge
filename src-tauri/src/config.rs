@@ -9,6 +9,7 @@ pub struct AppConfig {
     pub server: ServerConfig,
     pub models: ModelsConfig,
     pub process: ProcessConfig,
+    pub providers: ProvidersConfig,
     pub ui: UiConfig,
 }
 
@@ -38,6 +39,23 @@ pub struct ServerConfig {
 pub struct ModelsConfig {
     /// Directories to scan for .gguf model files.
     pub scan_dirs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProvidersConfig {
+    /// Active runtime provider. Supported now: "managed_llamacpp", "lm_studio".
+    pub active: String,
+    pub lm_studio: ExternalProviderConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExternalProviderConfig {
+    pub enabled: bool,
+    /// OpenAI-compatible base URL, normally ending in /v1.
+    pub base_url: String,
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +93,26 @@ pub struct ProcessConfig {
     pub defrag_thold: f32,
     /// RoPE frequency scaling factor (--rope-freq-scale). 0 = auto.
     pub rope_freq_scale: f32,
+    /// Fit mode passed to llama-server (--fit). Empty = unset.
+    pub fit_mode: String,
+    /// Optional KV cache RAM in MiB (--cache-ram).
+    pub cache_ram_mb: Option<u32>,
+    /// Optional context copy checkpoints (-ctk/--ctxc? exposed here as ctxcp).
+    pub ctxcp: Option<u32>,
+    /// Enable llama.cpp Jinja template mode (--jinja).
+    pub use_jinja: bool,
+    /// Reasoning mode passed to llama-server (--reasoning). Empty = unset.
+    pub reasoning_mode: String,
+    /// Template selection mode: "builtin", "repo", or "custom".
+    pub template_mode: String,
+    /// Optional built-in chat template name when using bridge/builtin templates.
+    pub template_name: Option<String>,
+    /// Optional custom chat template file path.
+    pub custom_template_path: Option<String>,
+    /// Optional JSON object passed to --chat-template-kwargs.
+    pub chat_template_kwargs_json: Option<String>,
+    /// Extra raw llama-server args appended after curated settings.
+    pub extra_args: Vec<String>,
     /// Maximum time (seconds) to wait for a model to load. Default 300 (5 min).
     pub model_load_timeout_secs: u64,
     /// Maximum time (seconds) to wait for the first token during inference. Default 300.
@@ -97,6 +135,7 @@ impl Default for AppConfig {
             server: ServerConfig::default(),
             models: ModelsConfig::default(),
             process: ProcessConfig::default(),
+            providers: ProvidersConfig::default(),
             ui: UiConfig::default(),
         }
     }
@@ -120,8 +159,29 @@ impl Default for ServerConfig {
 
 impl Default for ModelsConfig {
     fn default() -> Self {
+        Self { scan_dirs: vec![] }
+    }
+}
+
+impl Default for ProvidersConfig {
+    fn default() -> Self {
         Self {
-            scan_dirs: vec![],
+            active: "managed_llamacpp".to_string(),
+            lm_studio: ExternalProviderConfig {
+                enabled: false,
+                base_url: "http://127.0.0.1:1234/v1".to_string(),
+                api_key: None,
+            },
+        }
+    }
+}
+
+impl Default for ExternalProviderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            api_key: None,
         }
     }
 }
@@ -145,6 +205,16 @@ impl Default for ProcessConfig {
             main_gpu: 0,
             defrag_thold: 0.1,
             rope_freq_scale: 0.0,
+            fit_mode: String::new(),
+            cache_ram_mb: None,
+            ctxcp: None,
+            use_jinja: false,
+            reasoning_mode: String::new(),
+            template_mode: "repo".to_string(),
+            template_name: None,
+            custom_template_path: None,
+            chat_template_kwargs_json: None,
+            extra_args: Vec::new(),
             model_load_timeout_secs: 300,
             first_token_timeout_secs: 300,
             inter_token_timeout_secs: 120,

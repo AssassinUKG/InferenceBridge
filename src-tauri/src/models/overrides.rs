@@ -8,6 +8,10 @@ use super::profiles::{ModelProfile, ParserType, RendererType, ThinkTagStyle, Too
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ModelProfileOverride {
     pub supports_vision: Option<bool>,
+    pub hf_repo_id: Option<String>,
+    pub hf_file: Option<String>,
+    pub hf_template_path: Option<String>,
+    pub hf_has_repo_template: Option<bool>,
     pub tool_call_format: Option<ToolCallFormat>,
     pub think_tag_style: Option<ThinkTagStyle>,
     pub interleaved_think_tool: Option<bool>,
@@ -32,6 +36,15 @@ pub struct ModelProfileOverride {
 pub struct ModelOverrideStore {
     #[serde(default)]
     pub models: HashMap<String, ModelProfileOverride>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HfModelMetadata {
+    pub repo_id: Option<String>,
+    pub file: Option<String>,
+    pub template_path: Option<String>,
+    pub has_repo_template: bool,
+    pub supports_vision: Option<bool>,
 }
 
 impl ModelProfileOverride {
@@ -162,6 +175,26 @@ pub fn effective_override(model_name: &str) -> Option<ModelProfileOverride> {
     load_overrides().matching_override(model_name).cloned()
 }
 
+pub fn effective_hf_metadata(model_name: &str) -> Option<HfModelMetadata> {
+    let override_entry = load_overrides().matching_override(model_name)?.clone();
+    if override_entry.hf_repo_id.is_none()
+        && override_entry.hf_file.is_none()
+        && override_entry.hf_template_path.is_none()
+        && override_entry.hf_has_repo_template.is_none()
+        && override_entry.supports_vision.is_none()
+    {
+        return None;
+    }
+
+    Some(HfModelMetadata {
+        repo_id: override_entry.hf_repo_id,
+        file: override_entry.hf_file,
+        template_path: override_entry.hf_template_path,
+        has_repo_template: override_entry.hf_has_repo_template.unwrap_or(false),
+        supports_vision: override_entry.supports_vision,
+    })
+}
+
 pub fn set_model_supports_vision_override(
     model_name: &str,
     supports_vision: bool,
@@ -174,5 +207,26 @@ pub fn set_model_supports_vision_override(
     let mut store = load_overrides();
     let entry = store.models.entry(normalized_name).or_default();
     entry.supports_vision = Some(supports_vision);
+    save_overrides(&store)
+}
+
+pub fn set_model_hf_metadata_override(
+    model_name: &str,
+    metadata: HfModelMetadata,
+) -> Result<(), String> {
+    let normalized_name = model_name.trim().to_lowercase();
+    if normalized_name.is_empty() {
+        return Err("Model name cannot be empty when saving overrides".to_string());
+    }
+
+    let mut store = load_overrides();
+    let entry = store.models.entry(normalized_name).or_default();
+    entry.hf_repo_id = metadata.repo_id;
+    entry.hf_file = metadata.file;
+    entry.hf_template_path = metadata.template_path;
+    entry.hf_has_repo_template = Some(metadata.has_repo_template);
+    if let Some(supports_vision) = metadata.supports_vision {
+        entry.supports_vision = Some(supports_vision);
+    }
     save_overrides(&store)
 }

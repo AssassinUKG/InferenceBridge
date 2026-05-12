@@ -6,10 +6,11 @@ import type {
   LogEntry,
   ModelInfo,
   ProcessStatusInfo,
+  RuntimeDoctorReport,
 } from "../../lib/types";
 import * as api from "../../lib/tauri";
 
-type DebugTab = "api" | "profile" | "launch" | "docs" | "logs" | "prompt" | "trace";
+type DebugTab = "api" | "doctor" | "profile" | "launch" | "docs" | "logs" | "prompt" | "trace";
 type Example = {
   label: string;
   method: string;
@@ -29,6 +30,7 @@ interface Props {
 
 const TABS: Array<{ key: DebugTab; label: string }> = [
   { key: "api", label: "API Editor" },
+  { key: "doctor", label: "Doctor" },
   { key: "profile", label: "Profile" },
   { key: "launch", label: "Launch" },
   { key: "docs", label: "Docs" },
@@ -246,6 +248,7 @@ function exampleList(activeModel: string | null, selectedModel: string | null): 
     { label: "Model Stats", method: "POST", path: "/v1/models/stats", body: JSON.stringify({ model: modelName }, null, 2), description: "Poll load progress and backend stats for one model." },
     { label: "Context", method: "GET", path: "/v1/context/status", description: "See KV usage, context pressure, and compaction state." },
     { label: "Runtime", method: "GET", path: "/v1/runtime/status", description: "Inspect backend, launch, startup, and slot status." },
+    { label: "Doctor", method: "GET", path: "/v1/runtime/doctor", description: "Probe managed llama.cpp, LM Studio, Ollama, and external local providers." },
     { label: "Profile", method: "GET", path: `/v1/debug/profile?model=${encodeURIComponent(modelName)}`, description: "Show the effective profile after detection and overrides." },
     { label: "Load Model", method: "POST", path: "/v1/models/load", body: JSON.stringify({ model: modelName }, null, 2), description: "Start loading a model in the background." },
     { label: "Unload", method: "POST", path: "/v1/models/unload", body: "{}", description: "Unload the active backend model." },
@@ -277,6 +280,7 @@ export function DebugInspector({
   const [parseTrace, setParseTrace] = useState("");
   const [launchPreview, setLaunchPreview] = useState("");
   const [effectiveProfile, setEffectiveProfile] = useState<EffectiveProfileInfo | null>(null);
+  const [runtimeDoctor, setRuntimeDoctor] = useState<RuntimeDoctorReport | null>(null);
   const [selectedProfileModel, setSelectedProfileModel] = useState("");
   const [autoRefreshLogs, setAutoRefreshLogs] = useState(true);
   const [tabError, setTabError] = useState<string | null>(null);
@@ -352,8 +356,19 @@ export function DebugInspector({
     }
   };
 
+  const refreshDoctor = async () => {
+    try {
+      setRuntimeDoctor(await api.getRuntimeDoctor());
+      setTabError(null);
+    } catch (error) {
+      setRuntimeDoctor(null);
+      setTabError(String(error));
+    }
+  };
+
   useEffect(() => {
     if (activeTab === "logs") refreshLogs();
+    if (activeTab === "doctor") refreshDoctor();
     if (activeTab === "prompt") refreshPrompt();
     if (activeTab === "trace") refreshTrace();
     if (activeTab === "launch") refreshLaunch();
@@ -701,6 +716,126 @@ export function DebugInspector({
                 )}
               </Panel>
             </div>
+          </div>
+        )}
+
+        {activeTab === "doctor" && (
+          <div className="grid gap-3 lg:grid-cols-[320px_minmax(0,1fr)]">
+            <Panel
+              title="Runtime Doctor"
+              description="Probe local provider endpoints and report what is actually reachable."
+              actions={<ActionButton label="Refresh Doctor" onClick={refreshDoctor} primary />}
+            >
+              <div className="grid gap-3 px-4 py-3">
+                <Metric
+                  label="Providers"
+                  value={
+                    runtimeDoctor
+                      ? `${runtimeDoctor.summary.reachable_providers}/${runtimeDoctor.summary.total_providers} reachable`
+                      : "Not checked"
+                  }
+                />
+                <Metric
+                  label="Public API"
+                  value={
+                    runtimeDoctor
+                      ? runtimeDoctor.app_api.reachable
+                        ? "Reachable"
+                        : runtimeDoctor.app_api.state
+                      : "Unknown"
+                  }
+                />
+                <Metric
+                  label="Active Runtime"
+                  value={
+                    runtimeDoctor?.active_runtime.model ??
+                    runtimeDoctor?.active_runtime.state ??
+                    "No runtime"
+                  }
+                />
+                <Metric
+                  label="Next Step"
+                  value={runtimeDoctor?.summary.preferred_next_step ?? "Run doctor to inspect provider state."}
+                />
+              </div>
+            </Panel>
+
+            <Panel title="Provider Probes" description="Managed llama.cpp, standalone llama.cpp, Ollama, and LM Studio probes.">
+              {!runtimeDoctor ? (
+                <div className="px-4 py-4 text-sm" style={{ color: "var(--text-1)" }}>
+                  Run doctor to probe local providers.
+                </div>
+              ) : (
+                <div>
+                  {runtimeDoctor.providers.map((provider, index) => (
+                    <div key={provider.id}>
+                      <div className="grid gap-3 px-4 py-3 xl:grid-cols-[minmax(0,1fr)_220px_220px]">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <StatusDot running={provider.reachable} error={!provider.reachable && provider.status !== "idle"} />
+                            <span className="text-sm font-semibold" style={{ color: "var(--text-0)" }}>
+                              {provider.name}
+                            </span>
+                            <span
+                              className="rounded px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.12em]"
+                              style={{
+                                background: provider.reachable ? "rgba(52,211,153,0.1)" : "rgba(107,114,128,0.12)",
+                                border: provider.reachable ? "1px solid rgba(52,211,153,0.22)" : "1px solid var(--border)",
+                                color: provider.reachable ? "#34d399" : "var(--text-2)",
+                              }}
+                            >
+                              {provider.status}
+                            </span>
+                          </div>
+                          <div className="mt-2 font-mono text-xs break-all" style={{ color: "var(--text-2)" }}>
+                            {provider.base_url}
+                          </div>
+                          {provider.error && (
+                            <div className="mt-2 text-xs" style={{ color: "#fca5a5" }}>
+                              {provider.error}
+                            </div>
+                          )}
+                          {provider.hints.length > 0 && (
+                            <div className="mt-2 space-y-1 text-xs" style={{ color: "var(--text-1)" }}>
+                              {provider.hints.map((hint) => (
+                                <div key={hint}>{hint}</div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2 text-xs">
+                          <Metric label="Models" value={provider.model_count.toString()} />
+                          <Metric label="Context" value={provider.context_limit ? provider.context_limit.toLocaleString() : "Unknown"} />
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-2 text-xs">
+                          <Metric label="Health" value={provider.endpoints.health ? "Yes" : "No"} />
+                          <Metric label="Models API" value={provider.endpoints.openai_models ? "Yes" : "No"} />
+                          <Metric label="Props" value={provider.endpoints.props ? "Yes" : "No"} />
+                          <Metric label="Slots" value={provider.endpoints.slots ? "Yes" : "No"} />
+                        </div>
+                      </div>
+                      {provider.models.length > 0 && (
+                        <>
+                          <Divider />
+                          <div className="px-4 py-3">
+                            <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
+                              Models
+                            </div>
+                            <CompactCode
+                              value={provider.models.slice(0, 12).map((model) => model.id).join("\n")}
+                              emptyLabel="No models reported."
+                            />
+                          </div>
+                        </>
+                      )}
+                      {index < runtimeDoctor.providers.length - 1 && <Divider />}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </Panel>
           </div>
         )}
 

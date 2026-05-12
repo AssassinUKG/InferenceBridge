@@ -88,6 +88,7 @@ If you set an API key in Settings, pass it as a Bearer token. If no API key is c
 | `POST` | `/v1/chat/completions` | OpenAI-style chat completions |
 | `POST` | `/v1/completions` | Text completions |
 | `GET` | `/v1/context/status` | Context and KV-cache status |
+| `GET` | `/v1/runtime/doctor` | Local provider preflight diagnostics |
 | `GET` | `/v1/sessions` | List saved chat sessions |
 | `POST` | `/v1/sessions` | Create a chat session |
 | `DELETE` | `/v1/sessions/{id}` | Delete a chat session |
@@ -192,6 +193,17 @@ For development:
 npm run tauri dev
 ```
 
+On Windows, you can also use the PowerShell helper:
+
+```powershell
+.\build.ps1 -Mode Dev
+.\build.ps1 -Mode Check
+.\build.ps1 -Mode Release
+```
+
+If dependencies are already installed, add `-SkipInstall`.
+Use `-CleanInstall` only when no dev server is running, because it uses `npm ci` and replaces `node_modules`.
+
 ## GitHub Actions
 
 This repo uses three GitHub Actions workflows:
@@ -231,6 +243,7 @@ That will run the `Release` workflow and create a draft release with platform in
 - [docs/03-implementation-plan.md](docs/03-implementation-plan.md)
 - [docs/04-debug-api-workspace.md](docs/04-debug-api-workspace.md)
 - [docs/05-inference-runtime-roadmap.md](docs/05-inference-runtime-roadmap.md)
+- [docs/08-local-provider-runtime-improvement-plan.md](docs/08-local-provider-runtime-improvement-plan.md)
 
 ## License
 

@@ -81,12 +81,16 @@ impl SessionDb {
                 .execute("ALTER TABLE messages ADD COLUMN image_base64 TEXT", [])?;
         }
         if !names.iter().any(|col| col == "tokens_evaluated") {
-            self.conn
-                .execute("ALTER TABLE messages ADD COLUMN tokens_evaluated INTEGER", [])?;
+            self.conn.execute(
+                "ALTER TABLE messages ADD COLUMN tokens_evaluated INTEGER",
+                [],
+            )?;
         }
         if !names.iter().any(|col| col == "tokens_predicted") {
-            self.conn
-                .execute("ALTER TABLE messages ADD COLUMN tokens_predicted INTEGER", [])?;
+            self.conn.execute(
+                "ALTER TABLE messages ADD COLUMN tokens_predicted INTEGER",
+                [],
+            )?;
         }
 
         Ok(())
@@ -184,7 +188,12 @@ impl SessionDb {
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub fn add_context_snapshot(&self, session_id: &str, snapshot: &str, kv_tokens: u32) -> Result<i64> {
+    pub fn add_context_snapshot(
+        &self,
+        session_id: &str,
+        snapshot: &str,
+        kv_tokens: u32,
+    ) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO context_snapshots (session_id, snapshot, kv_tokens) VALUES (?1, ?2, ?3)",
             rusqlite::params![session_id, snapshot, kv_tokens],

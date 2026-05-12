@@ -72,25 +72,23 @@ pub async fn debug_api_request(
             Ok(json) => json.into_response(),
             Err(status) => status.into_response(),
         }
+    } else if method == "GET" && path == "/v1/runtime/doctor" {
+        crate::api::extensions::runtime_doctor(AxumState(shared))
+            .await
+            .into_response()
     } else if method == "GET" && path.starts_with("/v1/debug/profile") {
         let query = path
             .split_once('?')
             .map(|(_, query)| query)
             .unwrap_or_default();
-        let model = query
-            .split('&')
-            .find_map(|pair| {
-                let (key, value) = pair.split_once('=')?;
-                if key == "model" {
-                    Some(
-                        percent_decode_str(value)
-                            .decode_utf8_lossy()
-                            .into_owned(),
-                    )
-                } else {
-                    None
-                }
-            });
+        let model = query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            if key == "model" {
+                Some(percent_decode_str(value).decode_utf8_lossy().into_owned())
+            } else {
+                None
+            }
+        });
         match crate::api::extensions::debug_profile(
             AxumState(shared),
             axum::extract::Query(crate::api::extensions::DebugProfileQuery { model }),
@@ -118,11 +116,10 @@ pub async fn debug_api_request(
             .into_response()
     } else if method == "POST" && path == "/v1/chat/completions" {
         let body = request.body.unwrap_or_else(|| "{}".to_string());
-        let mut parsed =
-            serde_json::from_str::<crate::api::completions::ChatCompletionRequest>(&body)
-                .map_err(|e| format!("Invalid JSON for /v1/chat/completions: {e}"))?;
-        if parsed.stream {
-            parsed.stream = false;
+        let mut parsed = serde_json::from_str::<serde_json::Value>(&body)
+            .map_err(|e| format!("Invalid JSON for /v1/chat/completions: {e}"))?;
+        if let Some(object) = parsed.as_object_mut() {
+            object.insert("stream".to_string(), serde_json::Value::Bool(false));
         }
         match crate::api::completions::chat_completions(AxumState(shared), axum::Json(parsed)).await
         {
@@ -131,11 +128,10 @@ pub async fn debug_api_request(
         }
     } else if method == "POST" && path == "/v1/responses" {
         let body = request.body.unwrap_or_else(|| "{}".to_string());
-        let mut parsed =
-            serde_json::from_str::<crate::api::responses::ResponsesRequest>(&body)
-                .map_err(|e| format!("Invalid JSON for /v1/responses: {e}"))?;
-        if parsed.stream {
-            parsed.stream = false;
+        let mut parsed = serde_json::from_str::<serde_json::Value>(&body)
+            .map_err(|e| format!("Invalid JSON for /v1/responses: {e}"))?;
+        if let Some(object) = parsed.as_object_mut() {
+            object.insert("stream".to_string(), serde_json::Value::Bool(false));
         }
         match crate::api::responses::responses(AxumState(shared), axum::Json(parsed)).await {
             Ok(response) => response,
@@ -218,4 +214,11 @@ pub async fn get_launch_preview(state: tauri::State<'_, SharedState>) -> Result<
         .clone()
         .ok_or_else(|| "No launch preview captured yet".to_string())?;
     serde_json::to_string_pretty(&preview).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_runtime_doctor(
+    state: tauri::State<'_, SharedState>,
+) -> Result<crate::providers::RuntimeDoctorReport, String> {
+    Ok(crate::providers::collect_runtime_doctor(state.inner().clone()).await)
 }

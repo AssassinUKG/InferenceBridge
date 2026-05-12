@@ -10,33 +10,6 @@ static QWEN_PARAM_RE: OnceLock<regex::Regex> = OnceLock::new();
 static SQUARE_BRACKET_RE: OnceLock<regex::Regex> = OnceLock::new();
 static PARENTHESIS_RE: OnceLock<regex::Regex> = OnceLock::new();
 
-fn qwen_function_re() -> &'static regex::Regex {
-    QWEN_FUNCTION_RE.get_or_init(|| {
-        regex::Regex::new(r"<function=([^>]+)>(.*?)</function>").expect("valid Qwen function regex")
-    })
-}
-
-fn qwen_param_re() -> &'static regex::Regex {
-    QWEN_PARAM_RE.get_or_init(|| {
-        regex::Regex::new(r"<parameter=([^>]+)>(.*?)</parameter>")
-            .expect("valid Qwen parameter regex")
-    })
-}
-
-fn square_bracket_re() -> &'static regex::Regex {
-    SQUARE_BRACKET_RE.get_or_init(|| {
-        regex::Regex::new(r"\[([a-zA-Z][a-zA-Z0-9_\-]*)\]\s*\{")
-            .expect("valid square bracket tool regex")
-    })
-}
-
-fn parenthesis_re() -> &'static regex::Regex {
-    PARENTHESIS_RE.get_or_init(|| {
-        regex::Regex::new(r"\[tool_call\]([a-zA-Z][a-zA-Z0-9_\-]*)\s*\(\s*(\{)")
-            .expect("valid parenthesis tool regex")
-    })
-}
-
 /// A parsed tool call.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -61,10 +34,7 @@ pub fn extract_tool_calls(text: &str) -> (Vec<ToolCall>, String) {
     (calls, remaining.trim().to_string())
 }
 
-pub fn extract_tool_calls_for_profile(
-    text: &str,
-    profile: &ModelProfile,
-) -> (Vec<ToolCall>, String) {
+pub fn extract_tool_calls_for_profile(text: &str, profile: &ModelProfile) -> (Vec<ToolCall>, String) {
     let mut calls = Vec::new();
     let mut remaining =
         crate::normalize::think_strip::strip_think_tags_with_style(text, profile.think_tag_style);
@@ -81,12 +51,12 @@ pub fn extract_tool_calls_for_profile(
             if calls.is_empty() {
                 if extract_square_bracket_tool_calls(&mut remaining, &mut calls) {
                     tracing::info!(
-                        "qwen safety-net: [tool_name]{{...}} format detected - \
+                        "qwen safety-net: [tool_name]{{...}} format detected — \
                         check chat template config on llama-server"
                     );
                 } else if extract_parenthesis_tool_calls(&mut remaining, &mut calls) {
                     tracing::info!(
-                        "qwen safety-net: [tool_call]name({{...}}) format detected - \
+                        "qwen safety-net: [tool_call]name({{...}}) format detected — \
                         check chat template config on llama-server"
                     );
                 }
@@ -138,16 +108,18 @@ fn extract_hermes_calls(text: &mut String, calls: &mut Vec<ToolCall>) {
 }
 
 fn extract_qwen_function_calls(text: &mut String, calls: &mut Vec<ToolCall>) {
-    let mut removals = Vec::new();
+    let re = regex::Regex::new(r"<function=([^>]+)>(.*?)</function>").unwrap();
+    let mut new_text = text.clone();
 
-    for cap in qwen_function_re().captures_iter(text) {
+    for cap in re.captures_iter(text) {
         let full_match = cap.get(0).unwrap();
         let outer_name = cap.get(1).unwrap().as_str().trim();
         let body = cap.get(2).unwrap().as_str();
 
         // Parse parameters from <parameter=key>value</parameter> pairs
+        let param_re = regex::Regex::new(r"<parameter=([^>]+)>(.*?)</parameter>").unwrap();
         let mut args = serde_json::Map::new();
-        for param_cap in qwen_param_re().captures_iter(body) {
+        for param_cap in param_re.captures_iter(body) {
             let key = param_cap.get(1).unwrap().as_str().trim();
             let raw_value = param_cap.get(2).unwrap().as_str();
             let trimmed = raw_value.trim();
@@ -170,16 +142,8 @@ fn extract_qwen_function_calls(text: &mut String, calls: &mut Vec<ToolCall>) {
             arguments,
             raw_text: Some(full_match.as_str().to_string()),
         });
-        removals.push((full_match.start(), full_match.end()));
-    }
 
-    if removals.is_empty() {
-        return;
-    }
-
-    let mut new_text = text.clone();
-    for (start, end) in removals.into_iter().rev() {
-        new_text.replace_range(start..end, "");
+        new_text = new_text.replace(full_match.as_str(), "");
     }
 
     *text = new_text;
@@ -224,12 +188,11 @@ fn balanced_json_object_len(text: &str) -> Option<usize> {
 /// falls back to square-bracket notation instead of `<function=...>` XML.
 /// Returns `true` if at least one call was extracted.
 fn extract_square_bracket_tool_calls(text: &mut String, calls: &mut Vec<ToolCall>) -> bool {
+    let re = regex::Regex::new(r"\[([a-zA-Z][a-zA-Z0-9_\-]*)\]\s*\{").unwrap();
     let mut found_any = false;
     loop {
         let (mat_start, name, brace_start) = {
-            let Some(cap) = square_bracket_re().captures(text) else {
-                break;
-            };
+            let Some(cap) = re.captures(text) else { break };
             let mat = cap.get(0).unwrap();
             let name = cap.get(1).unwrap().as_str().to_string();
             let mat_start = mat.start();
@@ -238,9 +201,7 @@ fn extract_square_bracket_tool_calls(text: &mut String, calls: &mut Vec<ToolCall
             (mat_start, name, brace_start)
         };
         let json_slice = &text[brace_start..];
-        let Some(json_len) = balanced_json_object_len(json_slice) else {
-            break;
-        };
+        let Some(json_len) = balanced_json_object_len(json_slice) else { break };
         let body_end = brace_start + json_len;
         let json_str = &text[brace_start..body_end];
         if let Some(args) = super::json_repair::repair_json(json_str) {
@@ -267,23 +228,20 @@ fn extract_square_bracket_tool_calls(text: &mut String, calls: &mut Vec<ToolCall
 /// Returns `true` if at least one call was extracted.
 fn extract_parenthesis_tool_calls(text: &mut String, calls: &mut Vec<ToolCall>) -> bool {
     // Matches: [tool_call]name( where name is an identifier and ( opens the arg list
+    let re = regex::Regex::new(r"\[tool_call\]([a-zA-Z][a-zA-Z0-9_\-]*)\s*\(\s*(\{)").unwrap();
     let mut found_any = false;
     loop {
         let (mat_start, name, brace_start) = {
-            let Some(cap) = parenthesis_re().captures(text) else {
-                break;
-            };
+            let Some(cap) = re.captures(text) else { break };
             let mat = cap.get(0).unwrap();
             let name = cap.get(1).unwrap().as_str().to_string();
             let mat_start = mat.start();
-            // cap group 2 is the `{` - brace_start is its byte offset
+            // cap group 2 is the `{` — brace_start is its byte offset
             let brace_start = cap.get(2).unwrap().start();
             (mat_start, name, brace_start)
         };
         let json_slice = &text[brace_start..];
-        let Some(json_len) = balanced_json_object_len(json_slice) else {
-            break;
-        };
+        let Some(json_len) = balanced_json_object_len(json_slice) else { break };
         let body_end = brace_start + json_len;
         // Consume the closing `)` that wraps the JSON if present
         let call_end = {
@@ -337,7 +295,8 @@ fn unwrap_meta_tool_call(
                 let looks_like_json = (trimmed.starts_with('{') && trimmed.ends_with('}'))
                     || (trimmed.starts_with('[') && trimmed.ends_with(']'));
                 if looks_like_json {
-                    serde_json::from_str(trimmed).unwrap_or_else(|_| serde_json::Value::String(raw))
+                    serde_json::from_str(trimmed)
+                        .unwrap_or_else(|_| serde_json::Value::String(raw))
                 } else {
                     serde_json::Value::String(raw)
                 }
@@ -353,9 +312,7 @@ fn unwrap_meta_tool_call(
 
 #[cfg(test)]
 mod tests {
-    use crate::models::profiles::{
-        ModelFamily, ModelProfile, ParserType, RendererType, ThinkTagStyle, ToolCallFormat,
-    };
+    use crate::models::profiles::{ModelFamily, ModelProfile, ParserType, RendererType, ThinkTagStyle, ToolCallFormat};
 
     use super::{extract_tool_calls, extract_tool_calls_for_profile};
 
@@ -404,21 +361,12 @@ mod tests {
 
     #[test]
     fn qwen_xml_preserves_parameter_whitespace() {
-        let text =
-            "<function=echo><parameter=text>  keep surrounding spaces  </parameter></function>";
+        let text = "<function=echo><parameter=text>  keep surrounding spaces  </parameter></function>";
         let (calls, _) = extract_tool_calls_for_profile(text, &qwen_profile());
         assert_eq!(
             calls[0].arguments["text"],
             serde_json::Value::String("  keep surrounding spaces  ".to_string())
         );
-    }
-
-    #[test]
-    fn qwen_xml_removes_only_each_matched_block_once() {
-        let text = "<function=alpha><parameter=x>1</parameter></function>\nkeep\n<function=alpha><parameter=x>1</parameter></function>";
-        let (calls, remaining) = extract_tool_calls_for_profile(text, &qwen_profile());
-        assert_eq!(calls.len(), 2);
-        assert_eq!(remaining, "keep");
     }
 
     #[test]
@@ -507,10 +455,12 @@ mod tests {
 
     #[test]
     fn qwen_xml_takes_priority_over_parenthesis() {
-        // XML wins - parenthesis safety net should not fire when XML is present
+        // XML wins — parenthesis safety net should not fire when XML is present
         let text = "<function=get_weather><parameter=city>London</parameter></function>";
         let (calls, _) = extract_tool_calls_for_profile(text, &qwen_profile());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "get_weather");
     }
 }
+
+

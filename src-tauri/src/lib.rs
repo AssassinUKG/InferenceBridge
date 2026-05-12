@@ -6,6 +6,7 @@ pub mod engine;
 pub mod logging;
 pub mod models;
 pub mod normalize;
+pub mod providers;
 pub mod session;
 pub mod state;
 pub mod templates;
@@ -177,6 +178,7 @@ pub fn run() {
             commands::model::swap_model,
             commands::model::get_process_status,
             commands::model::get_effective_profile,
+            commands::model::set_model_vision_override,
             commands::model::reload_last_known_good,
             commands::model::check_llama_server,
             commands::model::update_llama_server,
@@ -194,6 +196,7 @@ pub fn run() {
             commands::debug::get_raw_prompt,
             commands::debug::get_parse_trace,
             commands::debug::get_launch_preview,
+            commands::debug::get_runtime_doctor,
             commands::debug::get_logs,
             commands::debug::clear_logs,
             commands::debug::debug_api_request,
@@ -531,6 +534,11 @@ async fn headless_load_model(state: &state::SharedState, model_name: &str, ctx_s
 
         LaunchConfig {
             model_path: model.path.clone(),
+            hf_repo: None,
+            hf_file: model
+                .hf_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.file.clone()),
             context_size: ctx,
             gpu_layers: s.config.process.gpu_layers,
             threads: s.config.process.threads,
@@ -547,6 +555,19 @@ async fn headless_load_model(state: &state::SharedState, model_name: &str, ctx_s
             main_gpu: s.config.process.main_gpu,
             defrag_thold: s.config.process.defrag_thold,
             rope_freq_scale: s.config.process.rope_freq_scale,
+            fit_mode: Some(s.config.process.fit_mode.clone())
+                .filter(|value| !value.trim().is_empty()),
+            cache_ram_mb: s.config.process.cache_ram_mb,
+            ctxcp: s.config.process.ctxcp,
+            use_jinja: s.config.process.use_jinja,
+            reasoning_mode: Some(s.config.process.reasoning_mode.clone())
+                .filter(|value| !value.trim().is_empty()),
+            template_mode: s.config.process.template_mode.clone(),
+            template_source: None,
+            template_file: None,
+            template_name: s.config.process.template_name.clone(),
+            chat_template_kwargs_json: s.config.process.chat_template_kwargs_json.clone(),
+            extra_args: s.config.process.extra_args.clone(),
         }
     };
 
@@ -1139,15 +1160,24 @@ pub fn run_model_test_cli(
                     println!("Response: {}", stats.response);
                     println!(
                         "Prompt tokens: {}",
-                        stats.prompt_tokens.map(|value| value.to_string()).unwrap_or_else(|| "Unknown".to_string())
+                        stats
+                            .prompt_tokens
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "Unknown".to_string())
                     );
                     println!(
                         "Completion tokens: {}",
-                        stats.completion_tokens.map(|value| value.to_string()).unwrap_or_else(|| "Unknown".to_string())
+                        stats
+                            .completion_tokens
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "Unknown".to_string())
                     );
                     println!(
                         "Total tokens: {}",
-                        stats.total_tokens.map(|value| value.to_string()).unwrap_or_else(|| "Unknown".to_string())
+                        stats
+                            .total_tokens
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "Unknown".to_string())
                     );
                     if let Some(prompt_tps) = stats.prompt_tokens_per_second {
                         println!("Prompt tokens/sec: {:.2}", prompt_tps);

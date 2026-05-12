@@ -9,8 +9,7 @@ use tauri::Emitter;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
-use crate::state::SharedState;
-
+use crate::{models::overrides::HfModelMetadata, state::SharedState};
 
 // Shared model browser types used by the UI and HF search results.
 
@@ -203,7 +202,11 @@ fn hf_api_to_hub(m: HfApiModel) -> Option<HubModel> {
         name,
         family: owner.to_string(),
         params: String::new(),
-        description: format!("{} downloads | {}", format_downloads(m.downloads), m.model_id),
+        description: format!(
+            "{} downloads | {}",
+            format_downloads(m.downloads),
+            m.model_id
+        ),
         tags,
         supports_vision,
         quants,
@@ -302,7 +305,7 @@ fn build_hf_sync_queries(filename: &str) -> Vec<String> {
     queries
 }
 
-async fn lookup_hf_supports_vision(filename: &str) -> Result<Option<bool>, String> {
+async fn lookup_hf_metadata(filename: &str) -> Result<Option<HfModelMetadata>, String> {
     let target = filename.to_lowercase();
     for query in build_hf_sync_queries(filename) {
         let models = search_hf_api_models(Some(&query), 0, 20).await?;
@@ -317,7 +320,13 @@ async fn lookup_hf_supports_vision(filename: &str) -> Result<Option<bool>, Strin
             });
 
             if has_exact_sibling {
-                return Ok(Some(hf_supports_vision(&model)));
+                return Ok(Some(HfModelMetadata {
+                    repo_id: Some(model.model_id.clone()),
+                    file: Some(filename.to_string()),
+                    template_path: Some("chat_template.jinja".to_string()),
+                    has_repo_template: true,
+                    supports_vision: Some(hf_supports_vision(&model)),
+                }));
             }
         }
     }
@@ -488,9 +497,7 @@ pub async fn cancel_download(
 }
 
 #[tauri::command]
-pub async fn clear_completed_downloads(
-    state: tauri::State<'_, SharedState>,
-) -> Result<(), String> {
+pub async fn clear_completed_downloads(state: tauri::State<'_, SharedState>) -> Result<(), String> {
     let mut s = state.write().await;
     s.active_downloads.retain(|_, entry| !entry.progress.done);
     Ok(())
@@ -516,17 +523,17 @@ pub async fn sync_local_model_metadata(
     let mut updated_models = 0usize;
 
     for filename in &filenames {
-        match lookup_hf_supports_vision(filename).await {
-            Ok(Some(supports_vision)) => {
+        match lookup_hf_metadata(filename).await {
+            Ok(Some(metadata)) => {
                 matched_models += 1;
-                match crate::models::overrides::set_model_supports_vision_override(
+                match crate::models::overrides::set_model_hf_metadata_override(
                     filename,
-                    supports_vision,
+                    metadata.clone(),
                 ) {
                     Ok(()) => updated_models += 1,
                     Err(error) => tracing::warn!(
                         model = %filename,
-                        supports_vision,
+                        repo = ?metadata.repo_id,
                         error = %error,
                         "Failed to persist synced Hugging Face metadata override"
                     ),
@@ -541,9 +548,10 @@ pub async fn sync_local_model_metadata(
         }
     }
 
-    let rescanned = tokio::task::spawn_blocking(move || crate::models::scanner::scan_all(&scan_dirs))
-        .await
-        .unwrap_or_default();
+    let rescanned =
+        tokio::task::spawn_blocking(move || crate::models::scanner::scan_all(&scan_dirs))
+            .await
+            .unwrap_or_default();
 
     state.write().await.model_registry.update(rescanned);
 
@@ -563,6 +571,7 @@ pub async fn download_hub_model(
     url: String,
     filename: String,
     supports_vision: Option<bool>,
+    repo_id: Option<String>,
 ) -> Result<String, String> {
     let relative_path = sanitize_download_subpath(&filename)?;
     let download_id = url.clone();
@@ -594,7 +603,10 @@ pub async fn download_hub_model(
         let s = state.read().await;
         if let Some(existing) = s.active_downloads.get(&download_id) {
             if !existing.progress.done {
-                return Err(format!("Download already in progress for {}", existing.progress.filename));
+                return Err(format!(
+                    "Download already in progress for {}",
+                    existing.progress.filename
+                ));
             }
         }
     }
@@ -723,21 +735,26 @@ pub async fn download_hub_model(
             .map_err(|e| format!("Flush error: {e}"))?;
         drop(file);
 
-        if let (Some(value), Some(model_filename)) = (
-            supports_vision,
-            relative_path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .map(str::to_string),
-        ) {
+        if let Some(model_filename) = relative_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(str::to_string)
+        {
+            let metadata = HfModelMetadata {
+                repo_id: repo_id.clone(),
+                file: Some(filename.clone()),
+                template_path: Some("chat_template.jinja".to_string()),
+                has_repo_template: repo_id.is_some(),
+                supports_vision,
+            };
             if let Err(error) =
-                crate::models::overrides::set_model_supports_vision_override(&model_filename, value)
+                crate::models::overrides::set_model_hf_metadata_override(&model_filename, metadata)
             {
                 tracing::warn!(
                     model = %model_filename,
-                    supports_vision = value,
+                    repo = ?repo_id,
                     error = %error,
-                    "Failed to persist Hugging Face vision capability override"
+                    "Failed to persist Hugging Face metadata override"
                 );
             }
         }
@@ -746,9 +763,10 @@ pub async fn download_hub_model(
             let s = state.read().await;
             let dirs = s.config.models.scan_dirs.clone();
             drop(s);
-            let scanned = tokio::task::spawn_blocking(move || crate::models::scanner::scan_all(&dirs))
-                .await
-                .unwrap_or_default();
+            let scanned =
+                tokio::task::spawn_blocking(move || crate::models::scanner::scan_all(&dirs))
+                    .await
+                    .unwrap_or_default();
             state.write().await.model_registry.update(scanned);
         }
 
@@ -882,7 +900,11 @@ mod tests {
             model_id: "HauhauCS/Qwen3.5-35B-A3B-Uncensored".to_string(),
             downloads: 0,
             pipeline_tag: None,
-            tags: vec!["gguf".to_string(), "vision".to_string(), "multimodal".to_string()],
+            tags: vec![
+                "gguf".to_string(),
+                "vision".to_string(),
+                "multimodal".to_string(),
+            ],
             private: false,
             disabled: false,
             gated: None,
@@ -892,4 +914,3 @@ mod tests {
         assert!(hf_supports_vision(&model));
     }
 }
-

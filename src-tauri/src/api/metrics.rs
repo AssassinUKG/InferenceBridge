@@ -1,6 +1,6 @@
+use crate::state::SharedState;
 use axum::extract::State;
 use axum::response::Json;
-use crate::state::SharedState;
 
 #[derive(serde::Serialize)]
 pub struct MetricsResponse {
@@ -14,13 +14,15 @@ pub struct MetricsResponse {
     pub uptime_secs: u64,
 }
 
-pub async fn get_metrics(
-    State(state): State<SharedState>,
-) -> Json<MetricsResponse> {
+pub async fn get_metrics(State(state): State<SharedState>) -> Json<MetricsResponse> {
     let s = state.read().await;
 
     let process_state = format!("{:?}", s.process.state());
-    let context_size = s.model_stats.as_ref().map(|st| st.context_size).filter(|v| *v > 0);
+    let context_size = s
+        .model_stats
+        .as_ref()
+        .map(|st| st.context_size)
+        .filter(|v| *v > 0);
     let model_load_state = match &s.model_load_state {
         crate::state::ModelLoadState::Idle => "idle".to_string(),
         crate::state::ModelLoadState::Loading => "loading".to_string(),
@@ -51,9 +53,7 @@ pub struct CancelResponse {
     pub message: String,
 }
 
-pub async fn cancel_inference(
-    State(state): State<SharedState>,
-) -> Json<CancelResponse> {
+pub async fn cancel_inference(State(state): State<SharedState>) -> Json<CancelResponse> {
     let mut s = state.write().await;
 
     if s.active_generation.is_some() {

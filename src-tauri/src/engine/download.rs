@@ -356,7 +356,7 @@ pub async fn download_llama_server(
         "model-load-progress",
         crate::state::LoadProgress {
             stage: "downloading".to_string(),
-            message: format!("llama-server {tag} installed"),
+            message: format!("Finalizing llama-server {tag} install..."),
             progress: 0.95,
             done: false,
             error: None,

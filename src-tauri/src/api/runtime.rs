@@ -33,8 +33,9 @@ pub fn start_managed(state: SharedState, host: String, port: u16, source: &'stat
 
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let handle = tauri::async_runtime::spawn(async move {
-        let (effective_host, effective_port) = if should_try_startup_port_fallback(source, &host, port)
-        {
+        let (effective_host, effective_port) = if should_try_startup_port_fallback(
+            source, &host, port,
+        ) {
             match reserve_startup_api_port(state.clone(), &host, port).await {
                 Ok((fallback_host, fallback_port)) => (fallback_host, fallback_port),
                 Err(error) => {
@@ -60,15 +61,14 @@ pub fn start_managed(state: SharedState, host: String, port: u16, source: &'stat
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
         }
-        if let Err(error) =
-            crate::api::server::start_api_server_with_shutdown(
-                state,
-                &effective_host,
-                effective_port,
-                source,
-                stop_rx,
-            )
-                .await
+        if let Err(error) = crate::api::server::start_api_server_with_shutdown(
+            state,
+            &effective_host,
+            effective_port,
+            source,
+            stop_rx,
+        )
+        .await
         {
             tracing::error!(error = %error, source, "Managed API server task exited with error");
         }
@@ -121,7 +121,10 @@ async fn reserve_startup_api_port(
     host: &str,
     port: u16,
 ) -> Result<(String, u16), String> {
-    if tokio::net::TcpListener::bind(format!("{host}:{port}")).await.is_ok() {
+    if tokio::net::TcpListener::bind(format!("{host}:{port}"))
+        .await
+        .is_ok()
+    {
         return Ok((host.to_string(), port));
     }
 

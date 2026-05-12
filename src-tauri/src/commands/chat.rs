@@ -105,7 +105,10 @@ async fn schedule_context_follow_up(state: SharedState, session_id: String) {
         let s = state.read().await;
         (
             s.loaded_model.is_some(),
-            matches!(s.process.state(), crate::engine::process::ProcessState::Running),
+            matches!(
+                s.process.state(),
+                crate::engine::process::ProcessState::Running
+            ),
             s.process.port(),
             s.app_handle.clone(),
         )
@@ -136,16 +139,25 @@ async fn schedule_context_follow_up(state: SharedState, session_id: String) {
         .iter()
         .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
         .count() as u32;
-    let compressed_tokens = latest_snapshot.as_ref().map(|snap| snap.kv_tokens).unwrap_or(0);
+    let compressed_tokens = latest_snapshot
+        .as_ref()
+        .map(|snap| snap.kv_tokens)
+        .unwrap_or(0);
     let rolling_tokens = status.used_tokens.saturating_sub(compressed_tokens);
 
-    let action = strategy::decide_action(status.used_tokens, status.total_tokens, rolling_message_count);
+    let action = strategy::decide_action(
+        status.used_tokens,
+        status.total_tokens,
+        rolling_message_count,
+    );
     let action_label = match action {
         strategy::ContextAction::NoAction => None,
-        strategy::ContextAction::Compress { message_count } => {
-            Some(format!("Context nearing capacity; compressing {message_count} older messages."))
+        strategy::ContextAction::Compress { message_count } => Some(format!(
+            "Context nearing capacity; compressing {message_count} older messages."
+        )),
+        strategy::ContextAction::Rebuild => {
+            Some("Context critically full; a rebuild is recommended.".to_string())
         }
-        strategy::ContextAction::Rebuild => Some("Context critically full; a rebuild is recommended.".to_string()),
     };
 
     status = status.with_breakdown(0, rolling_tokens, compressed_tokens, action_label.clone());
@@ -229,7 +241,9 @@ async fn schedule_context_follow_up(state: SharedState, session_id: String) {
                     pinned_tokens,
                     rolling_tokens.saturating_sub(summary_tokens),
                     compressed_tokens.saturating_add(summary_tokens),
-                    Some(format!("Compressed {message_count} older messages into a memory snapshot.")),
+                    Some(format!(
+                        "Compressed {message_count} older messages into a memory snapshot."
+                    )),
                 ));
             }
         });

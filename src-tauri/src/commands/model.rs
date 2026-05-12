@@ -76,6 +76,209 @@ fn resolve_launch_context_size(requested_context_size: Option<u32>) -> Option<u3
     normalize_requested_context_size(requested_context_size)
 }
 
+fn sanitize_hf_cache_segment(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+async fn ensure_cached_hf_template(
+    repo_id: &str,
+    template_path: &str,
+) -> Result<std::path::PathBuf, String> {
+    let template_relative = template_path.trim().trim_start_matches('/');
+    let repo_dir = crate::config::app_support_dir()
+        .join("hf-templates")
+        .join(sanitize_hf_cache_segment(repo_id));
+    let cached_path = repo_dir.join(template_relative);
+
+    if cached_path.exists() {
+        return Ok(cached_path);
+    }
+
+    if let Some(parent) = cached_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
+    }
+
+    let url = format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        repo_id.trim(),
+        template_relative
+    );
+    let client = reqwest::Client::builder()
+        .user_agent("InferenceBridge/1.0")
+        .build()
+        .map_err(|error| format!("Failed to create Hugging Face client: {error}"))?;
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| format!("Failed to fetch repo chat template from {url}: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Failed to fetch repo chat template from {url}: HTTP {}",
+            response.status()
+        ));
+    }
+
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("Failed to read template response from {url}: {error}"))?;
+    tokio::fs::write(&cached_path, body)
+        .await
+        .map_err(|error| format!("Failed to write {}: {error}", cached_path.display()))?;
+    Ok(cached_path)
+}
+
+async fn resolve_template_selection(
+    process: &ProcessConfig,
+    model_filename: &str,
+    hf_metadata: Option<&HfModelMetadata>,
+) -> Result<
+    (
+        String,
+        Option<String>,
+        Option<std::path::PathBuf>,
+        Option<String>,
+        bool,
+    ),
+    String,
+> {
+    let requested_mode = process.template_mode.trim().to_lowercase();
+    let custom_template = process
+        .custom_template_path
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from);
+
+    if let Some(custom_template) = custom_template {
+        if custom_template.exists() {
+            return Ok((
+                "custom".to_string(),
+                Some(format!("custom:{}", custom_template.display())),
+                Some(custom_template),
+                None,
+                process.use_jinja || requested_mode == "custom",
+            ));
+        }
+        tracing::warn!(
+            model = %model_filename,
+            path = %custom_template.display(),
+            "Custom template override was configured but the file does not exist; falling back"
+        );
+    }
+
+    let repo_template_path = hf_metadata
+        .and_then(|metadata| metadata.template_path.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("chat_template.jinja");
+
+    if requested_mode != "builtin" {
+        if let Some(metadata) = hf_metadata {
+            if let Some(repo_id) = metadata
+                .repo_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                if metadata.has_repo_template || metadata.template_path.is_some() {
+                    let cached = ensure_cached_hf_template(repo_id, repo_template_path).await?;
+                    return Ok((
+                        "repo".to_string(),
+                        Some(format!("hf:{repo_id}/{repo_template_path}")),
+                        Some(cached),
+                        None,
+                        true,
+                    ));
+                }
+            }
+        }
+    }
+
+    let template_name = process
+        .template_name
+        .as_ref()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    Ok((
+        "builtin".to_string(),
+        template_name
+            .as_ref()
+            .map(|name| format!("builtin:{name}"))
+            .or(Some("builtin:fallback".to_string())),
+        None,
+        template_name,
+        process.use_jinja,
+    ))
+}
+
+fn preview_matches_effective_launch(
+    preview: &LaunchPreview,
+    model_filename: &str,
+    requested_context_size: Option<u32>,
+    template_mode: &str,
+    template_source: Option<&str>,
+    template_name: Option<&str>,
+    template_path: Option<&std::path::Path>,
+    chat_template_kwargs_json: Option<&str>,
+    fit_mode: Option<&str>,
+    cache_ram_mb: Option<u32>,
+    ctxcp: Option<u32>,
+    use_jinja: bool,
+    reasoning_mode: Option<&str>,
+    extra_args: &[String],
+) -> bool {
+    let model_ok = names_match(&preview.model_path, model_filename)
+        || preview
+            .model_path
+            .rsplit(std::path::MAIN_SEPARATOR)
+            .next()
+            .map(|value| names_match(value, model_filename))
+            .unwrap_or(false)
+        || preview
+            .hf_file
+            .as_deref()
+            .map(|value| names_match(value, model_filename))
+            .unwrap_or(false);
+
+    model_ok
+        && preview.context_size == requested_context_size
+        && preview.template_mode == template_mode
+        && preview.template_source.as_deref() == template_source
+        && preview.template_name.as_deref() == template_name
+        && preview.template_path.as_deref()
+            == template_path
+                .map(|path| path.to_string_lossy().as_ref().to_string())
+                .as_deref()
+        && preview.chat_template_kwargs_json.as_deref() == chat_template_kwargs_json
+        && preview.fit_mode.as_deref() == fit_mode
+        && preview.cache_ram_mb == cache_ram_mb
+        && preview.ctxcp == ctxcp
+        && preview.use_jinja == use_jinja
+        && preview.reasoning_mode.as_deref() == reasoning_mode
+        && preview
+            .args
+            .iter()
+            .rev()
+            .take(extra_args.len())
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            == extra_args
+}
+
 #[cfg(test)]
 mod tests {
     use super::resolve_launch_context_size;
@@ -188,7 +391,13 @@ fn effective_profile_info_from_state(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .or_else(|| state.loaded_model.clone())
-        .or_else(|| state.model_registry.list().first().map(|model| model.filename.clone()))
+        .or_else(|| {
+            state
+                .model_registry
+                .list()
+                .first()
+                .map(|model| model.filename.clone())
+        })
         .ok_or_else(|| "No model is available to resolve an effective profile".to_string())?;
 
     Ok(EffectiveProfileInfo {
@@ -208,15 +417,86 @@ pub fn get_effective_profile_for_shared(
     effective_profile_info_from_state(state, model_name)
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeLoadOverrides {
+    pub hf_repo: Option<String>,
+    pub hf_file: Option<String>,
+    pub fit_mode: Option<String>,
+    pub cache_ram_mb: Option<u32>,
+    pub ctxcp: Option<u32>,
+    pub use_jinja: Option<bool>,
+    pub reasoning_mode: Option<String>,
+    pub template_mode: Option<String>,
+    pub template_name: Option<String>,
+    pub custom_template_path: Option<String>,
+    pub chat_template_kwargs_json: Option<String>,
+    pub extra_args: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeLoadRequest {
+    #[serde(default)]
+    pub context_size: Option<u32>,
+    #[serde(default)]
+    pub hf_repo: Option<String>,
+    #[serde(default)]
+    pub hf_file: Option<String>,
+    #[serde(default)]
+    pub fit_mode: Option<String>,
+    #[serde(default)]
+    pub cache_ram_mb: Option<u32>,
+    #[serde(default)]
+    pub ctxcp: Option<u32>,
+    #[serde(default)]
+    pub use_jinja: Option<bool>,
+    #[serde(default)]
+    pub reasoning_mode: Option<String>,
+    #[serde(default)]
+    pub template_mode: Option<String>,
+    #[serde(default)]
+    pub template_name: Option<String>,
+    #[serde(default)]
+    pub custom_template_path: Option<String>,
+    #[serde(default)]
+    pub chat_template_kwargs_json: Option<String>,
+    #[serde(default)]
+    pub extra_args: Option<Vec<String>>,
+}
+
+impl RuntimeLoadRequest {
+    pub fn normalized_context_size(&self) -> Option<u32> {
+        normalize_requested_context_size(self.context_size)
+    }
+
+    pub fn into_overrides(self) -> RuntimeLoadOverrides {
+        RuntimeLoadOverrides {
+            hf_repo: self.hf_repo,
+            hf_file: self.hf_file,
+            fit_mode: self.fit_mode,
+            cache_ram_mb: self.cache_ram_mb,
+            ctxcp: self.ctxcp,
+            use_jinja: self.use_jinja,
+            reasoning_mode: self.reasoning_mode,
+            template_mode: self.template_mode,
+            template_name: self.template_name,
+            custom_template_path: self.custom_template_path,
+            chat_template_kwargs_json: self.chat_template_kwargs_json,
+            extra_args: self.extra_args,
+        }
+    }
+}
+
 /// Core backend model loading logic, used by both the REST API and headless mode.
 ///
 /// Emits `model-load-progress` Tauri events when an `app_handle` is stored in
 /// AppState (GUI mode). In headless/API-only mode the handle is `None` and the
 /// function is silent toward the frontend.
-pub async fn backend_load_model(
+pub async fn backend_load_model_with_overrides(
     state: SharedState,
     model_name: String,
     context_size: Option<u32>,
+    overrides: RuntimeLoadOverrides,
 ) -> Result<String, String> {
     // Cancel any active inference before starting a new load.
     {
@@ -236,42 +516,6 @@ pub async fn backend_load_model(
         s.model_load_mutex.clone()
     };
     let _load_guard = load_mutex.lock().await;
-
-    // Skip reload only if same model AND same context (or no context requested).
-    {
-        let s = state.read().await;
-        if let Some(loaded) = &s.loaded_model {
-            let req = model_name.trim().to_ascii_lowercase();
-            let cur = loaded.to_ascii_lowercase();
-            let search = if req.contains('/') {
-                req.rsplit('/').next().unwrap_or(&req)
-            } else {
-                &req
-            };
-            let name_ok = cur == req
-                || cur.trim_end_matches(".gguf") == req
-                || cur == req.trim_end_matches(".gguf")
-                || cur.trim_end_matches(".gguf") == search
-                || (!search.is_empty() && cur.contains(search));
-            if name_ok {
-                let loaded_ctx = s.model_stats.as_ref().map(|st| st.context_size).unwrap_or(0);
-                let ctx_ok = match context_size {
-                    None | Some(0) => true,
-                    Some(requested) => loaded_ctx == requested,
-                };
-                if ctx_ok {
-                    tracing::info!(model = %model_name, loaded_ctx, "Model already loaded with matching context");
-                    return Ok(loaded.clone());
-                }
-                tracing::info!(
-                    model = %model_name,
-                    loaded_ctx,
-                    requested_ctx = context_size,
-                    "Reloading model — context size mismatch"
-                );
-            }
-        }
-    }
 
     let transition = {
         let s = state.read().await;
@@ -296,7 +540,7 @@ pub async fn backend_load_model(
     .await;
 
     // Phase 1: Resolve model info (brief lock) + claim loading generation
-    let (config, model_filename, my_generation, launch_preview) = {
+    let (config, model_filename, my_generation, launch_preview, reused_existing) = {
         let model = {
             let s = state.read().await;
             s.model_registry.find_by_name(&model_name).cloned()
@@ -333,8 +577,43 @@ pub async fn backend_load_model(
         };
 
         let mut s = state.write().await;
-
+        let hf_metadata = model.hf_metadata.clone();
         let ctx = resolve_launch_context_size(context_size);
+        let mut process_config = s.config.process.clone();
+        if let Some(fit_mode) = overrides.fit_mode.as_ref() {
+            process_config.fit_mode = fit_mode.clone();
+        }
+        if let Some(cache_ram_mb) = overrides.cache_ram_mb {
+            process_config.cache_ram_mb = Some(cache_ram_mb);
+        }
+        if let Some(ctxcp) = overrides.ctxcp {
+            process_config.ctxcp = Some(ctxcp);
+        }
+        if let Some(use_jinja) = overrides.use_jinja {
+            process_config.use_jinja = use_jinja;
+        }
+        if let Some(reasoning_mode) = overrides.reasoning_mode.as_ref() {
+            process_config.reasoning_mode = reasoning_mode.clone();
+        }
+        if let Some(template_mode) = overrides.template_mode.as_ref() {
+            process_config.template_mode = template_mode.clone();
+        }
+        if let Some(template_name) = overrides.template_name.as_ref() {
+            process_config.template_name = Some(template_name.clone());
+        }
+        if let Some(custom_template_path) = overrides.custom_template_path.as_ref() {
+            process_config.custom_template_path = Some(custom_template_path.clone());
+        }
+        if let Some(chat_template_kwargs_json) = overrides.chat_template_kwargs_json.as_ref() {
+            process_config.chat_template_kwargs_json = Some(chat_template_kwargs_json.clone());
+        }
+        if let Some(extra_args) = overrides.extra_args.as_ref() {
+            process_config.extra_args = extra_args.clone();
+        }
+
+        let (template_mode, template_source, template_file, template_name, use_jinja) =
+            resolve_template_selection(&process_config, &model.filename, hf_metadata.as_ref())
+                .await?;
 
         // If ctx is None (no one specified), use 0 as placeholder — will be
         // updated from /slots or /props after health check succeeds.
@@ -349,6 +628,16 @@ pub async fn backend_load_model(
 
         let config = LaunchConfig {
             model_path: model.path.clone(),
+            hf_repo: overrides.hf_repo.clone().or_else(|| {
+                hf_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.repo_id.clone())
+            }),
+            hf_file: overrides.hf_file.clone().or_else(|| {
+                hf_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.file.clone())
+            }),
             context_size: ctx,
             gpu_layers: s.config.process.gpu_layers,
             threads: s.config.process.threads,
@@ -365,6 +654,22 @@ pub async fn backend_load_model(
             main_gpu: s.config.process.main_gpu,
             defrag_thold: s.config.process.defrag_thold,
             rope_freq_scale: s.config.process.rope_freq_scale,
+            fit_mode: Some(process_config.fit_mode.clone())
+                .filter(|value| !value.trim().is_empty()),
+            cache_ram_mb: process_config.cache_ram_mb,
+            ctxcp: process_config.ctxcp,
+            use_jinja,
+            reasoning_mode: Some(process_config.reasoning_mode.clone())
+                .filter(|value| !value.trim().is_empty()),
+            template_mode: template_mode.clone(),
+            template_source: template_source.clone(),
+            template_file: template_file.clone(),
+            template_name: template_name.clone(),
+            chat_template_kwargs_json: process_config
+                .chat_template_kwargs_json
+                .clone()
+                .filter(|value| !value.trim().is_empty()),
+            extra_args: process_config.extra_args.clone(),
         };
 
         LlamaProcess::validate_launch_config(&config).map_err(|e| {
@@ -393,18 +698,62 @@ pub async fn backend_load_model(
             msg
         })?;
 
-        // Bump generation so older in-flight loads won't overwrite us
-        s.loading_generation += 1;
-        let gen = s.loading_generation;
-        tracing::info!(
-            model = %model.filename,
-            generation = gen,
-            ctx_size = ctx,
-            "Phase 1: Resolved model (API/backend)"
-        );
+        let reuse_existing = if let (Some(loaded), Some(last_preview)) =
+            (s.loaded_model.clone(), s.last_launch_preview.as_ref())
+        {
+            if names_match(&loaded, &model.filename)
+                && preview_matches_effective_launch(
+                    last_preview,
+                    &model.filename,
+                    ctx,
+                    &template_mode,
+                    template_source.as_deref(),
+                    template_name.as_deref(),
+                    template_file.as_deref(),
+                    config.chat_template_kwargs_json.as_deref(),
+                    config.fit_mode.as_deref(),
+                    config.cache_ram_mb,
+                    config.ctxcp,
+                    config.use_jinja,
+                    config.reasoning_mode.as_deref(),
+                    &config.extra_args,
+                )
+            {
+                tracing::info!(
+                    model = %model.filename,
+                    context_size = ?ctx,
+                    template_mode = %template_mode,
+                    "Model already loaded with matching effective launch config"
+                );
+                Some((loaded, last_preview.clone()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
-        (config, model.filename.clone(), gen, preview)
+        if let Some((loaded, preview)) = reuse_existing {
+            (config, loaded, s.loading_generation, preview, true)
+        } else {
+            // Bump generation so older in-flight loads won't overwrite us
+            s.loading_generation += 1;
+            let gen = s.loading_generation;
+            tracing::info!(
+                model = %model.filename,
+                generation = gen,
+                ctx_size = ctx,
+                "Phase 1: Resolved model (API/backend)"
+            );
+
+            (config, model.filename.clone(), gen, preview, false)
+        }
     }; // write lock released
+
+    if reused_existing {
+        store_launch_preview(&state, launch_preview.clone()).await;
+        return Ok(model_filename);
+    }
 
     store_launch_preview(&state, launch_preview.clone()).await;
 
@@ -415,18 +764,6 @@ pub async fn backend_load_model(
 
     // Phase 2: Launch process (brief write lock, then released)
     //
-    // Pre-launch cleanup: kill any stale managed llama-server processes BEFORE
-    // acquiring the write lock.  The WMIC scan can take 1-3 seconds on Windows;
-    // running it under the write lock would block concurrent readers.
-    #[cfg(windows)]
-    {
-        tokio::task::spawn_blocking(move || {
-            crate::engine::process::LlamaProcess::clear_stale_managed_processes();
-        })
-        .await
-        .ok();
-    }
-
     publish_model_load_progress(
         &state,
         transition.clone(),
@@ -469,12 +806,22 @@ pub async fn backend_load_model(
             s.model_load_cancel.clone(),
         )
     };
-    tracing::info!(port = backend_port, timeout_secs = load_timeout_secs, "Phase 3: Waiting for llama-server health check...");
+    tracing::info!(
+        port = backend_port,
+        timeout_secs = load_timeout_secs,
+        "Phase 3: Waiting for llama-server health check..."
+    );
 
-    let client = reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .unwrap_or_default();
+    {
+        Ok(client) => client,
+        Err(error) => {
+            tracing::warn!(%error, "Falling back to default HTTP client for backend health check");
+            reqwest::Client::new()
+        }
+    };
     let health_url = format!("http://127.0.0.1:{}/health", backend_port);
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(load_timeout_secs);
@@ -660,7 +1007,10 @@ pub async fn backend_load_model(
             if let Some(preview) = s.last_launch_preview.as_mut() {
                 preview.context_size = Some(real_ctx);
             }
-            tracing::info!(real_ctx, "Discovered actual context size from running server");
+            tracing::info!(
+                real_ctx,
+                "Discovered actual context size from running server"
+            );
         }
     }
 
@@ -678,11 +1028,26 @@ pub async fn backend_load_model(
     tracing::info!("{result}");
     Ok(result)
 }
+
+pub async fn backend_load_model(
+    state: SharedState,
+    model_name: String,
+    context_size: Option<u32>,
+) -> Result<String, String> {
+    backend_load_model_with_overrides(
+        state,
+        model_name,
+        context_size,
+        RuntimeLoadOverrides::default(),
+    )
+    .await
+}
 // Tauri commands for model management.
 
+use crate::config::ProcessConfig;
 use crate::engine::download;
 use crate::engine::process::{LaunchConfig, LaunchPreview, LlamaProcess};
-use crate::models::overrides::{detect_effective_profile, effective_override};
+use crate::models::overrides::{detect_effective_profile, effective_override, HfModelMetadata};
 use crate::models::scanner;
 use crate::state::{
     EffectiveProfileInfo, GenerationRequest, LoadProgress, RuntimePerformanceMetrics, SharedState,
@@ -699,7 +1064,14 @@ fn command_no_window(program: &str) -> std::process::Command {
 
 #[tauri::command]
 pub async fn list_models(state: tauri::State<'_, SharedState>) -> Result<Vec<ModelInfo>, String> {
+    if let Some(models) = list_active_external_provider_models(state.inner().clone()).await {
+        return Ok(models);
+    }
+
     let s = state.read().await;
+    let loaded_model = s.loaded_model.clone();
+    let loaded_context = s.model_stats.as_ref().map(|stats| stats.context_size);
+    let last_launch_preview = s.last_launch_preview.clone();
     Ok(s.model_registry
         .list()
         .iter()
@@ -708,6 +1080,15 @@ pub async fn list_models(state: tauri::State<'_, SharedState>) -> Result<Vec<Mod
             let supports_tools = !matches!(m.profile.tool_call_format, ToolCallFormat::NativeApi)
                 || m.profile.supports_parallel_tools;
             let supports_reasoning = !matches!(m.profile.think_tag_style, ThinkTagStyle::None);
+            let is_loaded = loaded_model
+                .as_deref()
+                .map(|loaded| names_match(loaded, &m.filename))
+                .unwrap_or(false);
+            let vision_runtime_ready = is_loaded
+                && last_launch_preview
+                    .as_ref()
+                    .and_then(|preview| preview.mmproj_path.as_ref())
+                    .is_some();
             ModelInfo {
                 filename: m.filename.clone(),
                 path: m.path.to_string_lossy().to_string(),
@@ -716,15 +1097,135 @@ pub async fn list_models(state: tauri::State<'_, SharedState>) -> Result<Vec<Mod
                 supports_tools,
                 supports_reasoning,
                 supports_vision: m.profile.supports_vision,
-                context_window: m.profile.default_context_window,
+                context_window: if is_loaded {
+                    loaded_context
+                } else {
+                    m.profile.default_context_window
+                },
                 max_context_window: m.profile.max_context_window,
                 max_output_tokens: m.profile.default_max_output_tokens,
                 quant: extract_quant(&m.filename),
                 tool_call_format: format!("{:?}", m.profile.tool_call_format),
                 think_tag_style: format!("{:?}", m.profile.think_tag_style),
+                hf_repo: m
+                    .hf_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.repo_id.clone()),
+                hf_file: m
+                    .hf_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.file.clone()),
+                template_mode: if is_loaded {
+                    last_launch_preview
+                        .as_ref()
+                        .map(|preview| preview.template_mode.clone())
+                } else {
+                    None
+                },
+                template_source: if is_loaded {
+                    last_launch_preview
+                        .as_ref()
+                        .and_then(|preview| preview.template_source.clone())
+                } else {
+                    None
+                },
+                vision_runtime_ready,
+                vision_status: if !m.profile.supports_vision {
+                    "Not capable".to_string()
+                } else if vision_runtime_ready {
+                    "Vision Ready".to_string()
+                } else if is_loaded {
+                    "mmproj Missing".to_string()
+                } else {
+                    "Vision Capable".to_string()
+                },
+                provider_type: "managed_llamacpp".to_string(),
+                provider_name: "Managed llama.cpp".to_string(),
+                provider_base_url: None,
+                provider_managed: true,
             }
         })
         .collect())
+}
+
+#[derive(serde::Deserialize)]
+struct ProviderModelsResponse {
+    #[serde(default)]
+    data: Vec<ProviderModelObject>,
+}
+
+#[derive(serde::Deserialize)]
+struct ProviderModelObject {
+    id: String,
+    #[serde(default)]
+    max_context_length: Option<u32>,
+    #[serde(default)]
+    context_length: Option<u32>,
+    #[serde(default)]
+    context_window: Option<u32>,
+    #[serde(default)]
+    max_output_tokens: Option<u32>,
+}
+
+async fn list_active_external_provider_models(state: SharedState) -> Option<Vec<ModelInfo>> {
+    let provider = crate::api::upstream::active_openai_provider(&state).await?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let mut request = client.get(format!(
+        "{}/models",
+        provider.base_url.trim_end_matches('/')
+    ));
+    if let Some(api_key) = provider
+        .api_key
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+    {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request.send().await.ok()?;
+    if !response.status().is_success() {
+        return Some(Vec::new());
+    }
+    let upstream: ProviderModelsResponse = response.json().await.ok()?;
+    Some(
+        upstream
+            .data
+            .into_iter()
+            .map(|model| {
+                let context = model
+                    .max_context_length
+                    .or(model.context_length)
+                    .or(model.context_window);
+                ModelInfo {
+                    filename: model.id,
+                    path: provider.base_url.clone(),
+                    size_gb: 0.0,
+                    family: provider.name.clone(),
+                    supports_tools: false,
+                    supports_reasoning: false,
+                    supports_vision: false,
+                    context_window: context,
+                    max_context_window: context,
+                    max_output_tokens: model.max_output_tokens,
+                    quant: None,
+                    tool_call_format: "ProviderNative".to_string(),
+                    think_tag_style: "None".to_string(),
+                    hf_repo: None,
+                    hf_file: None,
+                    template_mode: None,
+                    template_source: Some(provider.name.clone()),
+                    vision_runtime_ready: false,
+                    vision_status: "Provider managed".to_string(),
+                    provider_type: "lm_studio".to_string(),
+                    provider_name: provider.name.clone(),
+                    provider_base_url: Some(provider.base_url.clone()),
+                    provider_managed: false,
+                }
+            })
+            .collect(),
+    )
 }
 
 #[tauri::command]
@@ -741,9 +1242,16 @@ pub async fn load_model(
     _app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
     model_name: String,
-    context_size: Option<u32>,
+    options: Option<RuntimeLoadRequest>,
 ) -> Result<String, String> {
-    backend_load_model(state.inner().clone(), model_name, context_size).await
+    let options = options.unwrap_or_default();
+    backend_load_model_with_overrides(
+        state.inner().clone(),
+        model_name,
+        options.normalized_context_size(),
+        options.into_overrides(),
+    )
+    .await
 }
 
 pub async fn backend_unload_model(state: SharedState) -> Result<String, String> {
@@ -1413,6 +1921,16 @@ pub struct ModelInfo {
     pub quant: Option<String>,
     pub tool_call_format: String,
     pub think_tag_style: String,
+    pub hf_repo: Option<String>,
+    pub hf_file: Option<String>,
+    pub template_mode: Option<String>,
+    pub template_source: Option<String>,
+    pub vision_runtime_ready: bool,
+    pub vision_status: String,
+    pub provider_type: String,
+    pub provider_name: String,
+    pub provider_base_url: Option<String>,
+    pub provider_managed: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -1467,6 +1985,21 @@ pub async fn get_effective_profile(
 }
 
 #[tauri::command]
+pub async fn set_model_vision_override(
+    state: tauri::State<'_, SharedState>,
+    model_name: String,
+    supports_vision: bool,
+) -> Result<(), String> {
+    crate::models::overrides::set_model_supports_vision_override(&model_name, supports_vision)?;
+
+    // Re-scan so the in-memory registry reflects the new override immediately.
+    let mut s = state.write().await;
+    let models = crate::models::scanner::scan_all(&s.config.models.scan_dirs);
+    s.model_registry.update(models);
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn reload_last_known_good(
     state: tauri::State<'_, SharedState>,
 ) -> Result<String, String> {
@@ -1510,7 +2043,19 @@ pub async fn update_llama_server(app: tauri::AppHandle) -> Result<String, String
     match download::check_for_update().await {
         Ok(Some((tag, url, size))) => {
             match download::download_llama_server(&app, &url, &tag, size).await {
-                Ok(path) => Ok(format!("Updated to {} at {}", tag, path.display())),
+                Ok(path) => {
+                    emit_load_progress_payload(
+                        &Some(app.clone()),
+                        &crate::state::LoadProgress {
+                            stage: "ready".to_string(),
+                            message: format!("Updated llama-server to {tag}"),
+                            progress: 1.0,
+                            done: true,
+                            error: None,
+                        },
+                    );
+                    Ok(format!("Updated to {} at {}", tag, path.display()))
+                }
                 Err(e) => Err(format!("Download failed: {e}")),
             }
         }
@@ -1527,7 +2072,7 @@ pub async fn swap_model(
     app: tauri::AppHandle,
     state: tauri::State<'_, SharedState>,
     model_name: Option<String>,
-    context_size: Option<u32>,
+    options: Option<RuntimeLoadRequest>,
 ) -> Result<String, String> {
     // Determine target: explicit name or previous model
     let target = match model_name {
@@ -1543,6 +2088,12 @@ pub async fn swap_model(
     tracing::info!(target = %target, "Hot-swap requested");
 
     let _ = app;
-    backend_load_model(state.inner().clone(), target, context_size).await
+    let options = options.unwrap_or_default();
+    backend_load_model_with_overrides(
+        state.inner().clone(),
+        target,
+        options.normalized_context_size(),
+        options.into_overrides(),
+    )
+    .await
 }
-

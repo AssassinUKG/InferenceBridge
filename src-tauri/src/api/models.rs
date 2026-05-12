@@ -27,6 +27,40 @@ pub struct LoadModelRequest {
         alias = "numCtx"
     )]
     pub context_size: Option<u32>,
+    #[serde(default, alias = "hfRepo", alias = "hf_repo", alias = "repo_id")]
+    pub hf_repo: Option<String>,
+    #[serde(default, alias = "hfFile", alias = "hf_file", alias = "file")]
+    pub hf_file: Option<String>,
+    #[serde(default, alias = "fit", alias = "fit_mode")]
+    pub fit_mode: Option<String>,
+    #[serde(
+        default,
+        alias = "cacheRam",
+        alias = "cache_ram",
+        alias = "cache_ram_mb"
+    )]
+    pub cache_ram_mb: Option<u32>,
+    #[serde(default)]
+    pub ctxcp: Option<u32>,
+    #[serde(default, alias = "jinja", alias = "use_jinja")]
+    pub use_jinja: Option<bool>,
+    #[serde(default, alias = "reasoning", alias = "reasoning_mode")]
+    pub reasoning_mode: Option<String>,
+    #[serde(default, alias = "templateMode", alias = "template_mode")]
+    pub template_mode: Option<String>,
+    #[serde(default, alias = "templateName", alias = "template_name")]
+    pub template_name: Option<String>,
+    #[serde(default, alias = "customTemplatePath", alias = "custom_template_path")]
+    pub custom_template_path: Option<String>,
+    #[serde(
+        default,
+        alias = "chatTemplateKwargs",
+        alias = "chat_template_kwargs",
+        alias = "chat_template_kwargs_json"
+    )]
+    pub chat_template_kwargs_json: Option<String>,
+    #[serde(default, alias = "extraArgs", alias = "extra_args")]
+    pub extra_args: Option<Vec<String>>,
     #[serde(default)]
     pub echo_load_config: bool,
     #[serde(flatten)]
@@ -83,21 +117,43 @@ pub async fn load_model(
     );
 
     let load_start = std::time::Instant::now();
-    crate::commands::model::backend_load_model(state.clone(), model_name.clone(), context_size)
-        .await
-        .map_err(|error| {
-            ApiErrorResponse::service_unavailable(format!(
-                "Failed to load model '{model_name}': {error}"
-            ))
-        })?;
+    crate::commands::model::backend_load_model_with_overrides(
+        state.clone(),
+        model_name.clone(),
+        context_size,
+        crate::commands::model::RuntimeLoadOverrides {
+            hf_repo: req.hf_repo.clone(),
+            hf_file: req.hf_file.clone(),
+            fit_mode: req.fit_mode.clone(),
+            cache_ram_mb: req.cache_ram_mb,
+            ctxcp: req.ctxcp,
+            use_jinja: req.use_jinja,
+            reasoning_mode: req.reasoning_mode.clone(),
+            template_mode: req.template_mode.clone(),
+            template_name: req.template_name.clone(),
+            custom_template_path: req.custom_template_path.clone(),
+            chat_template_kwargs_json: req.chat_template_kwargs_json.clone(),
+            extra_args: req.extra_args.clone(),
+        },
+    )
+    .await
+    .map_err(|error| {
+        ApiErrorResponse::service_unavailable(format!(
+            "Failed to load model '{model_name}': {error}"
+        ))
+    })?;
     let load_time_seconds = load_start.elapsed().as_secs_f64();
 
     let s = state.read().await;
     let loaded_name = s.loaded_model.clone().unwrap_or_else(|| model_name.clone());
     // Use the requested context directly — that's what we told llama-server.
     // Fall back to model_stats only when no explicit context was requested.
-    let actual_ctx = context_size
-        .unwrap_or_else(|| s.model_stats.as_ref().map(|st| st.context_size).unwrap_or(0));
+    let actual_ctx = context_size.unwrap_or_else(|| {
+        s.model_stats
+            .as_ref()
+            .map(|st| st.context_size)
+            .unwrap_or(0)
+    });
 
     Ok(Json(LoadModelResponse {
         model_type: "llm".to_string(),
@@ -195,8 +251,7 @@ pub async fn unload_model(
     State(state): State<SharedState>,
     body: Option<Json<UnloadModelRequest>>,
 ) -> Json<serde_json::Value> {
-    let instance_id = body
-        .and_then(|b| b.instance_id.clone().or_else(|| b.model.clone()));
+    let instance_id = body.and_then(|b| b.instance_id.clone().or_else(|| b.model.clone()));
 
     // Fall back to the currently loaded model if no body was sent.
     let instance_id = match instance_id {
@@ -247,6 +302,23 @@ pub struct ModelObject {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
     pub reasoning: ReasoningCapability,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision_runtime_ready: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mmproj_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hf_repo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hf_file: Option<String>,
+    pub provider_type: String,
+    pub provider_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_base_url: Option<String>,
+    pub provider_managed: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -270,6 +342,14 @@ pub struct ModelDetailResponse {
     pub tool_call_format: String,
     pub think_tag_style: String,
     pub reasoning: ReasoningCapability,
+    pub template_mode: Option<String>,
+    pub template_source: Option<String>,
+    pub vision_runtime_ready: bool,
+    pub mmproj_status: String,
+    pub vision_block_reason: Option<String>,
+    pub hf_repo: Option<String>,
+    pub hf_file: Option<String>,
+    pub hf_has_repo_template: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -302,6 +382,10 @@ pub struct ModelStatsResponse {
 // ── Handlers ────────────────────────────────────────────────────────────
 
 pub async fn list_models(State(state): State<SharedState>) -> Json<ModelsResponse> {
+    if let Some(response) = list_active_lm_studio_models(&state).await {
+        return Json(response);
+    }
+
     let snapshot = get_or_scan_models(&state).await;
     let loaded = snapshot.loaded_model.as_deref();
     let loaded_ctx = snapshot.loaded_context_size;
@@ -309,10 +393,105 @@ pub async fn list_models(State(state): State<SharedState>) -> Json<ModelsRespons
     let data: Vec<ModelObject> = snapshot
         .models
         .iter()
-        .map(|model| model_object_from_scanned(model, loaded, loaded_ctx))
+        .map(|model| {
+            model_object_from_scanned(model, loaded, loaded_ctx, snapshot.launch_preview.as_ref())
+        })
         .collect();
 
     Json(ModelsResponse {
+        object: "list".to_string(),
+        data,
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct UpstreamModelsResponse {
+    #[serde(default)]
+    data: Vec<UpstreamModelObject>,
+}
+
+#[derive(serde::Deserialize)]
+struct UpstreamModelObject {
+    id: String,
+    #[serde(default)]
+    created: Option<u64>,
+    #[serde(default)]
+    owned_by: Option<String>,
+    #[serde(default)]
+    max_context_length: Option<u32>,
+    #[serde(default)]
+    context_length: Option<u32>,
+    #[serde(default)]
+    context_window: Option<u32>,
+}
+
+async fn list_active_lm_studio_models(state: &SharedState) -> Option<ModelsResponse> {
+    let (enabled, active, base_url, api_key) = {
+        let s = state.read().await;
+        (
+            s.config.providers.lm_studio.enabled,
+            s.config.providers.active.clone(),
+            s.config.providers.lm_studio.base_url.clone(),
+            s.config.providers.lm_studio.api_key.clone(),
+        )
+    };
+
+    if !enabled || active != "lm_studio" {
+        return None;
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let mut request = client.get(format!(
+        "{}/models",
+        crate::providers::normalize_openai_base_url(&base_url)
+    ));
+    if let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let upstream: UpstreamModelsResponse = response.json().await.ok()?;
+    let now = now_unix_secs();
+    let data = upstream
+        .data
+        .into_iter()
+        .map(|model| ModelObject {
+            id: model.id,
+            object: "model".to_string(),
+            created: model.created.unwrap_or(now),
+            owned_by: model.owned_by.unwrap_or_else(|| "lm_studio".to_string()),
+            active: true,
+            max_context_length: model
+                .max_context_length
+                .or(model.context_length)
+                .or(model.context_window),
+            state: Some("external".to_string()),
+            reasoning: ReasoningCapability {
+                supported: false,
+                separates_content: false,
+                effort_values: Vec::new(),
+                supports_reasoning_tokens: false,
+                default_effort: None,
+            },
+            template_mode: None,
+            template_source: Some("lm_studio".to_string()),
+            vision_runtime_ready: None,
+            mmproj_status: None,
+            hf_repo: None,
+            hf_file: None,
+            provider_type: "lm_studio".to_string(),
+            provider_name: "LM Studio".to_string(),
+            provider_base_url: Some(crate::providers::normalize_openai_base_url(&base_url)),
+            provider_managed: false,
+        })
+        .collect();
+
+    Some(ModelsResponse {
         object: "list".to_string(),
         data,
     })
@@ -329,7 +508,12 @@ pub async fn get_model(
         return Err(StatusCode::NOT_FOUND);
     };
 
-    Ok(Json(model_detail_from_scanned(model, loaded, loaded_ctx)))
+    Ok(Json(model_detail_from_scanned(
+        model,
+        loaded,
+        loaded_ctx,
+        snapshot.launch_preview.as_ref(),
+    )))
 }
 
 pub async fn model_stats(
@@ -396,7 +580,14 @@ async fn model_stats_inner(
         state: state_value,
         progress,
         stats,
-        model: model.map(|model| model_detail_from_scanned(&model, active_model.as_deref(), loaded_ctx)),
+        model: model.map(|model| {
+            model_detail_from_scanned(
+                &model,
+                active_model.as_deref(),
+                loaded_ctx,
+                snapshot.launch_preview.as_ref(),
+            )
+        }),
     }))
 }
 
@@ -407,6 +598,7 @@ struct ModelRegistrySnapshot {
     models: Vec<crate::models::scanner::ScannedModel>,
     loaded_model: Option<String>,
     loaded_context_size: Option<u32>,
+    launch_preview: Option<crate::engine::process::LaunchPreview>,
 }
 
 async fn get_or_scan_models(state: &SharedState) -> ModelRegistrySnapshot {
@@ -416,7 +608,12 @@ async fn get_or_scan_models(state: &SharedState) -> ModelRegistrySnapshot {
             return ModelRegistrySnapshot {
                 models: s.model_registry.list().to_vec(),
                 loaded_model: s.loaded_model.clone(),
-                loaded_context_size: s.model_stats.as_ref().map(|st| st.context_size).filter(|v| *v > 0),
+                loaded_context_size: s
+                    .model_stats
+                    .as_ref()
+                    .map(|st| st.context_size)
+                    .filter(|v| *v > 0),
+                launch_preview: s.last_launch_preview.clone(),
             };
         }
     }
@@ -439,7 +636,12 @@ async fn get_or_scan_models(state: &SharedState) -> ModelRegistrySnapshot {
     ModelRegistrySnapshot {
         models: s.model_registry.list().to_vec(),
         loaded_model: s.loaded_model.clone(),
-        loaded_context_size: s.model_stats.as_ref().map(|st| st.context_size).filter(|v| *v > 0),
+        loaded_context_size: s
+            .model_stats
+            .as_ref()
+            .map(|st| st.context_size)
+            .filter(|v| *v > 0),
+        launch_preview: s.last_launch_preview.clone(),
     }
 }
 
@@ -504,10 +706,13 @@ fn model_object_from_scanned(
     model: &crate::models::scanner::ScannedModel,
     loaded_model: Option<&str>,
     _loaded_ctx: Option<u32>,
+    launch_preview: Option<&crate::engine::process::LaunchPreview>,
 ) -> ModelObject {
     let is_active = loaded_model
         .map(|loaded| names_match(loaded, &model.filename))
         .unwrap_or(false);
+    let (vision_runtime_ready, mmproj_status, _vision_block_reason) =
+        vision_runtime_info(model, is_active, launch_preview);
 
     ModelObject {
         id: model.filename.clone(),
@@ -518,6 +723,26 @@ fn model_object_from_scanned(
         max_context_length: model.profile.max_context_window,
         state: Some(if is_active { "loaded" } else { "not-loaded" }.to_string()),
         reasoning: reasoning_capability(&model.profile),
+        template_mode: launch_preview
+            .filter(|_| is_active)
+            .map(|preview| preview.template_mode.clone()),
+        template_source: launch_preview
+            .filter(|_| is_active)
+            .and_then(|preview| preview.template_source.clone()),
+        vision_runtime_ready: Some(vision_runtime_ready),
+        mmproj_status: Some(mmproj_status),
+        hf_repo: model
+            .hf_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.repo_id.clone()),
+        hf_file: model
+            .hf_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.file.clone()),
+        provider_type: "managed_llamacpp".to_string(),
+        provider_name: "Managed llama.cpp".to_string(),
+        provider_base_url: None,
+        provider_managed: true,
     }
 }
 
@@ -525,6 +750,7 @@ fn model_detail_from_scanned(
     model: &crate::models::scanner::ScannedModel,
     loaded_model: Option<&str>,
     loaded_ctx: Option<u32>,
+    launch_preview: Option<&crate::engine::process::LaunchPreview>,
 ) -> ModelDetailResponse {
     use crate::models::profiles::ThinkTagStyle;
 
@@ -534,6 +760,8 @@ fn model_detail_from_scanned(
     let is_active = loaded_model
         .map(|loaded| names_match(loaded, &model.filename))
         .unwrap_or(false);
+    let (vision_runtime_ready, mmproj_status, vision_block_reason) =
+        vision_runtime_info(model, is_active, launch_preview);
 
     ModelDetailResponse {
         id: model.filename.clone(),
@@ -548,19 +776,78 @@ fn model_detail_from_scanned(
         supports_tools,
         supports_reasoning,
         supports_vision: model.profile.supports_vision,
-        context_window: if is_active { loaded_ctx } else { model.profile.default_context_window },
+        context_window: if is_active {
+            loaded_ctx
+        } else {
+            model.profile.default_context_window
+        },
         max_context_length: model.profile.max_context_window,
         max_output_tokens: model.profile.default_max_output_tokens,
         quant: extract_quant(&model.filename),
         tool_call_format: format!("{:?}", model.profile.tool_call_format),
         think_tag_style: format!("{:?}", model.profile.think_tag_style),
         reasoning: reasoning_capability(&model.profile),
+        template_mode: launch_preview
+            .filter(|_| is_active)
+            .map(|preview| preview.template_mode.clone()),
+        template_source: launch_preview
+            .filter(|_| is_active)
+            .and_then(|preview| preview.template_source.clone()),
+        vision_runtime_ready,
+        mmproj_status,
+        vision_block_reason,
+        hf_repo: model
+            .hf_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.repo_id.clone()),
+        hf_file: model
+            .hf_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.file.clone()),
+        hf_has_repo_template: model
+            .hf_metadata
+            .as_ref()
+            .map(|metadata| metadata.has_repo_template)
+            .unwrap_or(false),
     }
 }
 
-fn reasoning_capability(
-    profile: &crate::models::profiles::ModelProfile,
-) -> ReasoningCapability {
+fn vision_runtime_info(
+    model: &crate::models::scanner::ScannedModel,
+    is_active: bool,
+    launch_preview: Option<&crate::engine::process::LaunchPreview>,
+) -> (bool, String, Option<String>) {
+    if !model.profile.supports_vision {
+        return (
+            false,
+            "not-capable".to_string(),
+            Some("Model metadata does not advertise vision support".to_string()),
+        );
+    }
+
+    if !is_active {
+        return (
+            false,
+            "vision-capable".to_string(),
+            Some("Model supports vision but is not the active runtime".to_string()),
+        );
+    }
+
+    if launch_preview
+        .and_then(|preview| preview.mmproj_path.as_ref())
+        .is_some()
+    {
+        return (true, "vision-ready".to_string(), None);
+    }
+
+    (
+        false,
+        "mmproj-missing".to_string(),
+        Some("Runtime is missing a matching mmproj sidecar".to_string()),
+    )
+}
+
+fn reasoning_capability(profile: &crate::models::profiles::ModelProfile) -> ReasoningCapability {
     let supported = !matches!(
         profile.think_tag_style,
         crate::models::profiles::ThinkTagStyle::None

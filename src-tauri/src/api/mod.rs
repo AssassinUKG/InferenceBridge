@@ -7,3 +7,4 @@ pub mod models;
 pub mod responses;
 pub mod runtime;
 pub mod server;
+pub mod upstream;

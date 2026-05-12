@@ -12,16 +12,38 @@ export interface ModelInfo {
   quant: string | null;
   tool_call_format: string;
   think_tag_style: string;
+  hf_repo: string | null;
+  hf_file: string | null;
+  template_mode: string | null;
+  template_source: string | null;
+  vision_runtime_ready: boolean;
+  vision_status: string;
+  provider_type: string;
+  provider_name: string;
+  provider_base_url: string | null;
+  provider_managed: boolean;
 }
 
 export interface LaunchPreview {
   server_path: string;
   model_path: string;
+  hf_repo: string | null;
+  hf_file: string | null;
   mmproj_path: string | null;
   backend_preference: string;
-  context_size: number;
+  context_size: number | null;
   port: number;
   parallel_slots: number;
+  fit_mode: string | null;
+  cache_ram_mb: number | null;
+  ctxcp: number | null;
+  use_jinja: boolean;
+  reasoning_mode: string | null;
+  template_mode: string;
+  template_source: string | null;
+  template_path: string | null;
+  template_name: string | null;
+  chat_template_kwargs_json: string | null;
   args: string[];
 }
 
@@ -145,7 +167,21 @@ export interface AppSettings {
   main_gpu: number;
   defrag_thold: number;
   rope_freq_scale: number;
+  fit_mode: string;
+  cache_ram_mb: number | null;
+  ctxcp: number | null;
+  use_jinja: boolean;
+  reasoning_mode: string;
+  template_mode: string;
+  template_name: string | null;
+  custom_template_path: string | null;
+  chat_template_kwargs_json: string | null;
+  extra_args: string[];
   api_key: string | null;
+  active_provider: string;
+  lm_studio_enabled: boolean;
+  lm_studio_base_url: string;
+  lm_studio_api_key: string | null;
 }
 
 export interface ApiAccessInfo {
@@ -236,4 +272,75 @@ export interface EffectiveProfileInfo {
   resolved_model: string | null;
   profile: ModelProfile;
   override_entry: ModelProfileOverride | null;
+}
+
+export interface RuntimeDoctorReport {
+  checked_at: string;
+  app_api: AppApiDoctor;
+  active_runtime: ActiveRuntimeDoctor;
+  providers: ProviderProbe[];
+  summary: RuntimeDoctorSummary;
+}
+
+export interface RuntimeDoctorSummary {
+  reachable_providers: number;
+  total_providers: number;
+  loaded_model: string | null;
+  preferred_next_step: string;
+}
+
+export interface AppApiDoctor {
+  state: string;
+  url: string;
+  reachable: boolean;
+  error: string | null;
+}
+
+export interface ActiveRuntimeDoctor {
+  managed: boolean;
+  state: string;
+  model: string | null;
+  port: number | null;
+  backend: string | null;
+  launch_context_size: number | null;
+}
+
+export type ProviderType =
+  | "managed_llama_cpp"
+  | "external_llama_cpp"
+  | "lm_studio"
+  | "ollama"
+  | "open_ai_compatible";
+
+export interface ProviderProbe {
+  id: string;
+  provider_type: ProviderType;
+  name: string;
+  base_url: string;
+  managed: boolean;
+  reachable: boolean;
+  status: string;
+  models: ProviderModelInfo[];
+  model_count: number;
+  context_limit: number | null;
+  output_limit: number | null;
+  endpoints: ProviderEndpointSupport;
+  build_info: string | null;
+  error: string | null;
+  hints: string[];
+}
+
+export interface ProviderEndpointSupport {
+  health: boolean;
+  props: boolean;
+  slots: boolean;
+  openai_models: boolean;
+  ollama_tags: boolean;
+}
+
+export interface ProviderModelInfo {
+  id: string;
+  name: string | null;
+  context_limit: number | null;
+  output_limit: number | null;
 }

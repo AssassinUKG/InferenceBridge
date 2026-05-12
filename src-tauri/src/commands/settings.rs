@@ -4,6 +4,7 @@ use crate::engine::scheduler::RequestScheduler;
 use crate::state::SharedState;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, UdpSocket};
+use tauri::Emitter;
 
 /// Settings exposed to the frontend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,8 +31,22 @@ pub struct AppSettings {
     pub main_gpu: i32,
     pub defrag_thold: f32,
     pub rope_freq_scale: f32,
+    pub fit_mode: String,
+    pub cache_ram_mb: Option<u32>,
+    pub ctxcp: Option<u32>,
+    pub use_jinja: bool,
+    pub reasoning_mode: String,
+    pub template_mode: String,
+    pub template_name: Option<String>,
+    pub custom_template_path: Option<String>,
+    pub chat_template_kwargs_json: Option<String>,
+    pub extra_args: Vec<String>,
     /// API key for Bearer token auth. None / empty string = no auth required.
     pub api_key: Option<String>,
+    pub active_provider: String,
+    pub lm_studio_enabled: bool,
+    pub lm_studio_base_url: String,
+    pub lm_studio_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,7 +87,21 @@ pub async fn get_settings(state: tauri::State<'_, SharedState>) -> Result<AppSet
         main_gpu: s.config.process.main_gpu,
         defrag_thold: s.config.process.defrag_thold,
         rope_freq_scale: s.config.process.rope_freq_scale,
+        fit_mode: s.config.process.fit_mode.clone(),
+        cache_ram_mb: s.config.process.cache_ram_mb,
+        ctxcp: s.config.process.ctxcp,
+        use_jinja: s.config.process.use_jinja,
+        reasoning_mode: s.config.process.reasoning_mode.clone(),
+        template_mode: s.config.process.template_mode.clone(),
+        template_name: s.config.process.template_name.clone(),
+        custom_template_path: s.config.process.custom_template_path.clone(),
+        chat_template_kwargs_json: s.config.process.chat_template_kwargs_json.clone(),
+        extra_args: s.config.process.extra_args.clone(),
         api_key: s.config.server.api_key.clone(),
+        active_provider: s.config.providers.active.clone(),
+        lm_studio_enabled: s.config.providers.lm_studio.enabled,
+        lm_studio_base_url: s.config.providers.lm_studio.base_url.clone(),
+        lm_studio_api_key: s.config.providers.lm_studio.api_key.clone(),
     })
 }
 
@@ -105,13 +134,17 @@ pub async fn update_settings(
     let shared = state.inner().clone();
     let host = settings.server_host.clone();
     let normalized_api_key = settings.api_key.clone().filter(|k| !k.trim().is_empty());
-    let (
-        should_restart_api,
-        should_start_api,
-        previous_host,
-        previous_port,
-        previous_api_key,
-    ) = {
+    let active_provider = match settings.active_provider.trim() {
+        "lm_studio" if settings.lm_studio_enabled => "lm_studio".to_string(),
+        _ => "managed_llamacpp".to_string(),
+    };
+    let lm_studio_base_url =
+        crate::providers::normalize_openai_base_url(&settings.lm_studio_base_url);
+    let lm_studio_api_key = settings
+        .lm_studio_api_key
+        .clone()
+        .filter(|key| !key.trim().is_empty());
+    let (should_restart_api, should_start_api, previous_host, previous_port, previous_api_key) = {
         let mut s = shared.write().await;
         let previous_host = s.config.server.host.clone();
         let previous_port = s.config.server.port;
@@ -154,7 +187,38 @@ pub async fn update_settings(
         s.config.process.main_gpu = settings.main_gpu;
         s.config.process.defrag_thold = settings.defrag_thold;
         s.config.process.rope_freq_scale = settings.rope_freq_scale;
+        s.config.process.fit_mode = settings.fit_mode.trim().to_string();
+        s.config.process.cache_ram_mb = settings.cache_ram_mb.filter(|value| *value > 0);
+        s.config.process.ctxcp = settings.ctxcp.filter(|value| *value > 0);
+        s.config.process.use_jinja = settings.use_jinja;
+        s.config.process.reasoning_mode = settings.reasoning_mode.trim().to_string();
+        s.config.process.template_mode = settings.template_mode.trim().to_lowercase();
+        s.config.process.template_name = settings
+            .template_name
+            .clone()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        s.config.process.custom_template_path = settings
+            .custom_template_path
+            .clone()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        s.config.process.chat_template_kwargs_json = settings
+            .chat_template_kwargs_json
+            .clone()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        s.config.process.extra_args = settings
+            .extra_args
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect();
         s.config.server.api_key = normalized_api_key.clone();
+        s.config.providers.active = active_provider.clone();
+        s.config.providers.lm_studio.enabled = settings.lm_studio_enabled;
+        s.config.providers.lm_studio.base_url = lm_studio_base_url.clone();
+        s.config.providers.lm_studio.api_key = lm_studio_api_key.clone();
 
         // Persist to disk.
         s.config
@@ -347,6 +411,16 @@ pub async fn download_llama_build(
     // Update the process to use the new binary.
     let mut s = state.write().await;
     s.process.set_server_path(server_path.clone());
+    let _ = app.emit(
+        "model-load-progress",
+        crate::state::LoadProgress {
+            stage: "ready".to_string(),
+            message: format!("Installed {backend} llama-server {tag}"),
+            progress: 1.0,
+            done: true,
+            error: None,
+        },
+    );
     Ok(format!(
         "Installed {backend} build {} at {}",
         tag,

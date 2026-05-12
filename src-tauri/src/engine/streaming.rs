@@ -258,7 +258,8 @@ pub async fn consume_sse_stream_with_timeouts(
                                         .send(StreamEvent::ReasoningDelta(parser_buffer.clone()))
                                         .await;
                                 } else {
-                                    let _ = tx.send(StreamEvent::Token(parser_buffer.clone())).await;
+                                    let _ =
+                                        tx.send(StreamEvent::Token(parser_buffer.clone())).await;
                                 }
                                 parser_buffer.clear();
                             }

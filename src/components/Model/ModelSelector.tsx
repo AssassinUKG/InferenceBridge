@@ -7,6 +7,7 @@ import type {
 } from "../../lib/types";
 import { useGpuStats } from "../../hooks/useGpuStats";
 import * as api from "../../lib/tauri";
+import type { LoadModelOptions } from "../../lib/tauri";
 
 interface Props {
   models: ModelInfo[];
@@ -17,9 +18,9 @@ interface Props {
   error: string | null;
   isLoading: boolean;
   loadProgress: LoadProgress | null;
-  onLoad: (modelName: string, contextSize?: number) => void;
+  onLoad: (modelName: string, options?: LoadModelOptions) => void;
   onUnload: () => void;
-  onSwap: (modelName?: string, contextSize?: number) => void;
+  onSwap: (modelName?: string, options?: LoadModelOptions) => void;
   onSetApiServerRunning: (running: boolean) => void;
   onScan: () => void;
   onOpenSettings: () => void;
@@ -210,6 +211,16 @@ export function ModelSelector({
         quant: null,
         tool_call_format: "NativeApi",
         think_tag_style: "None",
+        hf_repo: null,
+        hf_file: null,
+        template_mode: null,
+        template_source: null,
+        vision_runtime_ready: false,
+        vision_status: "Unknown",
+        provider_type: "managed_llamacpp",
+        provider_name: "Managed llama.cpp",
+        provider_base_url: null,
+        provider_managed: true,
       })
     : null;
   const modelCards = filteredModels.filter((m) => m.filename !== loadedModel);
@@ -288,6 +299,12 @@ export function ModelSelector({
           >
             {models.length} model{models.length === 1 ? "" : "s"}
           </span>
+          {settings && (
+            <ProviderBadge
+              providerName={settings.active_provider === "lm_studio" ? "LM Studio" : "Managed"}
+              managed={settings.active_provider !== "lm_studio"}
+            />
+          )}
           {gpuStats && (
             <VramBar
               usedMb={gpuStats.used_mb}
@@ -480,8 +497,8 @@ export function ModelSelector({
                 isLoading={isLoading}
                 showSwap={!!loadedModel && m.filename !== loadedModel}
                 isLast={i === modelCards.length - 1}
-                onLoad={(ctx) => onLoad(m.filename, ctx)}
-                onSwap={(ctx) => onSwap(m.filename, ctx)}
+                onLoad={(options) => onLoad(m.filename, options)}
+                onSwap={(options) => onSwap(m.filename, options)}
               />
             ))}
           </>
@@ -692,6 +709,7 @@ function LoadedModelRow({
 
         {/* Meta */}
         <div className="flex flex-wrap items-center gap-3 text-xs" style={{ color: "var(--text-1)" }}>
+          <ProviderBadge providerName={model.provider_name} managed={model.provider_managed} />
           {model.family && <span>{model.family}</span>}
           {model.quant && (
             <span style={{ color: "#fbbf24" }}>{model.quant}</span>
@@ -707,12 +725,20 @@ function LoadedModelRow({
           )}
           {model.supports_reasoning && <CapBadge label="Reasoning" tone="amber" />}
           {model.supports_tools && <CapBadge label="Tools" tone="emerald" />}
-          {model.supports_vision && <CapBadge label="Vision" tone="rose" />}
+          {model.supports_vision && (
+            <CapBadge
+              label={model.vision_runtime_ready ? "Vision Ready" : model.vision_status}
+              tone={model.vision_runtime_ready ? "rose" : "slate"}
+            />
+          )}
           {model.think_tag_style !== "None" && (
             <CapBadge label={`Think ${model.think_tag_style}`} tone="violet" />
           )}
           {model.tool_call_format !== "NativeApi" && (
             <CapBadge label={fmtToolFormat(model.tool_call_format)} tone="cyan" />
+          )}
+          {model.template_mode && (
+            <CapBadge label={`Template ${model.template_mode}`} tone="slate" />
           )}
         </div>
 
@@ -783,8 +809,8 @@ function ModelRow({
   isLoading: boolean;
   showSwap: boolean;
   isLast: boolean;
-  onLoad: (contextSize?: number) => void;
-  onSwap: (contextSize?: number) => void;
+  onLoad: (options?: LoadModelOptions) => void;
+  onSwap: (options?: LoadModelOptions) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [hovered, setHovered] = useState(false);
@@ -793,7 +819,41 @@ function ModelRow({
   const maxCtx = model.max_context_window ?? Math.max(defaultCtx * 4, 32768);
   const minCtx = 512;
   const [contextSize, setContextSize] = useState(defaultCtx);
-  const customCtx = contextSize !== defaultCtx ? contextSize : undefined;
+  const [fitMode, setFitMode] = useState("on");
+  const [useJinja, setUseJinja] = useState(model.template_mode === "repo");
+  const [reasoningMode, setReasoningMode] = useState("on");
+  const [templateMode, setTemplateMode] = useState(model.template_mode ?? "builtin");
+  const [chatTemplateKwargsJson, setChatTemplateKwargsJson] = useState("");
+  const [extraArgs, setExtraArgs] = useState("");
+  const [supportsVision, setSupportsVision] = useState(model.supports_vision);
+  const [visionSaving, setVisionSaving] = useState(false);
+  const isExternalProvider = !model.provider_managed;
+
+  async function toggleVisionOverride() {
+    const next = !supportsVision;
+    setSupportsVision(next);
+    setVisionSaving(true);
+    try {
+      await api.setModelVisionOverride(model.filename, next);
+    } catch {
+      setSupportsVision(!next);
+    } finally {
+      setVisionSaving(false);
+    }
+  }
+
+  const loadOptions: LoadModelOptions = {
+    contextSize,
+    fitMode,
+    useJinja,
+    reasoningMode,
+    templateMode,
+    chatTemplateKwargsJson: chatTemplateKwargsJson.trim() || undefined,
+    extraArgs: extraArgs
+      .split(/\r?\n|,/)
+      .map((value) => value.trim())
+      .filter(Boolean),
+  };
   // Use GPU stats hook for live VRAM/overflow info
   const gpuStats = useGpuStats();
 
@@ -856,24 +916,33 @@ function ModelRow({
           className="flex flex-wrap items-center gap-3 text-xs"
           style={{ color: "var(--text-1)" }}
         >
+          <ProviderBadge providerName={model.provider_name} managed={model.provider_managed} />
           {model.quant && <span style={{ color: "#fbbf24" }}>{model.quant}</span>}
-          <span>{model.size_gb.toFixed(2)} GB</span>
+          {model.size_gb > 0 && <span>{model.size_gb.toFixed(2)} GB</span>}
           {formatContext(model.context_window, model.max_context_window) && (
             <span>{formatContext(model.context_window, model.max_context_window)}</span>
           )}
-          {customCtx && (
+          {contextSize !== defaultCtx && (
             <span style={{ color: "#22d3ee" }}>
               {contextSize.toLocaleString()} ctx
             </span>
           )}
           {model.supports_reasoning && <CapBadge label="Reasoning" tone="amber" />}
           {model.supports_tools && <CapBadge label="Tools" tone="emerald" />}
-          {model.supports_vision && <CapBadge label="Vision" tone="rose" />}
+          {model.supports_vision && (
+            <CapBadge
+              label={model.vision_runtime_ready ? "Vision Ready" : model.vision_status}
+              tone={model.vision_runtime_ready ? "rose" : "slate"}
+            />
+          )}
           {model.think_tag_style !== "None" && (
             <CapBadge label={`Think ${model.think_tag_style}`} tone="violet" />
           )}
           {model.tool_call_format !== "NativeApi" && (
             <CapBadge label={fmtToolFormat(model.tool_call_format)} tone="cyan" />
+          )}
+          {model.template_mode && (
+            <CapBadge label={`Template ${model.template_mode}`} tone="slate" />
           )}
         </div>
 
@@ -891,16 +960,23 @@ function ModelRow({
           >
             {expanded ? "^" : "v"}
           </button>
-          {showSwap ? (
+          {isExternalProvider ? (
             <ActionBtn
-              onClick={() => onSwap(customCtx)}
+              onClick={() => undefined}
+              disabled
+              label="Provider Routed"
+              variant="ghost"
+            />
+          ) : showSwap ? (
+            <ActionBtn
+              onClick={() => onSwap(loadOptions)}
               disabled={isLoading}
               label="Swap In"
               variant="indigo"
             />
           ) : (
             <ActionBtn
-              onClick={() => onLoad(customCtx)}
+              onClick={() => onLoad(loadOptions)}
               disabled={isLoading}
               label="Load"
               variant="primary"
@@ -919,7 +995,7 @@ function ModelRow({
           }}
         >
           {/* Context slider with live VRAM/overflow monitor */}
-          <div className="mb-3">
+          {!isExternalProvider && <div className="mb-3">
             <div className="mb-2 flex items-center justify-between text-xs">
               <span style={{ color: "var(--text-1)" }}>Context size</span>
               <div className="flex items-center gap-2">
@@ -971,16 +1047,17 @@ function ModelRow({
               }
               return null;
             })()}
-          </div>
+          </div>}
 
           {/* Stats grid */}
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
             <StatTile label="File Size" value={model.size_gb && model.size_gb > 0 ? `${model.size_gb.toFixed(2)} GB` : 'N/A'} />
+            <StatTile label="Provider" value={model.provider_name} />
             <StatTile label="Default Context" value={model.context_window ? `${fmtNum(model.context_window)} tokens` : '—'} />
             <StatTile label="Max Context" value={model.max_context_window ? `${fmtNum(model.max_context_window)} tokens` : '—'} />
             <StatTile label="Tool Format" value={fmtToolFormat(model.tool_call_format)} />
           </div>
-          {(!model.size_gb || model.size_gb === 0) && (
+          {(!isExternalProvider && (!model.size_gb || model.size_gb === 0)) && (
             <div style={{ color: '#fbbf24', fontSize: 12, marginTop: 4 }}>
               File size missing? Try <b>Rescan</b> in the toolbar above.
             </div>
@@ -992,16 +1069,16 @@ function ModelRow({
             style={{ background: "var(--surface-3)", border: "1px solid var(--border)" }}
           >
             <span className="text-[10px] uppercase tracking-widest shrink-0" style={{ color: "var(--text-2)" }}>
-              Path
+              {isExternalProvider ? "Base URL" : "Path"}
             </span>
             <span
               className="flex-1 min-w-0 truncate font-mono text-[11px]"
               style={{ color: "var(--text-1)" }}
-              title={model.path}
+              title={isExternalProvider ? model.provider_base_url ?? model.path : model.path}
             >
-              {model.path}
+              {isExternalProvider ? model.provider_base_url ?? model.path : model.path}
             </span>
-            <button
+            {!isExternalProvider && <button
               onClick={() => api.showInFolder(model.path)}
               className="shrink-0 rounded px-2 py-0.5 text-[10px] font-medium transition"
               style={{
@@ -1020,8 +1097,98 @@ function ModelRow({
               }}
             >
               Open Folder
-            </button>
+            </button>}
           </div>
+
+          {!isExternalProvider && <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <div>
+              <div className="mb-1 text-[10px] uppercase tracking-widest" style={{ color: "var(--text-2)" }}>
+                Template mode
+              </div>
+              <select
+                value={templateMode}
+                onChange={(e) => setTemplateMode(e.target.value)}
+                className="w-full rounded px-2 py-1.5 text-xs"
+                style={{ background: "var(--surface-1)", border: "1px solid var(--border)", color: "var(--text-0)" }}
+              >
+                <option value="builtin">Bridge fallback</option>
+                <option value="repo">Repo template</option>
+                <option value="custom">Custom template</option>
+              </select>
+            </div>
+            <div>
+              <div className="mb-1 text-[10px] uppercase tracking-widest" style={{ color: "var(--text-2)" }}>
+                Reasoning mode
+              </div>
+              <select
+                value={reasoningMode}
+                onChange={(e) => setReasoningMode(e.target.value)}
+                className="w-full rounded px-2 py-1.5 text-xs"
+                style={{ background: "var(--surface-1)", border: "1px solid var(--border)", color: "var(--text-0)" }}
+              >
+                <option value="on">On</option>
+                <option value="off">Off</option>
+                <option value="auto">Auto</option>
+              </select>
+            </div>
+            <div>
+              <div className="mb-1 text-[10px] uppercase tracking-widest" style={{ color: "var(--text-2)" }}>
+                Fit mode
+              </div>
+              <select
+                value={fitMode}
+                onChange={(e) => setFitMode(e.target.value)}
+                className="w-full rounded px-2 py-1.5 text-xs"
+                style={{ background: "var(--surface-1)", border: "1px solid var(--border)", color: "var(--text-0)" }}
+              >
+                <option value="on">On</option>
+                <option value="off">Off</option>
+              </select>
+            </div>
+            <label className="flex items-center gap-2 text-xs" style={{ color: "var(--text-1)" }}>
+              <input type="checkbox" checked={useJinja} onChange={(e) => setUseJinja(e.target.checked)} />
+              Use Jinja rendering
+            </label>
+            <label
+              className="flex items-center gap-2 text-xs"
+              style={{ color: supportsVision ? "#f472b6" : "var(--text-1)", opacity: visionSaving ? 0.6 : 1 }}
+              title="Marks this model as vision-capable so InferenceBridge looks for a matching mmproj sidecar on next load"
+            >
+              <input
+                type="checkbox"
+                checked={supportsVision}
+                disabled={visionSaving}
+                onChange={toggleVisionOverride}
+              />
+              Supports vision (override)
+            </label>
+            <div className="sm:col-span-2">
+              <div className="mb-1 text-[10px] uppercase tracking-widest" style={{ color: "var(--text-2)" }}>
+                Template kwargs JSON
+              </div>
+              <input
+                type="text"
+                value={chatTemplateKwargsJson}
+                onChange={(e) => setChatTemplateKwargsJson(e.target.value)}
+                placeholder='{"preserve_thinking": true}'
+                className="w-full rounded px-2 py-1.5 text-xs"
+                style={{ background: "var(--surface-1)", border: "1px solid var(--border)", color: "var(--text-0)" }}
+              />
+            </div>
+            <div className="sm:col-span-2">
+              <div className="mb-1 text-[10px] uppercase tracking-widest" style={{ color: "var(--text-2)" }}>
+                Extra args
+              </div>
+              <textarea
+                value={extraArgs}
+                onChange={(e) => setExtraArgs(e.target.value)}
+                placeholder="--no-mmproj, --temp 0.6"
+                rows={2}
+                className="w-full rounded px-2 py-1.5 text-xs"
+                style={{ background: "var(--surface-1)", border: "1px solid var(--border)", color: "var(--text-0)" }}
+              />
+            </div>
+          </div>}
         </div>
       )}
     </div>
@@ -1066,13 +1233,14 @@ function StatTile({ label, value }: { label: string; value: string }) {
 
 // ─── Capability badge ─────────────────────────────────────────────────────────
 
-function CapBadge({ label, tone }: { label: string; tone: "amber" | "emerald" | "rose" | "cyan" | "violet" }) {
+function CapBadge({ label, tone }: { label: string; tone: "amber" | "emerald" | "rose" | "cyan" | "violet" | "slate" }) {
   const colors: Record<string, [string, string]> = {
     amber: ["rgba(251,191,36,0.1)", "rgba(251,191,36,0.25)"],
     emerald: ["rgba(52,211,153,0.1)", "rgba(52,211,153,0.25)"],
     rose: ["rgba(248,113,113,0.1)", "rgba(248,113,113,0.25)"],
     cyan: ["rgba(34,211,238,0.1)", "rgba(34,211,238,0.25)"],
     violet: ["rgba(167,139,250,0.1)", "rgba(167,139,250,0.25)"],
+    slate: ["rgba(148,163,184,0.08)", "rgba(148,163,184,0.22)"],
   };
   const textColors: Record<string, string> = {
     amber: "#fcd34d",
@@ -1080,6 +1248,7 @@ function CapBadge({ label, tone }: { label: string; tone: "amber" | "emerald" | 
     rose: "#fca5a5",
     cyan: "#67e8f9",
     violet: "#c4b5fd",
+    slate: "#cbd5e1",
   };
   const [bg, border] = colors[tone];
   return (
@@ -1093,6 +1262,22 @@ function CapBadge({ label, tone }: { label: string; tone: "amber" | "emerald" | 
 }
 
 // ─── Action button ────────────────────────────────────────────────────────────
+
+function ProviderBadge({ providerName, managed }: { providerName: string; managed: boolean }) {
+  return (
+    <span
+      className="shrink-0 rounded px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider"
+      style={{
+        background: managed ? "rgba(34,211,238,0.10)" : "rgba(52,211,153,0.10)",
+        border: managed ? "1px solid rgba(34,211,238,0.22)" : "1px solid rgba(52,211,153,0.22)",
+        color: managed ? "#22d3ee" : "#34d399",
+      }}
+      title={managed ? "Managed by InferenceBridge" : "External provider routed through InferenceBridge"}
+    >
+      {providerName}
+    </span>
+  );
+}
 
 function ActionBtn({
   label,

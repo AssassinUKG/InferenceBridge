@@ -77,11 +77,18 @@ impl ModelProfile {
             Self::qwen3(&lower)
         } else if lower.contains("qwen2.5") {
             Self::qwen2_5()
-        } else if lower.contains("deepseek") && (lower.contains("r1") || lower.contains("reasoning")) {
+        } else if lower.contains("deepseek")
+            && (lower.contains("r1") || lower.contains("reasoning"))
+        {
             Self::deepseek_r1()
         } else if lower.contains("gemma") {
             Self::gemma()
-        } else if lower.contains("llama") && (lower.contains("3.") || lower.contains("3-") || lower.contains("3:")) {
+        } else if lower.contains("llama")
+            && (lower.contains("3.")
+                || lower.contains("3-")
+                || lower.contains("3:")
+                || lower.contains("3_"))
+        {
             Self::llama3()
         } else if lower.contains("phi-3")
             || lower.contains("phi-4")
@@ -100,13 +107,32 @@ impl ModelProfile {
     }
 
     fn infer_vision_support(model_name: &str) -> bool {
-        let normalized = model_name.replace('_', "-");
-        model_name.contains("vision")
-            || model_name.contains("llava")
-            || model_name.contains("multimodal")
-            || model_name.contains("qwen2.5-vl")
-            || model_name.contains("-vl")
-            || model_name.contains("_vl")
+        let lower = model_name.to_lowercase();
+        let normalized = lower.replace('_', "-");
+        lower.contains("vision")
+            || lower.contains("llava")
+            || lower.contains("multimodal")
+            || lower.contains("-vl")
+            || lower.contains("_vl")
+            // MiniCPM-V series
+            || lower.contains("minicpm-v")
+            || lower.contains("minicpmv")
+            // InternVL series
+            || lower.contains("internvl")
+            // Moondream
+            || lower.contains("moondream")
+            // SmolVLM
+            || lower.contains("smolvlm")
+            // Pixtral (Mistral vision)
+            || lower.contains("pixtral")
+            // BakLLaVA
+            || lower.contains("bakllava")
+            // CogVLM
+            || lower.contains("cogvlm")
+            // Idefics
+            || lower.contains("idefics")
+            // Qwen2-VL and Qwen2.5-VL (also caught by -vl above, but explicit for clarity)
+            || normalized.contains("qwen2-vl")
             // Qwen3.5 35B-A3B multimodal variants are commonly published as plain GGUF
             // filenames without an explicit `vision` or `-vl` marker.
             || normalized.contains("qwen3.5-35b-a3b")

@@ -1,6 +1,6 @@
 // Typed wrappers around Tauri invoke calls.
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import type {
   AppSettings,
   ApiAccessInfo,
@@ -13,9 +13,26 @@ import type {
   MessageInfo,
   ModelInfo,
   ProcessStatusInfo,
+  RuntimeDoctorReport,
   ServerInfo,
   SessionInfo,
 } from "./types";
+
+function isTauriRuntime() {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
+function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  if (!isTauriRuntime()) {
+    return Promise.reject(
+      new Error(
+        "Tauri desktop runtime is not available. Start the full app with `npm run tauri dev`; the Vite URL is only the frontend preview."
+      )
+    );
+  }
+
+  return tauriInvoke<T>(command, args);
+}
 
 // Models
 
@@ -23,13 +40,66 @@ export const listModels = () => invoke<ModelInfo[]>("list_models");
 
 export const scanModels = () => invoke<number>("scan_models");
 
-export const loadModel = (modelName: string, contextSize?: number) =>
-  invoke<string>("load_model", { modelName, contextSize });
+export const setModelVisionOverride = (modelName: string, supportsVision: boolean) =>
+  invoke<void>("set_model_vision_override", { modelName, supportsVision });
+
+export interface LoadModelOptions {
+  contextSize?: number;
+  hfRepo?: string;
+  hfFile?: string;
+  fitMode?: string;
+  cacheRamMb?: number | null;
+  ctxcp?: number | null;
+  useJinja?: boolean;
+  reasoningMode?: string;
+  templateMode?: string;
+  templateName?: string | null;
+  customTemplatePath?: string | null;
+  chatTemplateKwargsJson?: string | null;
+  extraArgs?: string[];
+}
+
+export const loadModel = (modelName: string, options?: LoadModelOptions) =>
+  invoke<string>("load_model", {
+    modelName,
+    options: {
+      contextSize: options?.contextSize,
+      hfRepo: options?.hfRepo,
+      hfFile: options?.hfFile,
+      fitMode: options?.fitMode,
+      cacheRamMb: options?.cacheRamMb ?? null,
+      ctxcp: options?.ctxcp ?? null,
+      useJinja: options?.useJinja,
+      reasoningMode: options?.reasoningMode,
+      templateMode: options?.templateMode,
+      templateName: options?.templateName ?? null,
+      customTemplatePath: options?.customTemplatePath ?? null,
+      chatTemplateKwargsJson: options?.chatTemplateKwargsJson ?? null,
+      extraArgs: options?.extraArgs,
+    },
+  });
 
 export const unloadModel = () => invoke<string>("unload_model");
 
-export const swapModel = (modelName?: string, contextSize?: number) =>
-  invoke<string>("swap_model", { modelName, contextSize });
+export const swapModel = (modelName?: string, options?: LoadModelOptions) =>
+  invoke<string>("swap_model", {
+    modelName,
+    options: {
+      contextSize: options?.contextSize,
+      hfRepo: options?.hfRepo,
+      hfFile: options?.hfFile,
+      fitMode: options?.fitMode,
+      cacheRamMb: options?.cacheRamMb ?? null,
+      ctxcp: options?.ctxcp ?? null,
+      useJinja: options?.useJinja,
+      reasoningMode: options?.reasoningMode,
+      templateMode: options?.templateMode,
+      templateName: options?.templateName ?? null,
+      customTemplatePath: options?.customTemplatePath ?? null,
+      chatTemplateKwargsJson: options?.chatTemplateKwargsJson ?? null,
+      extraArgs: options?.extraArgs,
+    },
+  });
 
 export const getProcessStatus = () =>
   invoke<ProcessStatusInfo>("get_process_status");
@@ -121,6 +191,9 @@ export const getLaunchPreview = () => invoke<string>("get_launch_preview");
 export const getEffectiveProfile = (modelName?: string) =>
   invoke<EffectiveProfileInfo>("get_effective_profile", { modelName });
 
+export const getRuntimeDoctor = () =>
+  invoke<RuntimeDoctorReport>("get_runtime_doctor");
+
 export const getLogs = (limit?: number) =>
   invoke<LogEntry[]>("get_logs", { limit });
 
@@ -183,11 +256,13 @@ export const showInFolder = (path: string) =>
 export const downloadHubModel = (
   url: string,
   filename: string,
-  supportsVision?: boolean
+  supportsVision?: boolean,
+  repoId?: string
 ) => invoke<string>("download_hub_model", {
   url,
   filename,
   supportsVision,
+  repoId,
 });
 
 export const listDownloads = () =>

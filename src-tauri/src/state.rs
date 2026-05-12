@@ -6,15 +6,15 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
+use crate::commands::browse::DownloadProgress;
 use crate::config::AppConfig;
 use crate::context::tracker::ContextStatus;
-use crate::engine::scheduler::RequestScheduler;
 use crate::engine::process::{LaunchPreview, LlamaProcess};
+use crate::engine::scheduler::RequestScheduler;
 use crate::models::overrides::ModelProfileOverride;
 use crate::models::profiles::ModelProfile;
 use crate::models::registry::ModelRegistry;
 use crate::session::db::SessionDb;
-use crate::commands::browse::DownloadProgress;
 
 #[derive(Clone, serde::Serialize)]
 pub enum ModelLoadState {
@@ -176,10 +176,7 @@ pub struct GenerationHandle {
     pub request_id: String,
 }
 
-pub async fn begin_api_generation(
-    state: &SharedState,
-    model: String,
-) -> GenerationHandle {
+pub async fn begin_api_generation(state: &SharedState, model: String) -> GenerationHandle {
     let mut s = state.write().await;
     s.generation_cancel.cancel();
     s.generation_cancel = CancellationToken::new();
@@ -221,9 +218,9 @@ pub fn summarize_reasoning_tokens(
         let reasoning_chars = reasoning_text.chars().count() as u32;
         let total_chars = visible_chars + reasoning_chars;
         if total_chars > 0 {
-            let estimated =
-                ((total_completion_tokens as f64) * (reasoning_chars as f64 / total_chars as f64))
-                    .round() as u32;
+            let estimated = ((total_completion_tokens as f64)
+                * (reasoning_chars as f64 / total_chars as f64))
+                .round() as u32;
             return estimated.min(total_completion_tokens);
         }
     }

@@ -25,10 +25,13 @@ pub fn strip_think_tags(text: &str) -> String {
                     remaining = format!("{}{}", &remaining[..start], &remaining[close_end..]);
                 } else {
                     let before = remaining[..start].trim().to_string();
+                    let inner = remaining[after_open..].trim().to_string();
+                    if !before.is_empty() && !inner.is_empty() {
+                        return format!("{before} {inner}");
+                    }
                     if !before.is_empty() {
                         return before;
                     }
-                    let inner = remaining[after_open..].trim().to_string();
                     if !inner.is_empty() {
                         return inner;
                     }
@@ -128,6 +131,15 @@ mod tests {
     fn salvages_json_inside_think() {
         let raw = "<think>{\"name\":\"test\"}</think>";
         assert!(!strip_think_tags(raw).is_empty());
+    }
+
+    #[test]
+    fn unmatched_opening_tag_preserves_visible_prefix_and_suffix() {
+        let raw = "Answer:<think>still useful trailing content";
+        assert_eq!(
+            strip_think_tags(raw),
+            "Answer: still useful trailing content"
+        );
     }
 
     #[test]

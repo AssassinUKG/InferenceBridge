@@ -100,6 +100,8 @@ pub enum ProcessState {
 #[derive(Debug, Clone)]
 pub struct LaunchConfig {
     pub model_path: PathBuf,
+    pub hf_repo: Option<String>,
+    pub hf_file: Option<String>,
     /// When `None`, llama-server uses the model's native context window.
     pub context_size: Option<u32>,
     pub gpu_layers: i32,
@@ -117,18 +119,41 @@ pub struct LaunchConfig {
     pub main_gpu: i32,
     pub defrag_thold: f32,
     pub rope_freq_scale: f32,
+    pub fit_mode: Option<String>,
+    pub cache_ram_mb: Option<u32>,
+    pub ctxcp: Option<u32>,
+    pub use_jinja: bool,
+    pub reasoning_mode: Option<String>,
+    pub template_mode: String,
+    pub template_source: Option<String>,
+    pub template_file: Option<PathBuf>,
+    pub template_name: Option<String>,
+    pub chat_template_kwargs_json: Option<String>,
+    pub extra_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LaunchPreview {
     pub server_path: String,
     pub model_path: String,
+    pub hf_repo: Option<String>,
+    pub hf_file: Option<String>,
     pub mmproj_path: Option<String>,
     pub backend_preference: String,
     /// Actual context size: either explicitly requested or discovered from server after launch.
     pub context_size: Option<u32>,
     pub port: u16,
     pub parallel_slots: u32,
+    pub fit_mode: Option<String>,
+    pub cache_ram_mb: Option<u32>,
+    pub ctxcp: Option<u32>,
+    pub use_jinja: bool,
+    pub reasoning_mode: Option<String>,
+    pub template_mode: String,
+    pub template_source: Option<String>,
+    pub template_path: Option<String>,
+    pub template_name: Option<String>,
+    pub chat_template_kwargs_json: Option<String>,
     pub args: Vec<String>,
 }
 
@@ -163,7 +188,8 @@ impl LlamaProcess {
     }
 
     pub fn validate_launch_config(config: &LaunchConfig) -> anyhow::Result<()> {
-        if !config.model_path.exists() {
+        if config.hf_repo.as_deref().unwrap_or("").trim().is_empty() && !config.model_path.exists()
+        {
             anyhow::bail!("Model file does not exist: {}", config.model_path.display());
         }
         if config.context_size == Some(0) {
@@ -182,6 +208,16 @@ impl LlamaProcess {
         if config.rope_freq_scale < 0.0 {
             anyhow::bail!("RoPE frequency scale cannot be negative");
         }
+        if let Some(cache_ram_mb) = config.cache_ram_mb {
+            if cache_ram_mb == 0 {
+                anyhow::bail!("cache_ram_mb must be greater than 0 when specified");
+            }
+        }
+        if let Some(ctxcp) = config.ctxcp {
+            if ctxcp == 0 {
+                anyhow::bail!("ctxcp must be greater than 0 when specified");
+            }
+        }
         Ok(())
     }
 
@@ -198,15 +234,35 @@ impl LlamaProcess {
             None
         };
 
-        let mut args = vec![
-            "--model".to_string(),
-            config.model_path.to_string_lossy().to_string(),
+        let mut args = vec![];
+
+        if let Some(hf_repo) = config
+            .hf_repo
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            args.push("-hf".to_string());
+            let hf_ref = match config
+                .hf_file
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+            {
+                Some(file) => format!("{hf_repo}:{file}"),
+                None => hf_repo.clone(),
+            };
+            args.push(hf_ref);
+        } else {
+            args.push("--model".to_string());
+            args.push(config.model_path.to_string_lossy().to_string());
+        }
+
+        args.extend([
             "--port".to_string(),
             config.port.to_string(),
             "--parallel".to_string(),
             config.parallel_slots.max(1).to_string(),
             "--slots".to_string(),
-        ];
+        ]);
 
         // Only pass --ctx-size when explicitly specified; otherwise let
         // llama-server use the model's native context window.
@@ -218,6 +274,53 @@ impl LlamaProcess {
         if let Some(mmproj) = &mmproj_path {
             args.push("--mmproj".to_string());
             args.push(mmproj.to_string_lossy().to_string());
+        }
+        if let Some(fit_mode) = config
+            .fit_mode
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            args.push("--fit".to_string());
+            args.push(fit_mode.clone());
+        }
+        if let Some(cache_ram_mb) = config.cache_ram_mb {
+            args.push("--cache-ram".to_string());
+            args.push(cache_ram_mb.to_string());
+        }
+        if let Some(ctxcp) = config.ctxcp {
+            args.push("-ctxcp".to_string());
+            args.push(ctxcp.to_string());
+        }
+        if config.use_jinja {
+            args.push("--jinja".to_string());
+        }
+        if let Some(reasoning_mode) = config
+            .reasoning_mode
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            args.push("--reasoning".to_string());
+            args.push(reasoning_mode.clone());
+        }
+        if let Some(template_name) = config
+            .template_name
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            args.push("--chat-template".to_string());
+            args.push(template_name.clone());
+        }
+        if let Some(template_file) = config.template_file.as_ref() {
+            args.push("--chat-template-file".to_string());
+            args.push(template_file.to_string_lossy().to_string());
+        }
+        if let Some(kwargs_json) = config
+            .chat_template_kwargs_json
+            .as_ref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            args.push("--chat-template-kwargs".to_string());
+            args.push(kwargs_json.clone());
         }
 
         if config.gpu_layers != 0 {
@@ -268,15 +371,31 @@ impl LlamaProcess {
             args.push("--rope-freq-scale".to_string());
             args.push(format!("{:.6}", config.rope_freq_scale));
         }
+        args.extend(config.extra_args.iter().cloned());
 
         Ok(LaunchPreview {
             server_path: server_path.to_string_lossy().to_string(),
             model_path: config.model_path.to_string_lossy().to_string(),
+            hf_repo: config.hf_repo.clone(),
+            hf_file: config.hf_file.clone(),
             mmproj_path: mmproj_path.map(|path| path.to_string_lossy().to_string()),
             backend_preference: config.backend_preference.clone(),
             context_size: config.context_size,
             port: config.port,
             parallel_slots: config.parallel_slots.max(1),
+            fit_mode: config.fit_mode.clone(),
+            cache_ram_mb: config.cache_ram_mb,
+            ctxcp: config.ctxcp,
+            use_jinja: config.use_jinja,
+            reasoning_mode: config.reasoning_mode.clone(),
+            template_mode: config.template_mode.clone(),
+            template_source: config.template_source.clone(),
+            template_path: config
+                .template_file
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string()),
+            template_name: config.template_name.clone(),
+            chat_template_kwargs_json: config.chat_template_kwargs_json.clone(),
             args,
         })
     }
@@ -400,13 +519,13 @@ impl LlamaProcess {
             .find(|p| Self::matches_backend_preference(p, backend_preference))
     }
 
-    /// Find a free TCP port by binding to port 0 and reading the OS-assigned port.
-    /// The listener is dropped immediately, freeing the port for llama-server to use.
-    fn find_free_port() -> anyhow::Result<u16> {
+    /// Reserve a free TCP port by binding to port 0 and holding the listener
+    /// until immediately before spawning llama-server. This narrows the race
+    /// window compared with dropping the listener before process launch.
+    fn reserve_free_port() -> anyhow::Result<(std::net::TcpListener, u16)> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let port = listener.local_addr()?.port();
-        drop(listener);
-        Ok(port)
+        Ok((listener, port))
     }
 
     pub fn new() -> Self {
@@ -513,10 +632,17 @@ impl LlamaProcess {
         // NOTE: stale-process cleanup (kill_all_managed_processes / WMIC) was moved
         // to `clear_stale_managed_processes()` and must be called BEFORE the write lock.
 
-        // Auto-assign a free ephemeral port when port is 0.
+        // Auto-assign a free ephemeral port when port is 0, and keep the
+        // reservation open until just before the child is spawned.
+        let mut port_reservation = None;
         if config.port == 0 {
-            config.port = Self::find_free_port()?;
-            tracing::info!(port = config.port, "Auto-assigned free port for llama-server");
+            let (listener, port) = Self::reserve_free_port()?;
+            config.port = port;
+            port_reservation = Some(listener);
+            tracing::info!(
+                port = config.port,
+                "Auto-assigned free port for llama-server"
+            );
         }
 
         let preview = self.build_args_preview(&config)?;
@@ -567,6 +693,7 @@ impl LlamaProcess {
             "Launching llama-server"
         );
 
+        drop(port_reservation);
         let mut child = cmd.spawn()?;
         let child_pid = child.id();
 
@@ -663,10 +790,16 @@ impl LlamaProcess {
         if self.child.is_none() {
             return false;
         }
-        let client = reqwest::Client::builder()
+        let client = match reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
-            .unwrap_or_default();
+        {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::warn!(%error, "Falling back to default HTTP client for health check");
+                reqwest::Client::new()
+            }
+        };
         let url = format!("http://127.0.0.1:{}/health", self.current_port);
         matches!(client.get(&url).send().await, Ok(r) if r.status().is_success())
     }
@@ -683,10 +816,16 @@ impl LlamaProcess {
             );
 
             // Try graceful shutdown via /shutdown endpoint
-            let client = reqwest::Client::builder()
+            let client = match reqwest::Client::builder()
                 .timeout(Duration::from_secs(3))
                 .build()
-                .unwrap_or_default();
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    tracing::warn!(%error, "Falling back to default HTTP client for shutdown");
+                    reqwest::Client::new()
+                }
+            };
             let shutdown_url = format!("http://127.0.0.1:{}/shutdown", self.current_port);
             match client.post(&shutdown_url).send().await {
                 Ok(_) => tracing::debug!("Graceful shutdown request sent"),
@@ -710,14 +849,23 @@ impl LlamaProcess {
                 let _ = Self::force_kill_process_tree(pid);
             }
 
+            let released_port = self.current_port;
             self.current_model = None;
             self.current_pid = None;
             *self.detected_backend.lock().await = None;
             self.stderr_lines.lock().await.clear();
+
+            // Abort background I/O reader tasks before waiting on the port so
+            // lingering pipes/handles do not slow teardown.
+            for handle in self.io_tasks.drain(..) {
+                handle.abort();
+            }
+
+            Self::wait_for_port_release(released_port, Duration::from_millis(1500)).await;
+            self.current_port = 0;
             self.set_state(ProcessState::Idle);
-            Self::wait_for_port_release(self.current_port, Duration::from_millis(1500)).await;
         }
-        // Abort background I/O reader tasks
+        // Abort background I/O reader tasks for the no-child path too.
         for handle in self.io_tasks.drain(..) {
             handle.abort();
         }
@@ -784,7 +932,10 @@ impl LlamaProcess {
 
     #[cfg(windows)]
     fn normalize_windows_path(path: &str) -> String {
-        path.trim_matches('"').trim().replace('/', "\\").to_lowercase()
+        path.trim_matches('"')
+            .trim()
+            .replace('/', "\\")
+            .to_lowercase()
     }
 
     #[cfg(windows)]
@@ -808,7 +959,9 @@ impl LlamaProcess {
     fn force_kill_process_tree(pid: u32) -> anyhow::Result<()> {
         use std::process::Command;
         // Kill the process group (negative PID) to get all children.
-        let _ = Command::new("kill").args(["-9", &format!("-{pid}")]).output();
+        let _ = Command::new("kill")
+            .args(["-9", &format!("-{pid}")])
+            .output();
         // Also kill the PID directly in case it's not a process group leader.
         let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
         Ok(())
@@ -816,8 +969,11 @@ impl LlamaProcess {
 
     #[cfg(windows)]
     pub fn kill_all_managed_processes() -> anyhow::Result<u32> {
-        let managed_exe =
-            Self::normalize_windows_path(&Self::managed_binary_dir().join("llama-server.exe").to_string_lossy());
+        let managed_exe = Self::normalize_windows_path(
+            &Self::managed_binary_dir()
+                .join("llama-server.exe")
+                .to_string_lossy(),
+        );
 
         let output = system_command("wmic")
             .args([

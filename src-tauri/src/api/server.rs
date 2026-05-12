@@ -123,7 +123,9 @@ async fn serve_api_server(
     let server = axum::serve(listener, app);
     let result = if let Some(shutdown_rx) = shutdown {
         server
-            .with_graceful_shutdown(async move { let _ = shutdown_rx.await; })
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.await;
+            })
             .await
     } else {
         server.await
@@ -209,7 +211,9 @@ async fn evict_port_blocker(host: &str, port: u16, current_pid: u32) {
         tracing::warn!(
             port,
             owner_pid,
-            owner_name = owner_name.as_deref().unwrap_or("<ghost — tasklist returned nothing>"),
+            owner_name = owner_name
+                .as_deref()
+                .unwrap_or("<ghost — tasklist returned nothing>"),
             "evict_port_blocker: attempting force-kill of port owner"
         );
 
@@ -296,7 +300,12 @@ fn find_listening_pid(port: u16) -> Option<u32> {
             continue;
         }
         if let Ok(pid) = cols[4].parse::<u32>() {
-            tracing::debug!(port, pid, local_addr = cols[1], "find_listening_pid: found owner");
+            tracing::debug!(
+                port,
+                pid,
+                local_addr = cols[1],
+                "find_listening_pid: found owner"
+            );
             return Some(pid);
         }
     }
@@ -327,7 +336,10 @@ fn resolve_pid_name(pid: u32) -> Option<String> {
 
     // tasklist returns "INFO: No tasks are running..." when PID is not found.
     if line.is_empty() || line.starts_with("INFO:") {
-        tracing::debug!(pid, "resolve_pid_name: PID not visible to tasklist (ghost/protected)");
+        tracing::debug!(
+            pid,
+            "resolve_pid_name: PID not visible to tasklist (ghost/protected)"
+        );
         return None;
     }
 
@@ -448,9 +460,29 @@ async fn backend_proxy_fallback(
     };
 
     let method = req.method().clone();
-    let path = req.uri().path_and_query()
+    let path = req
+        .uri()
+        .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| req.uri().path().to_string());
+
+    // Short-circuit: port 0 means no model has been loaded yet — skip the
+    // network call entirely and return a clean error immediately.
+    if backend_port == 0 {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        tracing::debug!(%path, "backend_proxy_fallback: no model loaded (port 0), returning early");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": "No model is loaded. Load a model before sending requests.",
+                "path": path,
+                "hint": "Use the InferenceBridge UI (Models tab) or POST /v1/models/load to load a model."
+            })),
+        )
+            .into_response();
+    }
+
     let url = format!("http://127.0.0.1:{}{}", backend_port, path);
 
     tracing::debug!(
@@ -491,10 +523,8 @@ async fn backend_proxy_fallback(
                     if let Some(ct) = headers.get(reqwest::header::CONTENT_TYPE) {
                         builder = builder.header(axum::http::header::CONTENT_TYPE, ct.as_bytes());
                     } else {
-                        builder = builder.header(
-                            axum::http::header::CONTENT_TYPE,
-                            "application/json",
-                        );
+                        builder =
+                            builder.header(axum::http::header::CONTENT_TYPE, "application/json");
                     }
                     builder
                         .body(axum::body::Body::from(body))
@@ -582,38 +612,83 @@ async fn require_api_key(
 
 fn api_routes() -> Router<SharedState> {
     Router::new()
-        .route("/responses", axum::routing::post(super::responses::responses))
-        .route("/chat/completions", axum::routing::post(super::completions::chat_completions))
-        .route("/completions", axum::routing::post(super::completions::text_completions))
+        .route(
+            "/responses",
+            axum::routing::post(super::responses::responses),
+        )
+        .route(
+            "/chat/completions",
+            axum::routing::post(super::completions::chat_completions),
+        )
+        .route(
+            "/completions",
+            axum::routing::post(super::completions::text_completions),
+        )
         .route("/models", axum::routing::get(super::models::list_models))
-        .route("/models/load", axum::routing::post(super::models::load_model))
-        .route("/models/unload", axum::routing::post(super::models::unload_model))
+        .route(
+            "/models/load",
+            axum::routing::post(super::models::load_model),
+        )
+        .route(
+            "/models/unload",
+            axum::routing::post(super::models::unload_model),
+        )
         .route(
             "/models/stats",
-            axum::routing::get(super::models::current_model_stats)
-                .post(super::models::model_stats),
+            axum::routing::get(super::models::current_model_stats).post(super::models::model_stats),
         )
-        .route("/models/:model", axum::routing::get(super::models::get_model))
-        .route("/context/status", axum::routing::get(super::extensions::context_status))
-        .route("/runtime/status", axum::routing::get(super::extensions::runtime_status))
-        .route("/debug/profile", axum::routing::get(super::extensions::debug_profile))
+        .route(
+            "/models/:model",
+            axum::routing::get(super::models::get_model),
+        )
+        .route(
+            "/context/status",
+            axum::routing::get(super::extensions::context_status),
+        )
+        .route(
+            "/runtime/status",
+            axum::routing::get(super::extensions::runtime_status),
+        )
+        .route(
+            "/runtime/doctor",
+            axum::routing::get(super::extensions::runtime_doctor),
+        )
+        .route(
+            "/debug/profile",
+            axum::routing::get(super::extensions::debug_profile),
+        )
         .route(
             "/sessions",
             axum::routing::get(super::extensions::list_sessions)
                 .post(super::extensions::create_session),
         )
-        .route("/sessions/:id", axum::routing::delete(super::extensions::delete_session))
-        .route("/sessions/:id/messages", axum::routing::get(super::extensions::get_session_messages))
+        .route(
+            "/sessions/:id",
+            axum::routing::delete(super::extensions::delete_session),
+        )
+        .route(
+            "/sessions/:id/messages",
+            axum::routing::get(super::extensions::get_session_messages),
+        )
         .route("/health", axum::routing::get(super::health::health_check))
         .route("/metrics", axum::routing::get(super::metrics::get_metrics))
-        .route("/inference/cancel", axum::routing::post(super::metrics::cancel_inference))
+        .route(
+            "/inference/cancel",
+            axum::routing::post(super::metrics::cancel_inference),
+        )
 }
 
 fn native_api_routes() -> Router<SharedState> {
     Router::new()
         .route("/models", axum::routing::get(super::models::list_models))
-        .route("/models/load", axum::routing::post(super::models::load_model))
-        .route("/models/unload", axum::routing::post(super::models::unload_model))
+        .route(
+            "/models/load",
+            axum::routing::post(super::models::load_model),
+        )
+        .route(
+            "/models/unload",
+            axum::routing::post(super::models::unload_model),
+        )
         .route("/health", axum::routing::get(super::health::health_check))
 }
 

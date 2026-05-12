@@ -90,7 +90,9 @@ pub struct NextTokenInfo {
     pub n_remain: i64,
 }
 
-fn deserialize_next_token<'de, D>(deserializer: D) -> std::result::Result<Option<NextTokenInfo>, D::Error>
+fn deserialize_next_token<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<NextTokenInfo>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -210,16 +212,24 @@ mod tests {
     #[test]
     fn deserializes_slot_info_when_next_token_is_array() {
         let payload = r#"[{"id":0,"n_ctx":8192,"n_past":0,"state":0,"is_processing":false,"next_token":[{"has_next_token":false,"has_new_line":false,"n_remain":11619,"n_decoded":669}]}]"#;
-        let slots: Vec<SlotInfo> = serde_json::from_str(payload).expect("slot payload should deserialize");
+        let slots: Vec<SlotInfo> =
+            serde_json::from_str(payload).expect("slot payload should deserialize");
         assert_eq!(slots.len(), 1);
         assert_eq!(slots[0].n_ctx, 8192);
-        assert_eq!(slots[0].next_token.as_ref().map(|token| token.n_decoded), Some(669));
+        assert_eq!(
+            slots[0].next_token.as_ref().map(|token| token.n_decoded),
+            Some(669)
+        );
     }
 
     #[test]
     fn deserializes_slot_info_when_next_token_is_object() {
         let payload = r#"[{"id":0,"n_ctx":4096,"n_past":128,"state":0,"is_processing":true,"next_token":{"n_remain":12,"n_decoded":128}}]"#;
-        let slots: Vec<SlotInfo> = serde_json::from_str(payload).expect("slot payload should deserialize");
-        assert_eq!(slots[0].next_token.as_ref().map(|token| token.n_decoded), Some(128));
+        let slots: Vec<SlotInfo> =
+            serde_json::from_str(payload).expect("slot payload should deserialize");
+        assert_eq!(
+            slots[0].next_token.as_ref().map(|token| token.n_decoded),
+            Some(128)
+        );
     }
 }

@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { ModelInfo, ProcessStatusInfo, LoadProgress } from "../lib/types";
 import * as api from "../lib/tauri";
+import type { LoadModelOptions } from "../lib/tauri";
 
 const STATUS_POLL_MS = 1500;
 
@@ -185,7 +186,7 @@ export function useModel() {
   }, []);
 
   const loadModel = useCallback(
-    async (modelName: string, contextSize?: number) => {
+    async (modelName: string, options?: LoadModelOptions) => {
       setState((s) => ({
         ...s,
         isLoading: true,
@@ -199,7 +200,7 @@ export function useModel() {
         },
       }));
       try {
-        const result = await api.swapModel(modelName, contextSize);
+        const result = await api.swapModel(modelName, options);
         await refresh();
         setState((s) => ({ ...s, isLoading: false, loadProgress: null }));
         return result;
@@ -233,7 +234,7 @@ export function useModel() {
   }, [refresh]);
 
   const swapModel = useCallback(
-    async (modelName?: string, contextSize?: number) => {
+    async (modelName?: string, options?: LoadModelOptions) => {
       setState((s) => ({
         ...s,
         isLoading: true,
@@ -247,7 +248,7 @@ export function useModel() {
         },
       }));
       try {
-        const result = await api.swapModel(modelName, contextSize);
+        const result = await api.swapModel(modelName, options);
         await refresh();
         setState((s) => ({ ...s, isLoading: false, loadProgress: null }));
         return result;
