@@ -153,11 +153,11 @@ impl ModelProfile {
             renderer_type: RendererType::QwenChat,
             stop_markers: vec!["</tool_call>".into(), "</function>".into()],
             allow_fallback_extraction: true,
-            default_presence_penalty: Some(1.5),
-            default_temperature: Some(0.6),
-            default_top_p: Some(0.95),
+            default_presence_penalty: Some(1.3),
+            default_temperature: Some(0.7),
+            default_top_p: Some(0.8),
             default_top_k: Some(20),
-            default_min_p: Some(0.0),
+            default_min_p: Some(0.05),
             disable_thinking_for_tools: true,
             split_tool_calling: true,
         }
@@ -170,6 +170,7 @@ impl ModelProfile {
             think_tag_style: ThinkTagStyle::Standard,
             interleaved_think_tool: true,
             supports_parallel_tools: model_name.contains("14b")
+                || model_name.contains("27b")
                 || model_name.contains("30b")
                 || model_name.contains("32b"),
             supports_vision: false,
@@ -180,11 +181,11 @@ impl ModelProfile {
             renderer_type: RendererType::QwenChat,
             stop_markers: vec!["</tool_call>".into(), "</function>".into()],
             allow_fallback_extraction: true,
-            default_presence_penalty: Some(1.5),
-            default_temperature: Some(0.6),
-            default_top_p: Some(0.95),
+            default_presence_penalty: Some(1.3),
+            default_temperature: Some(0.7),
+            default_top_p: Some(0.8),
             default_top_k: Some(20),
-            default_min_p: Some(0.0),
+            default_min_p: Some(0.05),
             disable_thinking_for_tools: true,
             split_tool_calling: true,
         }

@@ -111,6 +111,32 @@ pub struct ProcessConfig {
     pub custom_template_path: Option<String>,
     /// Optional JSON object passed to --chat-template-kwargs.
     pub chat_template_kwargs_json: Option<String>,
+    /// KV cache quantisation for keys (--cache-type-k). Options: "f32","f16","q8_0","q4_0","q4_1".
+    /// "q8_0" halves KV VRAM with negligible quality loss on CUDA.
+    pub cache_type_k: String,
+    /// KV cache quantisation for values (--cache-type-v). Same options as cache_type_k.
+    pub cache_type_v: String,
+    /// Merge all parallel-slot KV caches into one contiguous buffer (--kv-unified).
+    /// Reduces fragmentation; improves reuse across parallel HelixClaw agent requests.
+    pub kv_unified: bool,
+    /// Skip KV cache warmup on load (--no-warmup). Shaves 10-30 s off startup at the cost
+    /// of a slightly slower first request.
+    pub no_warmup: bool,
+    /// Enable context-shift extension (--ctx-shift). Discards oldest tokens when the
+    /// KV context fills, enabling "infinite" generation beyond ctx_size.
+    pub ctx_shift: bool,
+    /// GPU tensor-split ratios for multi-GPU setups (--tensor-split).
+    /// e.g. [3.0, 2.0] for a 60/40 split across two GPUs. Empty = single GPU.
+    pub tensor_split: Vec<f32>,
+    /// Path to a GGUF draft model for speculative decoding (-md). Empty = disabled.
+    /// Use a small model from the same family (e.g. Qwen3-0.6B for Qwen3-27B).
+    pub draft_model_path: String,
+    /// Max draft tokens per speculative step (--draft-max). 0 = server default (16).
+    pub draft_max_tokens: u32,
+    /// Min draft tokens before verification (--draft-min). 0 = server default (5).
+    pub draft_min_tokens: u32,
+    /// Min draft acceptance probability (--draft-p-min). 0.0 = server default.
+    pub draft_p_min: f32,
     /// Extra raw llama-server args appended after curated settings.
     pub extra_args: Vec<String>,
     /// Maximum time (seconds) to wait for a model to load. Default 300 (5 min).
@@ -197,7 +223,7 @@ impl Default for ProcessConfig {
             backend_preference: "auto".to_string(),
             batch_size: 0,
             ubatch_size: 0,
-            flash_attn: false,
+            flash_attn: true,
             use_mmap: true,
             use_mlock: false,
             cont_batching: true,
@@ -214,6 +240,16 @@ impl Default for ProcessConfig {
             template_name: None,
             custom_template_path: None,
             chat_template_kwargs_json: None,
+            cache_type_k: "q8_0".to_string(),
+            cache_type_v: "q8_0".to_string(),
+            kv_unified: true,
+            no_warmup: false,
+            ctx_shift: false,
+            tensor_split: vec![],
+            draft_model_path: String::new(),
+            draft_max_tokens: 0,
+            draft_min_tokens: 0,
+            draft_p_min: 0.0,
             extra_args: Vec::new(),
             model_load_timeout_secs: 300,
             first_token_timeout_secs: 300,

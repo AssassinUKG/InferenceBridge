@@ -1,6 +1,15 @@
 //! JSON repair pipeline — ported from HelixClaw's repair_json().
 //! 5-step repair: fast parse → trailing commas → unclosed strings → rebalance braces → salvage.
 
+use std::sync::OnceLock;
+
+static TRAILING_COMMA_RE: OnceLock<regex::Regex> = OnceLock::new();
+
+fn trailing_comma_re() -> &'static regex::Regex {
+    TRAILING_COMMA_RE
+        .get_or_init(|| regex::Regex::new(r",\s*([}\]])").unwrap())
+}
+
 /// Attempt to repair malformed JSON and return the parsed value.
 pub fn repair_json(input: &str) -> Option<serde_json::Value> {
     let trimmed = input.trim();
@@ -36,8 +45,7 @@ pub fn repair_json(input: &str) -> Option<serde_json::Value> {
 }
 
 fn remove_trailing_commas(s: &str) -> String {
-    let re = regex::Regex::new(r",\s*([}\]])").unwrap();
-    re.replace_all(s, "$1").to_string()
+    trailing_comma_re().replace_all(s, "$1").to_string()
 }
 
 fn close_unclosed_strings(s: &str) -> String {

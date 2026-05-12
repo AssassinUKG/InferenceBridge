@@ -87,6 +87,16 @@ pub async fn test_model(
             template_name: state.config.process.template_name.clone(),
             chat_template_kwargs_json: state.config.process.chat_template_kwargs_json.clone(),
             extra_args: state.config.process.extra_args.clone(),
+            cache_type_k: state.config.process.cache_type_k.clone(),
+            cache_type_v: state.config.process.cache_type_v.clone(),
+            kv_unified: state.config.process.kv_unified,
+            no_warmup: state.config.process.no_warmup,
+            ctx_shift: state.config.process.ctx_shift,
+            tensor_split: state.config.process.tensor_split.clone(),
+            draft_model_path: state.config.process.draft_model_path.clone(),
+            draft_max_tokens: state.config.process.draft_max_tokens,
+            draft_min_tokens: state.config.process.draft_min_tokens,
+            draft_p_min: state.config.process.draft_p_min,
         };
         state.process.launch(config).await?;
         state.loaded_model = Some(model.filename.clone());
@@ -115,6 +125,7 @@ pub async fn test_model(
         stop: profile.stop_markers.clone(),
         special: true,
         image_data: vec![],
+        grammar: None,
     };
     let port = {
         let state = shared_state.read().await;

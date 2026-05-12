@@ -2,6 +2,28 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+#[derive(serde::Deserialize)]
+struct SseChunkData {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    stop: bool,
+    #[serde(default)]
+    tokens_predicted: Option<u64>,
+    #[serde(default)]
+    tokens_evaluated: Option<u64>,
+    #[serde(default)]
+    timings: Option<SseTimings>,
+}
+
+#[derive(serde::Deserialize)]
+struct SseTimings {
+    #[serde(default)]
+    predicted_per_second: Option<f64>,
+    #[serde(default)]
+    prompt_per_second: Option<f64>,
+}
+
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     Token(String),
@@ -186,11 +208,14 @@ pub async fn consume_sse_stream_with_timeouts(
             }
         };
 
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        match std::str::from_utf8(&chunk) {
+            Ok(s) => buffer.push_str(s),
+            Err(_) => buffer.push_str(&String::from_utf8_lossy(&chunk)),
+        }
 
         while let Some(line_end) = buffer.find('\n') {
             let line = buffer[..line_end].trim().to_string();
-            buffer = buffer[line_end + 1..].to_string();
+            buffer.drain(..line_end + 1);
 
             if line.is_empty() || line.starts_with(':') {
                 continue;
@@ -221,9 +246,9 @@ pub async fn consume_sse_stream_with_timeouts(
                     return Ok(full_text);
                 }
 
-                match serde_json::from_str::<serde_json::Value>(data) {
+                match serde_json::from_str::<SseChunkData>(data) {
                     Ok(json) => {
-                        if let Some(content) = json["content"].as_str() {
+                        if let Some(content) = json.content.as_deref() {
                             if !content.is_empty() {
                                 full_text.push_str(content);
                                 parser_buffer.push_str(content);
@@ -232,22 +257,24 @@ pub async fn consume_sse_stream_with_timeouts(
                             }
                         }
 
-                        if json["stop"].as_bool().unwrap_or(false) {
-                            if let Some(value) = json["tokens_predicted"].as_u64() {
+                        if json.stop {
+                            if let Some(value) = json.tokens_predicted {
                                 tokens_predicted = value as u32;
                             }
-                            if let Some(value) = json["tokens_evaluated"].as_u64() {
+                            if let Some(value) = json.tokens_evaluated {
                                 tokens_evaluated = value as u32;
                             }
                             if let Some(value) = json
-                                .get("timings")
-                                .and_then(|timings| timings["predicted_per_second"].as_f64())
+                                .timings
+                                .as_ref()
+                                .and_then(|t| t.predicted_per_second)
                             {
                                 decode_tokens_per_second = value;
                             }
                             if let Some(value) = json
-                                .get("timings")
-                                .and_then(|timings| timings["prompt_per_second"].as_f64())
+                                .timings
+                                .as_ref()
+                                .and_then(|t| t.prompt_per_second)
                             {
                                 prompt_tokens_per_second = Some(value);
                             }

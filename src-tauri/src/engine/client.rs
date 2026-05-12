@@ -45,6 +45,9 @@ pub struct CompletionRequest {
     /// and an id that must appear as `[img-{id}]` somewhere in the prompt.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub image_data: Vec<ImageData>,
+    /// GBNF grammar string for constrained generation (e.g. tool call enforcement).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<String>,
 }
 
 /// Response from llama-server's /completion endpoint (non-streaming).
@@ -129,6 +132,20 @@ pub struct GenerationSettings {
     pub n_ctx: Option<u32>,
 }
 
+static SHARED_HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+fn shared_http_client() -> reqwest::Client {
+    SHARED_HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(300))
+                .pool_max_idle_per_host(8)
+                .build()
+                .unwrap_or_default()
+        })
+        .clone()
+}
+
 /// Client for communicating with a local llama-server instance.
 pub struct LlamaClient {
     client: reqwest::Client,
@@ -137,12 +154,8 @@ pub struct LlamaClient {
 
 impl LlamaClient {
     pub fn new(port: u16) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .unwrap_or_default();
         Self {
-            client,
+            client: shared_http_client(),
             base_url: format!("http://127.0.0.1:{}", port),
         }
     }

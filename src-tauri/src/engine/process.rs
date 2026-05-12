@@ -130,6 +130,17 @@ pub struct LaunchConfig {
     pub template_name: Option<String>,
     pub chat_template_kwargs_json: Option<String>,
     pub extra_args: Vec<String>,
+    pub cache_type_k: String,
+    pub cache_type_v: String,
+    pub kv_unified: bool,
+    pub no_warmup: bool,
+    pub ctx_shift: bool,
+    pub tensor_split: Vec<f32>,
+    /// Draft model path for speculative decoding (-md). Empty = disabled.
+    pub draft_model_path: String,
+    pub draft_max_tokens: u32,
+    pub draft_min_tokens: u32,
+    pub draft_p_min: f32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -370,6 +381,50 @@ impl LlamaProcess {
         if config.rope_freq_scale > 0.0 {
             args.push("--rope-freq-scale".to_string());
             args.push(format!("{:.6}", config.rope_freq_scale));
+        }
+        if !config.cache_type_k.is_empty() {
+            args.push("--cache-type-k".to_string());
+            args.push(config.cache_type_k.clone());
+        }
+        if !config.cache_type_v.is_empty() {
+            args.push("--cache-type-v".to_string());
+            args.push(config.cache_type_v.clone());
+        }
+        if config.kv_unified {
+            args.push("--kv-unified".to_string());
+        }
+        if config.no_warmup {
+            args.push("--no-warmup".to_string());
+        }
+        if config.ctx_shift {
+            args.push("--ctx-shift".to_string());
+        }
+        if !config.tensor_split.is_empty() {
+            args.push("--tensor-split".to_string());
+            args.push(
+                config
+                    .tensor_split
+                    .iter()
+                    .map(|v| format!("{v}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+        }
+        if !config.draft_model_path.is_empty() {
+            args.push("-md".to_string());
+            args.push(config.draft_model_path.clone());
+            if config.draft_max_tokens > 0 {
+                args.push("--draft-max".to_string());
+                args.push(config.draft_max_tokens.to_string());
+            }
+            if config.draft_min_tokens > 0 {
+                args.push("--draft-min".to_string());
+                args.push(config.draft_min_tokens.to_string());
+            }
+            if config.draft_p_min > 0.0 {
+                args.push("--draft-p-min".to_string());
+                args.push(format!("{:.4}", config.draft_p_min));
+            }
         }
         args.extend(config.extra_args.iter().cloned());
 

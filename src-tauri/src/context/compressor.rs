@@ -77,6 +77,7 @@ pub async fn summarize_messages_with_model(
         stop: profile.stop_markers.clone(),
         special: true,
         image_data: vec![],
+        grammar: None,
     };
 
     let client = LlamaClient::new(port);

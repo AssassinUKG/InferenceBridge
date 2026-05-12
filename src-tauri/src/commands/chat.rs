@@ -376,6 +376,7 @@ pub async fn send_message(
         stop: profile.stop_markers.clone(),
         special: true,
         image_data,
+        grammar: None,
     };
 
     let generation_started_at = now_rfc3339();

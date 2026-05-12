@@ -670,6 +670,16 @@ pub async fn backend_load_model_with_overrides(
                 .clone()
                 .filter(|value| !value.trim().is_empty()),
             extra_args: process_config.extra_args.clone(),
+            cache_type_k: s.config.process.cache_type_k.clone(),
+            cache_type_v: s.config.process.cache_type_v.clone(),
+            kv_unified: s.config.process.kv_unified,
+            no_warmup: s.config.process.no_warmup,
+            ctx_shift: s.config.process.ctx_shift,
+            tensor_split: s.config.process.tensor_split.clone(),
+            draft_model_path: s.config.process.draft_model_path.clone(),
+            draft_max_tokens: s.config.process.draft_max_tokens,
+            draft_min_tokens: s.config.process.draft_min_tokens,
+            draft_p_min: s.config.process.draft_p_min,
         };
 
         LlamaProcess::validate_launch_config(&config).map_err(|e| {

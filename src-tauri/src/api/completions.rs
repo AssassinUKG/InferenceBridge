@@ -840,6 +840,7 @@ pub(crate) async fn build_chat_request(
         stop,
         special: true,
         image_data,
+        grammar: None,
     })
 }
 
@@ -1032,11 +1033,11 @@ pub async fn chat_completions(
         !request.image_data.is_empty(),
     )
     .await?;
+    let _permit = scheduler.acquire().await;
     {
         let mut s = state.write().await;
         s.last_prompt = Some(request.prompt.clone());
     }
-    let _permit = scheduler.acquire().await;
 
     let client = LlamaClient::new(llama_port);
     let generation_started_at = chrono::Utc::now().to_rfc3339();
@@ -1237,15 +1238,15 @@ async fn stream_chat_completion(
                         &stripped,
                         &reasoning_text,
                     );
-                    let mut s = state_for_stream.write().await;
-                    s.last_parse_trace = Some(build_parse_trace(&profile, &full_text, &stripped));
-                    s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
+                    let parse_trace = build_parse_trace(&profile, &full_text, &stripped);
+                    let elapsed_ms = generation_started.elapsed().as_millis() as u64;
+                    let metrics = crate::state::RuntimePerformanceMetrics {
                         source: "api".to_string(),
                         model: model_name.clone(),
                         request_id: request_id.clone(),
                         started_at: generation_started_at.clone(),
                         finished_at: chrono::Utc::now().to_rfc3339(),
-                        elapsed_ms: generation_started.elapsed().as_millis() as u64,
+                        elapsed_ms,
                         time_to_first_token_ms: first_token_at.map(|t| t.duration_since(generation_started).as_millis() as u64),
                         prompt_tokens: Some(tokens_evaluated),
                         completion_tokens: Some(tokens_predicted),
@@ -1254,10 +1255,14 @@ async fn stream_chat_completion(
                         decode_tokens_per_second: Some(decode_tokens_per_second),
                         end_to_end_tokens_per_second: end_to_end_tokens_per_second(
                             Some(tokens_predicted),
-                            generation_started.elapsed().as_millis() as u64,
+                            elapsed_ms,
                         ),
-                    });
-                    drop(s);
+                    };
+                    {
+                        let mut s = state_for_stream.write().await;
+                        s.last_parse_trace = Some(parse_trace);
+                        s.last_generation_metrics = Some(metrics);
+                    }
 
                     let (stream_tool_calls, _) =
                         crate::normalize::tool_extract::extract_tool_calls_for_profile(
@@ -1491,13 +1496,14 @@ pub async fn text_completions(
         stop,
         special: true,
         image_data: vec![],
+        grammar: None,
     };
 
+    let _permit = scheduler.acquire().await;
     {
         let mut s = state.write().await;
         s.last_prompt = Some(prompt);
     }
-    let _permit = scheduler.acquire().await;
 
     let client = LlamaClient::new(port);
     let response = client.complete(&completion_req).await.map_err(|e| {
