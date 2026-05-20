@@ -22,6 +22,11 @@ export interface ModelInfo {
   provider_name: string;
   provider_base_url: string | null;
   provider_managed: boolean;
+  // GGUF architecture metadata (null for external providers)
+  n_layers: number | null;
+  n_kv_heads: number | null;
+  head_dim: number | null;
+  gguf_architecture: string | null;
 }
 
 export interface LaunchPreview {

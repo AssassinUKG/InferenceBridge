@@ -221,6 +221,10 @@ export function ModelSelector({
         provider_name: "Managed llama.cpp",
         provider_base_url: null,
         provider_managed: true,
+        n_layers: null,
+        n_kv_heads: null,
+        head_dim: null,
+        gguf_architecture: null,
       })
     : null;
   const modelCards = filteredModels.filter((m) => m.filename !== loadedModel);
@@ -857,14 +861,24 @@ function ModelRow({
   // Use GPU stats hook for live VRAM/overflow info
   const gpuStats = useGpuStats();
 
-  // Estimate VRAM usage: assume 2 bytes/token (float16), plus model size in MB
-  // This is a rough estimate; real usage may vary by backend/model
-  function estimateContextVRAM(tokens: number, modelSizeGB: number) {
-    // 2 bytes per token, convert to MB
-    const contextMb = (tokens * 2) / 1024;
-    const modelMb = (modelSizeGB || 0) * 1024;
-    return contextMb + modelMb;
+  // KV-cache bytes per token using architecture metadata from GGUF.
+  // Default cache type is q8_0 (1 byte/element) — matches ProcessConfig default.
+  // Formula: n_layers × 2 (K+V) × n_kv_heads × head_dim × bytes_per_element
+  const KV_BPE = 1.0; // q8_0
+  const kvBytesPerToken: number | null =
+    model.n_layers != null && model.n_kv_heads != null && model.head_dim != null
+      ? model.n_layers * 2 * model.n_kv_heads * model.head_dim * KV_BPE
+      : null;
+
+  function estimateContextVRAM(tokens: number): number {
+    const modelMb = (model.size_gb || 0) * 1024;
+    if (kvBytesPerToken != null) {
+      return modelMb + (tokens * kvBytesPerToken) / (1024 * 1024);
+    }
+    // Fallback when GGUF metadata unavailable (external providers, unparseable files)
+    return modelMb + (tokens * 2) / 1024;
   }
+
 
   return (
     <div
@@ -1032,21 +1046,9 @@ function ModelRow({
             {/* VRAM/overflow monitor as slider bar */}
             {gpuStats && (
               <div className="mt-2">
-                <VramBar usedMb={estimateContextVRAM(contextSize, model.size_gb)} dedicatedMb={gpuStats.dedicated_mb} systemRamMb={gpuStats.system_ram_mb} />
+                <VramBar usedMb={estimateContextVRAM(contextSize)} dedicatedMb={gpuStats.dedicated_mb} systemRamMb={gpuStats.system_ram_mb} />
               </div>
             )}
-            {/* Show warning if context+model exceeds VRAM (better estimate) */}
-            {gpuStats && (() => {
-              const vramNeeded = estimateContextVRAM(contextSize, model.size_gb);
-              if (vramNeeded > gpuStats.dedicated_mb) {
-                return (
-                  <div style={{ color: '#f87171', fontSize: 12, marginTop: 4 }}>
-                    Warning: Estimated context + model size ({Math.round(vramNeeded)} MB) exceeds GPU VRAM ({gpuStats.dedicated_mb} MB). Expect offload/slowdown.
-                  </div>
-                );
-              }
-              return null;
-            })()}
           </div>}
 
           {/* Stats grid */}

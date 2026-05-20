@@ -1112,7 +1112,13 @@ pub async fn list_models(state: tauri::State<'_, SharedState>) -> Result<Vec<Mod
                 } else {
                     m.profile.default_context_window
                 },
-                max_context_window: m.profile.max_context_window,
+                // GGUF context_length is the ground-truth training context;
+                // fall back to the profile hardcode when parsing failed.
+                max_context_window: m
+                    .gguf_meta
+                    .as_ref()
+                    .and_then(|g| g.context_length)
+                    .or(m.profile.max_context_window),
                 max_output_tokens: m.profile.default_max_output_tokens,
                 quant: extract_quant(&m.filename),
                 tool_call_format: format!("{:?}", m.profile.tool_call_format),
@@ -1153,6 +1159,10 @@ pub async fn list_models(state: tauri::State<'_, SharedState>) -> Result<Vec<Mod
                 provider_name: "Managed llama.cpp".to_string(),
                 provider_base_url: None,
                 provider_managed: true,
+                n_layers: m.gguf_meta.as_ref().and_then(|g| g.n_layers),
+                n_kv_heads: m.gguf_meta.as_ref().and_then(|g| g.n_kv_heads),
+                head_dim: m.gguf_meta.as_ref().and_then(|g| g.head_dim()),
+                gguf_architecture: m.gguf_meta.as_ref().and_then(|g| g.architecture.clone()),
             }
         })
         .collect())
@@ -1232,6 +1242,10 @@ async fn list_active_external_provider_models(state: SharedState) -> Option<Vec<
                     provider_name: provider.name.clone(),
                     provider_base_url: Some(provider.base_url.clone()),
                     provider_managed: false,
+                    n_layers: None,
+                    n_kv_heads: None,
+                    head_dim: None,
+                    gguf_architecture: None,
                 }
             })
             .collect(),
@@ -1941,6 +1955,11 @@ pub struct ModelInfo {
     pub provider_name: String,
     pub provider_base_url: Option<String>,
     pub provider_managed: bool,
+    // GGUF architecture metadata — populated for locally-scanned models
+    pub n_layers: Option<u32>,
+    pub n_kv_heads: Option<u32>,
+    pub head_dim: Option<u32>,
+    pub gguf_architecture: Option<String>,
 }
 
 #[derive(serde::Serialize)]

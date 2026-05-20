@@ -176,16 +176,21 @@ impl ModelProfile {
             supports_vision: false,
             default_max_output_tokens: Some(8192),
             default_context_window: None, // let llama-server use model metadata
-            max_context_window: Some(131072),
+            // GGUF context_length overrides this at runtime; 262144 is the
+            // native max for Qwen3.6-generation models (Unsloth/HF model cards).
+            max_context_window: Some(262144),
             parser_type: ParserType::QwenStateMachine,
             renderer_type: RendererType::QwenChat,
             stop_markers: vec!["</tool_call>".into(), "</function>".into()],
             allow_fallback_extraction: true,
             default_presence_penalty: Some(1.3),
+            // Unsloth recommended: temp=0.6, top_p=0.95, top_k=20, min_p=0.0
+            // for reasoning; temp=0.7, top_p=0.8, top_k=20 for instruct.
+            // We use the instruct defaults as the general case.
             default_temperature: Some(0.7),
             default_top_p: Some(0.8),
             default_top_k: Some(20),
-            default_min_p: Some(0.05),
+            default_min_p: Some(0.0),
             disable_thinking_for_tools: true,
             split_tool_calling: true,
         }

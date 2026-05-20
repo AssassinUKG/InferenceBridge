@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{overrides::HfModelMetadata, profiles::ModelProfile};
+use super::{gguf::GgufMeta, overrides::HfModelMetadata, profiles::ModelProfile};
 
 /// Information about a discovered model file.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -12,6 +12,9 @@ pub struct ScannedModel {
     pub size_bytes: u64,
     pub profile: ModelProfile,
     pub hf_metadata: Option<HfModelMetadata>,
+    /// Architecture metadata read directly from the GGUF header.
+    /// `None` if the file could not be parsed (e.g. during a fast rescan).
+    pub gguf_meta: Option<GgufMeta>,
 }
 
 /// Scan a directory recursively for .gguf files.
@@ -56,12 +59,14 @@ fn parse_model_file(path: &Path) -> Option<ScannedModel> {
     let metadata = std::fs::metadata(path).ok()?;
     let profile = super::overrides::detect_effective_profile(&filename);
     let hf_metadata = super::overrides::effective_hf_metadata(&filename);
+    let gguf_meta = super::gguf::read_gguf_meta(path);
     Some(ScannedModel {
         path: path.to_path_buf(),
         filename,
         size_bytes: metadata.len(),
         profile,
         hf_metadata,
+        gguf_meta,
     })
 }
 
