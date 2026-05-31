@@ -5,7 +5,7 @@ use crate::engine::client::{CompletionRequest, ImageData, LlamaClient};
 use crate::engine::streaming::{self, StreamEvent};
 use crate::models::profiles::{ModelFamily, ModelProfile};
 use crate::normalize::images::normalize_inline_image_payload;
-use crate::state::{GenerationRequest, SharedState};
+use crate::state::{append_live_stream_delta, begin_live_generation, SharedState};
 use crate::templates::engine::{render_prompt, ChatMessage};
 
 fn now_rfc3339() -> String {
@@ -78,24 +78,21 @@ async fn begin_generation(
     session_id: Option<String>,
     model: String,
 ) -> tokio_util::sync::CancellationToken {
-    let mut s = state.write().await;
-    s.generation_cancel.cancel();
-    s.generation_cancel = tokio_util::sync::CancellationToken::new();
-    s.active_generation = Some(GenerationRequest {
-        id: uuid::Uuid::new_v4().to_string(),
-        source: source.to_string(),
-        session_id,
-        model,
-        started_at: now_rfc3339(),
-        status: "running".to_string(),
-    });
-    s.generation_cancel.clone()
+    begin_live_generation(state, source, session_id, model)
+        .await
+        .cancel
 }
 
 async fn finish_generation(state: &SharedState, status: &str) {
     let mut s = state.write().await;
     if let Some(active) = s.active_generation.as_mut() {
         active.status = status.to_string();
+    }
+    if let Some(stream) = s.live_stream.as_mut() {
+        stream.status = status.to_string();
+    }
+    if let (Some(handle), Some(snapshot)) = (s.app_handle.clone(), s.live_stream.clone()) {
+        let _ = handle.emit("llm-stream-done", snapshot);
     }
     s.active_generation = None;
 }
@@ -419,12 +416,17 @@ pub async fn send_message(
 
     while let Some(event) = rx.recv().await {
         match event {
+            StreamEvent::RawDelta(raw) => {
+                append_live_stream_delta(state.inner(), "raw", &raw).await;
+            }
             StreamEvent::Token(token) => {
+                append_live_stream_delta(state.inner(), "content", &token).await;
                 let _ = app.emit("stream-token", &token);
                 tokio::task::yield_now().await;
             }
             StreamEvent::ReasoningDelta(reasoning) => {
                 reasoning_text.push_str(&reasoning);
+                append_live_stream_delta(state.inner(), "reasoning", &reasoning).await;
                 let _ = app.emit("stream-thinking", &reasoning);
                 tokio::task::yield_now().await;
             }
@@ -444,6 +446,7 @@ pub async fn send_message(
                 break;
             }
             StreamEvent::Error(error) => {
+                append_live_stream_delta(state.inner(), "error", &error).await;
                 let _ = app.emit("stream-error", &error);
                 finish_generation(state.inner(), "error").await;
                 return Err(error);

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use tauri::Emitter;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -79,6 +80,26 @@ pub struct RuntimePerformanceMetrics {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
+pub struct LiveStreamEvent {
+    pub timestamp: String,
+    pub kind: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LiveStreamSnapshot {
+    pub request_id: String,
+    pub source: String,
+    pub model: String,
+    pub started_at: String,
+    pub status: String,
+    pub raw_output: String,
+    pub visible_output: String,
+    pub reasoning_output: String,
+    pub events: Vec<LiveStreamEvent>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct EffectiveProfileInfo {
     pub requested_model: Option<String>,
     pub resolved_model: Option<String>,
@@ -120,6 +141,7 @@ pub struct AppState {
     pub last_known_good_config: Option<LaunchPreview>,
     pub last_context_status: Option<ContextStatus>,
     pub last_generation_metrics: Option<RuntimePerformanceMetrics>,
+    pub live_stream: Option<LiveStreamSnapshot>,
     pub last_startup_duration_ms: Option<u64>,
     pub model_load_state: ModelLoadState,
     pub model_load_progress: Option<LoadProgress>,
@@ -156,6 +178,7 @@ impl AppState {
             last_known_good_config: None,
             last_context_status: None,
             last_generation_metrics: None,
+            live_stream: None,
             last_startup_duration_ms: None,
             model_load_state: ModelLoadState::Idle,
             model_load_progress: None,
@@ -182,14 +205,34 @@ pub async fn begin_api_generation(state: &SharedState, model: String) -> Generat
     s.generation_cancel = CancellationToken::new();
     s.cumulative_metrics.total_requests += 1;
     let request_id = uuid::Uuid::new_v4().to_string();
+    let started_at = chrono::Utc::now().to_rfc3339();
     s.active_generation = Some(GenerationRequest {
         id: request_id.clone(),
         source: "api".to_string(),
         session_id: None,
         model,
-        started_at: chrono::Utc::now().to_rfc3339(),
+        started_at: started_at.clone(),
         status: "running".to_string(),
     });
+    let model = s
+        .active_generation
+        .as_ref()
+        .map(|generation| generation.model.clone())
+        .unwrap_or_default();
+    s.live_stream = Some(LiveStreamSnapshot {
+        request_id: request_id.clone(),
+        source: "api".to_string(),
+        model,
+        started_at,
+        status: "running".to_string(),
+        raw_output: String::new(),
+        visible_output: String::new(),
+        reasoning_output: String::new(),
+        events: Vec::new(),
+    });
+    if let (Some(handle), Some(snapshot)) = (s.app_handle.clone(), s.live_stream.clone()) {
+        let _ = handle.emit("llm-stream-start", snapshot);
+    }
     GenerationHandle {
         cancel: s.generation_cancel.clone(),
         request_id,
@@ -201,7 +244,110 @@ pub async fn finish_api_generation(state: &SharedState, status: &str) {
     if let Some(active) = s.active_generation.as_mut() {
         active.status = status.to_string();
     }
+    if let Some(stream) = s.live_stream.as_mut() {
+        stream.status = status.to_string();
+    }
+    if let (Some(handle), Some(snapshot)) = (s.app_handle.clone(), s.live_stream.clone()) {
+        let _ = handle.emit("llm-stream-done", snapshot);
+    }
     s.active_generation = None;
+}
+
+pub async fn begin_live_generation(
+    state: &SharedState,
+    source: &str,
+    session_id: Option<String>,
+    model: String,
+) -> GenerationHandle {
+    let mut s = state.write().await;
+    s.generation_cancel.cancel();
+    s.generation_cancel = CancellationToken::new();
+    s.cumulative_metrics.total_requests += 1;
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let started_at = chrono::Utc::now().to_rfc3339();
+    s.active_generation = Some(GenerationRequest {
+        id: request_id.clone(),
+        source: source.to_string(),
+        session_id,
+        model: model.clone(),
+        started_at: started_at.clone(),
+        status: "running".to_string(),
+    });
+    s.live_stream = Some(LiveStreamSnapshot {
+        request_id: request_id.clone(),
+        source: source.to_string(),
+        model,
+        started_at,
+        status: "running".to_string(),
+        raw_output: String::new(),
+        visible_output: String::new(),
+        reasoning_output: String::new(),
+        events: Vec::new(),
+    });
+    if let (Some(handle), Some(snapshot)) = (s.app_handle.clone(), s.live_stream.clone()) {
+        let _ = handle.emit("llm-stream-start", snapshot);
+    }
+    GenerationHandle {
+        cancel: s.generation_cancel.clone(),
+        request_id,
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LiveStreamDelta {
+    pub request_id: String,
+    pub timestamp: String,
+    pub kind: String,
+    pub text: String,
+}
+
+pub async fn append_live_stream_delta(state: &SharedState, kind: &str, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+
+    let (handle, delta) = {
+        let mut s = state.write().await;
+        let Some(stream) = s.live_stream.as_mut() else {
+            return;
+        };
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        match kind {
+            "content" => {
+                stream.visible_output.push_str(text);
+            }
+            "reasoning" => {
+                stream.reasoning_output.push_str(text);
+            }
+            "tool_call" | "raw" | "error" => {
+                stream.raw_output.push_str(text);
+            }
+            _ => {
+                stream.raw_output.push_str(text);
+            }
+        }
+        let event = LiveStreamEvent {
+            timestamp: timestamp.clone(),
+            kind: kind.to_string(),
+            text: text.to_string(),
+        };
+        stream.events.push(event);
+        if stream.events.len() > 500 {
+            let excess = stream.events.len() - 500;
+            stream.events.drain(0..excess);
+        }
+        let delta = LiveStreamDelta {
+            request_id: stream.request_id.clone(),
+            timestamp,
+            kind: kind.to_string(),
+            text: text.to_string(),
+        };
+        (s.app_handle.clone(), delta)
+    };
+
+    if let Some(handle) = handle {
+        let _ = handle.emit("llm-stream-delta", delta);
+    }
 }
 
 pub fn summarize_reasoning_tokens(

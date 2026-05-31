@@ -87,6 +87,7 @@ If you set an API key in Settings, pass it as a Bearer token. If no API key is c
 | `POST` | `/v1/models/stats` | Get status or load progress for a model |
 | `POST` | `/v1/chat/completions` | OpenAI-style chat completions |
 | `POST` | `/v1/completions` | Text completions |
+| `POST` | `/v1/reliability/agent-action/validate` | Clean, repair, and validate strict agent action JSON |
 | `GET` | `/v1/context/status` | Context and KV-cache status |
 | `GET` | `/v1/runtime/doctor` | Local provider preflight diagnostics |
 | `GET` | `/v1/sessions` | List saved chat sessions |
@@ -126,6 +127,17 @@ curl "http://127.0.0.1:8800/v1/chat/completions" \
     "model": "Qwen3-14B-Q4_K_M.gguf",
     "messages": [{"role": "user", "content": "Hello"}],
     "stream": false
+  }'
+```
+
+### Example: Validate Agent Action Output
+
+```bash
+curl "http://127.0.0.1:8800/v1/reliability/agent-action/validate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "think_tag_style": "qwen",
+    "text": "{\"step_id\":\"b5c4e48a-6b91-4b96-b7d3-7e410c2e4201\",\"role\":\"worker\",\"goal\":\"inspect file\",\"action\":\"read_file\",\"arguments\":{\"path\":\"src/main.rs\"},\"expected_outcome\":\"file content is returned\",\"success_check\":\"content length is greater than zero\",\"confidence\":0.91,\"next_step\":\"continue\"}"
   }'
 ```
 
@@ -244,6 +256,7 @@ That will run the `Release` workflow and create a draft release with platform in
 - [docs/04-debug-api-workspace.md](docs/04-debug-api-workspace.md)
 - [docs/05-inference-runtime-roadmap.md](docs/05-inference-runtime-roadmap.md)
 - [docs/08-local-provider-runtime-improvement-plan.md](docs/08-local-provider-runtime-improvement-plan.md)
+- [docs/09-agent-reliability-tracker.md](docs/09-agent-reliability-tracker.md)
 
 ## License
 

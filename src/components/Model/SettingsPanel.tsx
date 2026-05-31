@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import type { ApiAccessInfo, AppSettings, LlamaServerInfo, LoadProgress, ProcessStatusInfo, RuntimeDoctorReport } from "../../lib/types";
 import * as api from "../../lib/tauri";
+import { formatCliArgs, parseCliArgs } from "../../lib/args";
 
 interface Props {
   onSaved?: (settings: AppSettings) => void;
@@ -1065,19 +1066,16 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
                 />
               </FieldRow>
               <Divider />
-              <FieldRow label="Extra Args" hint="Comma-separated raw llama-server args appended last">
+              <FieldRow label="Extra Args" hint="Raw llama-server args appended last">
                 <FlatInput
-                  value={(settings.extra_args ?? []).join(", ")}
+                  value={formatCliArgs(settings.extra_args)}
                   onChange={(v) =>
                     setSettings({
                       ...settings,
-                      extra_args: v
-                        .split(",")
-                        .map((item) => item.trim())
-                        .filter(Boolean),
+                      extra_args: parseCliArgs(v),
                     })
                   }
-                  placeholder="--some-flag, value"
+                  placeholder="--temp 0.6 --top-p 0.95"
                 />
               </FieldRow>
             </div>

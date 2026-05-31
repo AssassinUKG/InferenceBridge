@@ -658,6 +658,14 @@ fn api_routes() -> Router<SharedState> {
             axum::routing::get(super::extensions::debug_profile),
         )
         .route(
+            "/debug/logs",
+            axum::routing::get(super::extensions::debug_logs),
+        )
+        .route(
+            "/reliability/agent-action/validate",
+            axum::routing::post(super::extensions::validate_agent_action),
+        )
+        .route(
             "/sessions",
             axum::routing::get(super::extensions::list_sessions)
                 .post(super::extensions::create_session),

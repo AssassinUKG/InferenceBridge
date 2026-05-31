@@ -531,6 +531,17 @@ async fn headless_load_model(state: &state::SharedState, model_name: &str, ctx_s
         };
 
         let ctx = ctx_size;
+        let profile = crate::models::overrides::detect_effective_profile(&model.filename);
+        let use_jinja = s.config.process.use_jinja
+            || matches!(
+                profile.tool_call_format,
+                crate::models::profiles::ToolCallFormat::QwenXml
+            );
+        let template_source = if use_jinja {
+            Some("gguf:embedded-jinja".to_string())
+        } else {
+            None
+        };
 
         LaunchConfig {
             model_path: model.path.clone(),
@@ -559,11 +570,11 @@ async fn headless_load_model(state: &state::SharedState, model_name: &str, ctx_s
                 .filter(|value| !value.trim().is_empty()),
             cache_ram_mb: s.config.process.cache_ram_mb,
             ctxcp: s.config.process.ctxcp,
-            use_jinja: s.config.process.use_jinja,
+            use_jinja,
             reasoning_mode: Some(s.config.process.reasoning_mode.clone())
                 .filter(|value| !value.trim().is_empty()),
             template_mode: s.config.process.template_mode.clone(),
-            template_source: None,
+            template_source,
             template_file: None,
             template_name: s.config.process.template_name.clone(),
             chat_template_kwargs_json: s.config.process.chat_template_kwargs_json.clone(),

@@ -7,14 +7,16 @@ use std::collections::HashMap;
 use crate::api::errors::ApiErrorResponse;
 use crate::commands::model::RuntimeLoadOverrides;
 use crate::engine::client::{CompletionRequest, ImageData, LlamaClient};
+use crate::engine::process::{LaunchPreview, ProcessState};
 use crate::engine::streaming::{self, StreamEvent};
-use crate::models::profiles::ModelProfile;
+use crate::models::profiles::{ModelProfile, ToolCallFormat};
 use crate::normalize::images::normalize_image_payload as normalize_image_payload_shared;
 use crate::normalize::think_strip::{
     extract_reasoning_content_with_style, strip_think_tags_with_style,
 };
 use crate::state::{
-    begin_api_generation, finish_api_generation, summarize_reasoning_tokens, SharedState,
+    append_live_stream_delta, begin_api_generation, finish_api_generation,
+    summarize_reasoning_tokens, SharedState,
 };
 
 #[derive(Debug, Deserialize)]
@@ -586,8 +588,8 @@ pub fn loaded_model_matches_request_pub(loaded: &str, requested: &str) -> bool {
 }
 
 fn loaded_model_matches_request(loaded: &str, requested: &str) -> bool {
-    let loaded = loaded.to_ascii_lowercase();
-    let requested = requested.trim().to_ascii_lowercase();
+    let loaded = normalize_model_match_name(loaded);
+    let requested = normalize_model_match_name(requested);
 
     // Handle path-style names like "qwen/qwen3.5-4b" → extract "qwen3.5-4b"
     let search = if requested.contains('/') {
@@ -601,6 +603,148 @@ fn loaded_model_matches_request(loaded: &str, requested: &str) -> bool {
         || loaded == requested.trim_end_matches(".gguf")
         || loaded.trim_end_matches(".gguf") == search
         || (!search.is_empty() && loaded.contains(search))
+        || model_tokens_match(&loaded, search)
+}
+
+fn normalize_model_match_name(name: &str) -> String {
+    let name = name.trim().replace('\\', "/").to_ascii_lowercase();
+    let name = name.rsplit('/').next().unwrap_or(&name);
+    name.trim_end_matches(".gguf").to_string()
+}
+
+fn model_match_tokens(name: &str) -> Vec<String> {
+    const NOISE: &[&str] = &[
+        "gguf",
+        "think",
+        "thinking",
+        "reasoning",
+        "chat",
+        "instruct",
+        "uncensored",
+    ];
+
+    name.split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '.'))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .filter(|token| !NOISE.contains(token))
+        .filter(|token| !token.starts_with('q') || !token.contains('_'))
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn model_tokens_match(loaded: &str, requested: &str) -> bool {
+    let requested_tokens = model_match_tokens(requested);
+    if requested_tokens.is_empty() {
+        return false;
+    }
+
+    let loaded_tokens = model_match_tokens(loaded);
+    requested_tokens
+        .iter()
+        .all(|requested| loaded_tokens.iter().any(|loaded| loaded == requested))
+}
+
+fn optional_override_matches<T: PartialEq>(requested: Option<T>, current: Option<T>) -> bool {
+    requested.map_or(true, |requested| current == Some(requested))
+}
+
+fn api_overrides_match_preview(overrides: &RuntimeLoadOverrides, preview: &LaunchPreview) -> bool {
+    optional_override_matches(overrides.hf_repo.as_deref(), preview.hf_repo.as_deref())
+        && optional_override_matches(overrides.hf_file.as_deref(), preview.hf_file.as_deref())
+        && optional_override_matches(overrides.fit_mode.as_deref(), preview.fit_mode.as_deref())
+        && optional_override_matches(overrides.cache_ram_mb, preview.cache_ram_mb)
+        && optional_override_matches(overrides.ctxcp, preview.ctxcp)
+        && optional_override_matches(overrides.use_jinja, Some(preview.use_jinja))
+        && optional_override_matches(
+            overrides.reasoning_mode.as_deref(),
+            preview.reasoning_mode.as_deref(),
+        )
+        && optional_override_matches(
+            overrides.template_mode.as_deref(),
+            Some(preview.template_mode.as_str()),
+        )
+        && optional_override_matches(
+            overrides.template_name.as_deref(),
+            preview.template_name.as_deref(),
+        )
+        && optional_override_matches(
+            overrides.custom_template_path.as_deref(),
+            preview.template_path.as_deref(),
+        )
+        && optional_override_matches(
+            overrides.chat_template_kwargs_json.as_deref(),
+            preview.chat_template_kwargs_json.as_deref(),
+        )
+        && overrides.extra_args.as_ref().map_or(true, |requested| {
+            preview
+                .args
+                .iter()
+                .rev()
+                .take(requested.len())
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                == *requested
+        })
+}
+
+fn context_request_matches_preview(
+    requested_context_size: Option<u32>,
+    preview: Option<&LaunchPreview>,
+) -> bool {
+    requested_context_size.map_or(true, |requested| {
+        preview
+            .and_then(|preview| preview.context_size)
+            .map_or(false, |current| current == requested)
+    })
+}
+
+fn context_size_for_reload(
+    requested_context_size: Option<u32>,
+    preview: Option<&LaunchPreview>,
+    loaded_context_size: Option<u32>,
+) -> Option<u32> {
+    requested_context_size
+        .or_else(|| preview.and_then(|preview| preview.context_size))
+        .or(loaded_context_size)
+}
+
+async fn publish_live_generation_metrics(
+    state: &SharedState,
+    source: &str,
+    model: &str,
+    request_id: &str,
+    started_at: &str,
+    generation_started: std::time::Instant,
+    first_token_at: Option<std::time::Instant>,
+    completion_tokens: u32,
+) {
+    let elapsed_ms = generation_started.elapsed().as_millis() as u64;
+    let mut s = state.write().await;
+    if let Some(active) = s.active_generation.as_mut() {
+        active.status = format!("streaming {} token(s)", completion_tokens);
+    }
+    s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
+        source: source.to_string(),
+        model: model.to_string(),
+        request_id: request_id.to_string(),
+        started_at: started_at.to_string(),
+        finished_at: chrono::Utc::now().to_rfc3339(),
+        elapsed_ms,
+        time_to_first_token_ms: first_token_at
+            .map(|t| t.duration_since(generation_started).as_millis() as u64),
+        prompt_tokens: None,
+        completion_tokens: Some(completion_tokens),
+        total_tokens: Some(completion_tokens),
+        prompt_tokens_per_second: None,
+        decode_tokens_per_second: end_to_end_tokens_per_second(Some(completion_tokens), elapsed_ms),
+        end_to_end_tokens_per_second: end_to_end_tokens_per_second(
+            Some(completion_tokens),
+            elapsed_ms,
+        ),
+    });
 }
 
 async fn swap_model_for_api(
@@ -626,41 +770,57 @@ pub(crate) async fn resolve_loaded_model(
     requested_overrides: RuntimeLoadOverrides,
 ) -> Result<String, ApiErrorResponse> {
     let has_overrides = has_runtime_load_overrides(&requested_overrides);
-    let (target_model, needs_swap) = {
+    let (target_model, needs_swap, context_size) = {
         let s = state.read().await;
+        let runtime_running = matches!(s.process.state(), ProcessState::Running);
+        let current_context_size = s.model_stats.as_ref().map(|stats| stats.context_size);
         let target_model = if requested_model.trim().is_empty() {
             s.loaded_model
                 .clone()
                 .ok_or_else(ApiErrorResponse::no_model)?
         } else {
-            requested_model.trim().to_string()
+            s.model_registry
+                .find_by_name(requested_model.trim())
+                .map(|model| model.filename.clone())
+                .unwrap_or_else(|| requested_model.trim().to_string())
         };
 
         let needs_swap = match &s.loaded_model {
             Some(loaded) => {
-                !loaded_model_matches_request(loaded, &target_model)
-                    || requested_context_size.is_some()
-                    || has_overrides
+                let model_matches = loaded_model_matches_request(loaded, &target_model)
+                    || loaded_model_matches_request(loaded, requested_model);
+                let context_matches = context_request_matches_preview(
+                    requested_context_size,
+                    s.last_launch_preview.as_ref(),
+                );
+                let overrides_match = !has_overrides
+                    || s.last_launch_preview
+                        .as_ref()
+                        .map(|preview| api_overrides_match_preview(&requested_overrides, preview))
+                        .unwrap_or(false);
+
+                !runtime_running || !model_matches || !context_matches || !overrides_match
             }
             None => true,
         };
 
-        (target_model, needs_swap)
+        let context_size = context_size_for_reload(
+            requested_context_size,
+            s.last_launch_preview.as_ref(),
+            current_context_size,
+        );
+
+        (target_model, needs_swap, context_size)
     };
 
     if needs_swap {
-        swap_model_for_api(
-            state,
-            &target_model,
-            requested_context_size,
-            requested_overrides,
-        )
-        .await
-        .map_err(|e| {
-            ApiErrorResponse::service_unavailable(format!(
-                "Could not load model '{target_model}': {e}"
-            ))
-        })?;
+        swap_model_for_api(state, &target_model, context_size, requested_overrides)
+            .await
+            .map_err(|e| {
+                ApiErrorResponse::service_unavailable(format!(
+                    "Could not load model '{target_model}': {e}"
+                ))
+            })?;
     }
 
     let s = state.read().await;
@@ -677,6 +837,7 @@ async fn normalize_image_payload(value: &str) -> Result<String, ApiErrorResponse
 
 pub(crate) async fn normalize_api_messages(
     messages: &[ApiMessage],
+    profile: &ModelProfile,
 ) -> Result<(Vec<crate::templates::engine::ChatMessage>, Vec<ImageData>), ApiErrorResponse> {
     let mut normalized = Vec::with_capacity(messages.len());
     let mut image_data = Vec::new();
@@ -739,8 +900,15 @@ pub(crate) async fn normalize_api_messages(
             content_parts.insert(0, format!("[name:{name}]"));
         }
 
-        if let Some(tool_call_id) = &message.tool_call_id {
-            content_parts.insert(0, format!("[tool_call_id:{tool_call_id}]"));
+        if message.role == "tool" {
+            content_parts = vec![render_tool_response_history(
+                message.name.as_deref(),
+                message.tool_call_id.as_deref(),
+                &content_parts.join("\n"),
+                profile,
+            )];
+        } else if let Some(tool_call_id) = &message.tool_call_id {
+            content_parts.insert(0, format!("Tool call id: {tool_call_id}"));
         }
 
         if let Some(refusal) = &message.refusal {
@@ -751,9 +919,7 @@ pub(crate) async fn normalize_api_messages(
 
         if let Some(tool_calls) = &message.tool_calls {
             if !tool_calls.is_empty() {
-                let serialized =
-                    serde_json::to_string_pretty(tool_calls).unwrap_or_else(|_| "[]".to_string());
-                content_parts.push(format!("[tool_calls]\n{serialized}"));
+                content_parts.push(render_tool_calls_history(tool_calls, profile));
             }
         }
 
@@ -764,6 +930,128 @@ pub(crate) async fn normalize_api_messages(
     }
 
     Ok((normalized, image_data))
+}
+
+fn render_tool_calls_history(tool_calls: &[serde_json::Value], profile: &ModelProfile) -> String {
+    let rendered = tool_calls
+        .iter()
+        .filter_map(|tool_call| render_tool_call_history(tool_call, profile.tool_call_format))
+        .collect::<Vec<_>>();
+
+    if rendered.is_empty() {
+        serde_json::to_string(tool_calls).unwrap_or_else(|_| "[]".to_string())
+    } else {
+        rendered.join("\n")
+    }
+}
+
+fn render_tool_call_history(
+    tool_call: &serde_json::Value,
+    format: ToolCallFormat,
+) -> Option<String> {
+    let function = tool_call.get("function").unwrap_or(tool_call);
+    let name = function
+        .get("name")
+        .or_else(|| tool_call.get("name"))
+        .and_then(|value| value.as_str())?
+        .trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let arguments = function
+        .get("arguments")
+        .or_else(|| tool_call.get("arguments"))
+        .map(normalize_tool_arguments)
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+
+    match format {
+        ToolCallFormat::QwenXml => Some(render_qwen_tool_call(name, &arguments)),
+        ToolCallFormat::HermesXml | ToolCallFormat::NativeApi => {
+            let value = serde_json::json!({
+                "name": name,
+                "arguments": arguments,
+            });
+            Some(format!("<tool_call>{}</tool_call>", value))
+        }
+    }
+}
+
+fn normalize_tool_arguments(value: &serde_json::Value) -> serde_json::Value {
+    if let Some(text) = value.as_str() {
+        serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::String(text.to_string()))
+    } else {
+        value.clone()
+    }
+}
+
+fn render_qwen_tool_call(name: &str, arguments: &serde_json::Value) -> String {
+    let mut out = format!("<tool_call>\n<function={}>\n", escape_qwen_xml_attr(name));
+    match arguments {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                out.push_str(&format!(
+                    "<parameter={}>{}</parameter>\n",
+                    escape_qwen_xml_attr(key),
+                    escape_xml_text(&tool_argument_to_text(value))
+                ));
+            }
+        }
+        other => {
+            out.push_str(&format!(
+                "<parameter=arguments>{}</parameter>\n",
+                escape_xml_text(&tool_argument_to_text(other))
+            ));
+        }
+    }
+    out.push_str("</function>\n</tool_call>");
+    out
+}
+
+fn tool_argument_to_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+fn render_tool_response_history(
+    name: Option<&str>,
+    tool_call_id: Option<&str>,
+    content: &str,
+    profile: &ModelProfile,
+) -> String {
+    let mut body = String::new();
+    if let Some(name) = name.filter(|value| !value.trim().is_empty()) {
+        body.push_str("Tool ");
+        body.push_str(name.trim());
+        body.push_str(" result");
+        if let Some(id) = tool_call_id.filter(|value| !value.trim().is_empty()) {
+            body.push_str(" (");
+            body.push_str(id.trim());
+            body.push(')');
+        }
+        body.push_str(":\n");
+    }
+    body.push_str(content);
+
+    match profile.tool_call_format {
+        ToolCallFormat::QwenXml => format!("<tool_response>\n{}\n</tool_response>", body.trim()),
+        ToolCallFormat::HermesXml | ToolCallFormat::NativeApi => body.trim().to_string(),
+    }
+}
+
+fn escape_qwen_xml_attr(text: &str) -> String {
+    text.trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect::<String>()
+}
+
+fn escape_xml_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn prepend_tool_schema_message(
@@ -781,15 +1069,318 @@ fn prepend_tool_schema_message(
     } else {
         ""
     };
+    let format_guidance = match profile.tool_call_format {
+        ToolCallFormat::QwenXml => {
+            "If a tool is needed, reply with exactly one Qwen XML tool call and no prose:\n<tool_call>\n<function=TOOL_NAME>\n<parameter=PARAM_NAME>VALUE</parameter>\n</function>\n</tool_call>"
+        }
+        ToolCallFormat::HermesXml => {
+            "If a tool is needed, reply with exactly one Hermes XML tool call and no prose:\n<tool_call>{\"name\":\"TOOL_NAME\",\"arguments\":{\"PARAM_NAME\":\"VALUE\"}}</tool_call>"
+        }
+        ToolCallFormat::NativeApi => {
+            "If a tool is needed, reply using the tool-calling format appropriate for your model family."
+        }
+    };
+    let schema_guidance =
+        "Tool arguments MUST match the JSON schema exactly. Use bare JSON numbers for integer/number fields and bare true/false for boolean fields; do not quote them as strings.";
     messages.insert(
         0,
         crate::templates::engine::ChatMessage {
             role: "system".to_string(),
             content: format!(
-                "Available tools (OpenAI-style schema):\n{serialized}\n\nIf a tool is needed, reply using the tool-calling format appropriate for your model family.{no_think_guidance}"
+                "Available tools (OpenAI-style schema):\n{serialized}\n\n{format_guidance}\n\n{schema_guidance}{no_think_guidance}"
             ),
         },
     );
+}
+
+fn tool_schema_type_matches(schema_type: &serde_json::Value, expected: &str) -> bool {
+    match schema_type {
+        serde_json::Value::String(value) => value == expected,
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| matches!(value, serde_json::Value::String(t) if t == expected)),
+        _ => false,
+    }
+}
+
+fn coerce_tool_arg_value(value: &mut serde_json::Value, schema: &serde_json::Value) {
+    let schema_type = schema.get("type").unwrap_or(&serde_json::Value::Null);
+    match value {
+        serde_json::Value::String(text) if tool_schema_type_matches(schema_type, "integer") => {
+            if let Ok(parsed) = text.trim().parse::<i64>() {
+                *value = serde_json::Value::Number(parsed.into());
+            }
+        }
+        serde_json::Value::String(text) if tool_schema_type_matches(schema_type, "number") => {
+            if let Ok(parsed) = text.trim().parse::<f64>() {
+                if let Some(number) = serde_json::Number::from_f64(parsed) {
+                    *value = serde_json::Value::Number(number);
+                }
+            }
+        }
+        serde_json::Value::String(text) if tool_schema_type_matches(schema_type, "boolean") => {
+            match text.trim().to_ascii_lowercase().as_str() {
+                "true" => *value = serde_json::Value::Bool(true),
+                "false" => *value = serde_json::Value::Bool(false),
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+fn coerce_tool_arguments_for_schema(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    tools: Option<&Vec<serde_json::Value>>,
+) -> serde_json::Value {
+    let mut repaired = arguments.clone();
+    let Some(properties) = tools
+        .and_then(|tools| {
+            tools.iter().find_map(|tool| {
+                let function = tool.get("function").unwrap_or(tool);
+                let name = function.get("name")?.as_str()?;
+                if name != tool_name {
+                    return None;
+                }
+                function
+                    .get("parameters")
+                    .and_then(|params| params.get("properties"))
+                    .and_then(|props| props.as_object())
+            })
+        })
+    else {
+        return repaired;
+    };
+
+    if let Some(args) = repaired.as_object_mut() {
+        for (arg_name, arg_value) in args.iter_mut() {
+            if let Some(schema) = properties.get(arg_name) {
+                coerce_tool_arg_value(arg_value, schema);
+            }
+        }
+    }
+
+    repaired
+}
+
+fn tool_parameters_for_name<'a>(
+    tool_name: &str,
+    tools: Option<&'a Vec<serde_json::Value>>,
+) -> Option<&'a serde_json::Value> {
+    tools.and_then(|tools| {
+        tools.iter().find_map(|tool| {
+            let function = tool.get("function").unwrap_or(tool);
+            let name = function.get("name")?.as_str()?;
+            (name == tool_name).then(|| function.get("parameters")).flatten()
+        })
+    })
+}
+
+fn validate_tool_arguments(
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    tools: Option<&Vec<serde_json::Value>>,
+) -> Vec<String> {
+    let Some(parameters) = tool_parameters_for_name(tool_name, tools) else {
+        return Vec::new();
+    };
+    let Some(args) = arguments.as_object() else {
+        return vec!["arguments must be a JSON object".to_string()];
+    };
+
+    let mut errors = Vec::new();
+    if let Some(required) = parameters.get("required").and_then(|value| value.as_array()) {
+        for name in required.iter().filter_map(|value| value.as_str()) {
+            if !args.contains_key(name) {
+                errors.push(format!("missing required field `{name}`"));
+            }
+        }
+    }
+
+    if let Some(properties) = parameters.get("properties").and_then(|value| value.as_object()) {
+        for (name, value) in args {
+            let Some(schema) = properties.get(name) else {
+                continue;
+            };
+            let schema_type = schema.get("type").unwrap_or(&serde_json::Value::Null);
+            let type_ok = (tool_schema_type_matches(schema_type, "integer") && value.is_i64())
+                || (tool_schema_type_matches(schema_type, "number") && value.is_number())
+                || (tool_schema_type_matches(schema_type, "boolean") && value.is_boolean())
+                || (tool_schema_type_matches(schema_type, "string") && value.is_string())
+                || (tool_schema_type_matches(schema_type, "array") && value.is_array())
+                || (tool_schema_type_matches(schema_type, "object") && value.is_object())
+                || matches!(schema_type, serde_json::Value::Null);
+            if !type_ok {
+                errors.push(format!(
+                    "field `{name}` has wrong type for schema `{}`",
+                    serde_json::to_string(schema_type).unwrap_or_default()
+                ));
+            }
+        }
+    }
+
+    errors
+}
+
+fn extract_first_json_object(text: &str) -> Option<serde_json::Value> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+        if value.is_object() {
+            return Some(value);
+        }
+    }
+
+    let start = text.find('{')?;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in text[start..].char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escaped = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = start + offset + ch.len_utf8();
+                    return serde_json::from_str::<serde_json::Value>(&text[start..end]).ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+async fn repair_tool_arguments_once(
+    client: &LlamaClient,
+    profile: &ModelProfile,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    tools: Option<&Vec<serde_json::Value>>,
+    errors: &[String],
+) -> Option<serde_json::Value> {
+    let schema = tool_parameters_for_name(tool_name, tools)?;
+    let prompt = crate::templates::engine::render_prompt(
+        &[
+            crate::templates::engine::ChatMessage {
+                role: "system".to_string(),
+                content: "Repair tool-call JSON arguments. Return only one valid JSON object. Do not call the tool, explain, or wrap in Markdown.".to_string(),
+            },
+            crate::templates::engine::ChatMessage {
+                role: "user".to_string(),
+                content: format!(
+                    "Tool name: {tool_name}\nSchema:\n{}\nCurrent arguments:\n{}\nValidation errors:\n{}\n\nReturn the corrected arguments JSON object only.",
+                    serde_json::to_string_pretty(schema).unwrap_or_default(),
+                    serde_json::to_string_pretty(arguments).unwrap_or_default(),
+                    errors.join("\n")
+                ),
+            },
+        ],
+        profile,
+    );
+    let repair_request = CompletionRequest {
+        prompt,
+        n_predict: Some(512),
+        temperature: Some(0.0),
+        top_p: Some(1.0),
+        top_k: Some(-1),
+        min_p: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        repeat_penalty: None,
+        seed: None,
+        stream: false,
+        stop: vec![],
+        special: true,
+        image_data: vec![],
+        grammar: None,
+    };
+
+    let response = client.complete(&repair_request).await.ok()?;
+    extract_first_json_object(&response.content)
+}
+
+async fn repaired_tool_arguments(
+    client: Option<&LlamaClient>,
+    profile: &ModelProfile,
+    tool_call: &crate::normalize::tool_extract::ToolCall,
+    tools: Option<&Vec<serde_json::Value>>,
+) -> serde_json::Value {
+    let coerced = coerce_tool_arguments_for_schema(&tool_call.name, &tool_call.arguments, tools);
+    let errors = validate_tool_arguments(&tool_call.name, &coerced, tools);
+    if errors.is_empty() {
+        return coerced;
+    }
+
+    let Some(client) = client else {
+        tracing::warn!(
+            tool = %tool_call.name,
+            errors = ?errors,
+            "Tool arguments failed schema validation after coercion; no repair client available"
+        );
+        return coerced;
+    };
+
+    if let Some(repaired) = repair_tool_arguments_once(
+        client,
+        profile,
+        &tool_call.name,
+        &coerced,
+        tools,
+        &errors,
+    )
+    .await
+    {
+        let repaired = coerce_tool_arguments_for_schema(&tool_call.name, &repaired, tools);
+        let repaired_errors = validate_tool_arguments(&tool_call.name, &repaired, tools);
+        if repaired_errors.is_empty() {
+            tracing::info!(tool = %tool_call.name, "Repaired tool arguments after schema validation failure");
+            return repaired;
+        }
+        tracing::warn!(
+            tool = %tool_call.name,
+            original_errors = ?errors,
+            repaired_errors = ?repaired_errors,
+            "Tool argument repair did not satisfy schema"
+        );
+    }
+
+    coerced
+}
+
+fn api_tool_call_value_from_arguments(
+    tool_call: &crate::normalize::tool_extract::ToolCall,
+    arguments: serde_json::Value,
+    index: Option<usize>,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "id": tool_call.id,
+        "type": "function",
+        "function": {
+            "name": tool_call.name,
+            "arguments": serde_json::to_string(&arguments).unwrap_or_default()
+        }
+    });
+    if let Some(index) = index {
+        value["index"] = serde_json::json!(index);
+    }
+    value
+}
+
+async fn api_tool_call_value(
+    client: Option<&LlamaClient>,
+    profile: &ModelProfile,
+    tool_call: &crate::normalize::tool_extract::ToolCall,
+    tools: Option<&Vec<serde_json::Value>>,
+    index: Option<usize>,
+) -> serde_json::Value {
+    let arguments = repaired_tool_arguments(client, profile, tool_call, tools).await;
+    api_tool_call_value_from_arguments(tool_call, arguments, index)
 }
 
 pub(crate) async fn build_chat_request(
@@ -799,7 +1390,7 @@ pub(crate) async fn build_chat_request(
 ) -> Result<CompletionRequest, ApiErrorResponse> {
     let requested_top_p = req.requested_top_p();
     let requested_top_k = req.requested_top_k();
-    let (mut messages, image_data) = normalize_api_messages(&req.messages).await?;
+    let (mut messages, image_data) = normalize_api_messages(&req.messages, profile).await?;
     prepend_tool_schema_message(&mut messages, profile, req.tools.as_ref());
     prepend_reasoning_guidance_message(
         &mut messages,
@@ -991,6 +1582,7 @@ pub async fn chat_completions(
     let requested_context_size = req.requested_context_size();
     let requested_model = req.model.clone().unwrap_or_default();
     let requested_overrides = extract_runtime_load_overrides(req.options.as_ref(), &req.extra);
+    let requested_tools = req.tools.clone();
     let model_name = resolve_loaded_model(
         &state,
         &requested_model,
@@ -1042,6 +1634,8 @@ pub async fn chat_completions(
     let client = LlamaClient::new(llama_port);
     let generation_started_at = chrono::Utc::now().to_rfc3339();
     let generation_started = std::time::Instant::now();
+    let gen = begin_api_generation(&state, model_name.clone()).await;
+    let request_id = gen.request_id.clone();
 
     if request.stream {
         return stream_chat_completion(
@@ -1052,19 +1646,35 @@ pub async fn chat_completions(
             profile,
             generation_started_at,
             generation_started,
+            request_id,
+            gen.cancel,
             include_usage_details,
+            requested_tools,
         )
         .await;
     }
 
-    let response = client.complete(&request).await.map_err(|e| {
-        tracing::error!(error = %e, "Completion failed");
-        ApiErrorResponse::inference_failed(&e.to_string())
-    })?;
+    let response = match client.complete(&request).await {
+        Ok(response) => response,
+        Err(e) => {
+            finish_api_generation(&state, "error").await;
+            tracing::error!(error = %e, "Completion failed");
+            return Err(ApiErrorResponse::inference_failed(&e.to_string()));
+        }
+    };
 
     let reasoning_text =
         extract_reasoning_content_with_style(&response.content, profile.think_tag_style);
     let stripped = strip_think_tags_with_style(&response.content, profile.think_tag_style);
+    if !response.content.is_empty() {
+        append_live_stream_delta(&state, "raw", &response.content).await;
+    }
+    if !reasoning_text.is_empty() {
+        append_live_stream_delta(&state, "reasoning", &reasoning_text).await;
+    }
+    if !stripped.is_empty() {
+        append_live_stream_delta(&state, "content", &stripped).await;
+    }
     let reasoning_tokens =
         summarize_reasoning_tokens(response.tokens_predicted, &stripped, &reasoning_text);
     {
@@ -1073,7 +1683,7 @@ pub async fn chat_completions(
         s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
             source: "api".to_string(),
             model: model_name.clone(),
-            request_id: String::new(),
+            request_id: request_id.clone(),
             started_at: generation_started_at,
             finished_at: chrono::Utc::now().to_rfc3339(),
             elapsed_ms: generation_started.elapsed().as_millis() as u64,
@@ -1098,22 +1708,23 @@ pub async fn chat_completions(
             ),
         });
     }
+    finish_api_generation(&state, "completed").await;
     let (tool_calls, text) =
         crate::normalize::tool_extract::extract_tool_calls_for_profile(&stripped, &profile);
     let content = if text.is_empty() { None } else { Some(text) };
-    let api_tool_calls: Vec<serde_json::Value> = tool_calls
-        .iter()
-        .map(|tool_call| {
-            serde_json::json!({
-                "id": tool_call.id,
-                "type": "function",
-                "function": {
-                    "name": tool_call.name,
-                    "arguments": serde_json::to_string(&tool_call.arguments).unwrap_or_default()
-                }
-            })
-        })
-        .collect();
+    let mut api_tool_calls: Vec<serde_json::Value> = Vec::new();
+    for tool_call in &tool_calls {
+        api_tool_calls.push(
+            api_tool_call_value(
+                Some(&client),
+                &profile,
+                tool_call,
+                requested_tools.as_ref(),
+                None,
+            )
+            .await,
+        );
+    }
 
     Ok(Json(ChatCompletionResponse {
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -1152,18 +1763,23 @@ async fn stream_chat_completion(
     profile: ModelProfile,
     generation_started_at: String,
     generation_started: std::time::Instant,
+    request_id: String,
+    cancel: tokio_util::sync::CancellationToken,
     include_usage_details: bool,
+    requested_tools: Option<Vec<serde_json::Value>>,
 ) -> Result<Response, ApiErrorResponse> {
-    let response = client.complete_stream(&request).await.map_err(|e| {
-        tracing::error!(error = %e, "Stream completion failed");
-        ApiErrorResponse::inference_failed(&e.to_string())
-    })?;
+    let response = match client.complete_stream(&request).await {
+        Ok(response) => response,
+        Err(e) => {
+            finish_api_generation(&state, "error").await;
+            tracing::error!(error = %e, "Stream completion failed");
+            return Err(ApiErrorResponse::inference_failed(&e.to_string()));
+        }
+    };
 
-    let gen = begin_api_generation(&state, model_name.clone()).await;
-    let request_id = gen.request_id.clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move {
-        let _ = streaming::consume_sse_stream(response, tx, gen.cancel).await;
+        let _ = streaming::consume_sse_stream(response, tx, cancel).await;
     });
 
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
@@ -1173,6 +1789,7 @@ async fn stream_chat_completion(
     let stream = async_stream::stream! {
         let mut raw_full_text = String::new();
         let mut first_token_at: Option<std::time::Instant> = None;
+        let mut visible_tokens: u32 = 0;
 
         let opening_chunk = serde_json::json!({
             "id": id,
@@ -1189,10 +1806,26 @@ async fn stream_chat_completion(
 
         while let Some(event) = rx.recv().await {
             match event {
+                StreamEvent::RawDelta(raw) => {
+                    raw_full_text.push_str(&raw);
+                    append_live_stream_delta(&state_for_stream, "raw", &raw).await;
+                }
                 StreamEvent::Token(token) => {
+                    append_live_stream_delta(&state_for_stream, "content", &token).await;
                     if first_token_at.is_none() {
                         first_token_at = Some(std::time::Instant::now());
                     }
+                    visible_tokens = visible_tokens.saturating_add(1);
+                    publish_live_generation_metrics(
+                        &state_for_stream,
+                        "api",
+                        &model_name,
+                        &request_id,
+                        &generation_started_at,
+                        generation_started,
+                        first_token_at,
+                        visible_tokens,
+                    ).await;
                     let chunk_json = serde_json::json!({
                         "id": id,
                         "object": "chat.completion.chunk",
@@ -1210,6 +1843,7 @@ async fn stream_chat_completion(
                     raw_full_text.push_str("<think>");
                     raw_full_text.push_str(&reasoning);
                     raw_full_text.push_str("</think>");
+                    append_live_stream_delta(&state_for_stream, "reasoning", &reasoning).await;
                     let chunk_json = serde_json::json!({
                         "id": id,
                         "object": "chat.completion.chunk",
@@ -1269,23 +1903,26 @@ async fn stream_chat_completion(
                             &stripped,
                             &profile,
                         );
-                    let api_stream_tool_calls: Vec<serde_json::Value> = stream_tool_calls
-                        .iter()
-                        .enumerate()
-                        .map(|(i, tc)| {
-                            serde_json::json!({
-                                "index": i,
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": serde_json::to_string(&tc.arguments)
-                                        .unwrap_or_default()
-                                }
-                            })
-                        })
-                        .collect();
+                    let mut api_stream_tool_calls: Vec<serde_json::Value> = Vec::new();
+                    for (i, tc) in stream_tool_calls.iter().enumerate() {
+                        api_stream_tool_calls.push(
+                            api_tool_call_value(
+                                Some(&client),
+                                &profile,
+                                tc,
+                                requested_tools.as_ref(),
+                                Some(i),
+                            )
+                            .await,
+                        );
+                    }
                     if !api_stream_tool_calls.is_empty() {
+                        append_live_stream_delta(
+                            &state_for_stream,
+                            "tool_call",
+                            &serde_json::to_string_pretty(&api_stream_tool_calls)
+                                .unwrap_or_default(),
+                        ).await;
                         let tool_calls_chunk = serde_json::json!({
                             "id": id,
                             "object": "chat.completion.chunk",
@@ -1329,6 +1966,7 @@ async fn stream_chat_completion(
                     return;
                 }
                 StreamEvent::Error(error) => {
+                    append_live_stream_delta(&state_for_stream, "error", &error).await;
                     finish_api_generation(&state_for_stream, "error").await;
                     let error_chunk = serde_json::json!({
                         "error": {
@@ -1544,8 +2182,10 @@ pub async fn text_completions(
 #[cfg(test)]
 mod tests {
     use super::{
-        loaded_model_matches_request, normalize_api_messages, ApiMessage, ChatCompletionRequest,
+        api_tool_call_value, context_size_for_reload, loaded_model_matches_request,
+        normalize_api_messages, ApiMessage, ChatCompletionRequest,
     };
+    use crate::models::profiles::ModelProfile;
 
     #[test]
     fn deserializes_string_message_content() {
@@ -1559,6 +2199,22 @@ mod tests {
         .expect("request should deserialize");
 
         assert_eq!(request.messages.len(), 1);
+    }
+
+    #[test]
+    fn reload_context_preserves_loaded_context_when_request_omits_context() {
+        assert_eq!(
+            context_size_for_reload(None, None, Some(32768)),
+            Some(32768)
+        );
+    }
+
+    #[test]
+    fn reload_context_prefers_explicit_request() {
+        assert_eq!(
+            context_size_for_reload(Some(16384), None, Some(32768)),
+            Some(16384)
+        );
     }
 
     #[tokio::test]
@@ -1578,7 +2234,9 @@ mod tests {
         )
         .expect("request should deserialize");
 
-        let (messages, image_data) = match normalize_api_messages(&request.messages).await {
+        let profile = ModelProfile::detect("Qwen3.6-27B-Q4_K_M.gguf");
+        let (messages, image_data) = match normalize_api_messages(&request.messages, &profile).await
+        {
             Ok(value) => value,
             Err(_) => panic!("messages should normalize"),
         };
@@ -1605,7 +2263,8 @@ mod tests {
             refusal: None,
         }];
 
-        let (normalized, image_data) = match normalize_api_messages(&messages).await {
+        let profile = ModelProfile::detect("Qwen3.6-27B-Q4_K_M.gguf");
+        let (normalized, image_data) = match normalize_api_messages(&messages, &profile).await {
             Ok(value) => value,
             Err(_) => panic!("messages should normalize"),
         };
@@ -1672,6 +2331,46 @@ mod tests {
                 .and_then(|value| value.max_tokens),
             Some(256)
         );
+    }
+
+    #[tokio::test]
+    async fn coerces_tool_arguments_to_declared_schema_types() {
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "subagent",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "timeout_seconds": { "type": "integer" },
+                        "enabled": { "type": "boolean" },
+                        "score": { "type": "number" }
+                    }
+                }
+            }
+        })];
+        let tool_call = crate::normalize::tool_extract::ToolCall {
+            id: "call_1".to_string(),
+            name: "subagent".to_string(),
+            arguments: serde_json::json!({
+                "timeout_seconds": "60",
+                "enabled": "true",
+                "score": "0.95"
+            }),
+            raw_text: None,
+        };
+
+        let profile = ModelProfile::detect("Qwen3.6-27B-Q4_K_M.gguf");
+        let api_value = api_tool_call_value(None, &profile, &tool_call, Some(&tools), None).await;
+        let args_text = api_value["function"]["arguments"]
+            .as_str()
+            .expect("arguments should be stringified JSON");
+        let args: serde_json::Value =
+            serde_json::from_str(args_text).expect("arguments should parse");
+
+        assert_eq!(args["timeout_seconds"], serde_json::json!(60));
+        assert_eq!(args["enabled"], serde_json::json!(true));
+        assert_eq!(args["score"], serde_json::json!(0.95));
     }
 
     #[test]
@@ -1787,6 +2486,18 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn matches_provider_profile_aliases_to_loaded_gguf() {
+        assert!(loaded_model_matches_request(
+            "Qwen3.6-27B-Q4_K_M.gguf",
+            "qwen3.6-think"
+        ));
+        assert!(loaded_model_matches_request(
+            "unsloth/Qwen3.5-27B-Instruct-Q4_K_M.gguf",
+            "qwen3.5-reasoning"
+        ));
+    }
+
     #[tokio::test]
     async fn preserves_tool_metadata_in_message_history() {
         let messages = vec![ApiMessage {
@@ -1805,13 +2516,18 @@ mod tests {
             refusal: None,
         }];
 
-        let (normalized, _) = match normalize_api_messages(&messages).await {
+        let profile = ModelProfile::detect("Qwen3.6-27B-Q4_K_M.gguf");
+        let (normalized, _) = match normalize_api_messages(&messages, &profile).await {
             Ok(value) => value,
             Err(_) => panic!("messages should normalize"),
         };
 
         assert!(normalized[0].content.contains("[name:planner]"));
-        assert!(normalized[0].content.contains("[tool_call_id:call_123]"));
-        assert!(normalized[0].content.contains("[tool_calls]"));
+        assert!(!normalized[0].content.contains("[tool_calls]"));
+        assert!(normalized[0].content.contains("<tool_call>"));
+        assert!(normalized[0].content.contains("<function=search_docs>"));
+        assert!(normalized[0]
+            .content
+            .contains("<parameter=query>qwen</parameter>"));
     }
 }

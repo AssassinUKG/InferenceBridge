@@ -4,7 +4,7 @@ import type { ModelInfo, ProcessStatusInfo, LoadProgress } from "../lib/types";
 import * as api from "../lib/tauri";
 import type { LoadModelOptions } from "../lib/tauri";
 
-const STATUS_POLL_MS = 1500;
+const STATUS_POLL_MS = 1000;
 
 interface ModelState {
   models: ModelInfo[];
@@ -63,6 +63,10 @@ function sameProcessStatus(
     a.last_generation_metrics?.finished_at === b.last_generation_metrics?.finished_at &&
     a.last_generation_metrics?.decode_tokens_per_second ===
       b.last_generation_metrics?.decode_tokens_per_second &&
+    a.live_stream?.request_id === b.live_stream?.request_id &&
+    a.live_stream?.status === b.live_stream?.status &&
+    a.live_stream?.raw_output.length === b.live_stream?.raw_output.length &&
+    a.live_stream?.events.length === b.live_stream?.events.length &&
     a.crash_count === b.crash_count &&
     a.server_version === b.server_version &&
     a.server_path === b.server_path &&

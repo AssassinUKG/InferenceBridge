@@ -48,6 +48,11 @@ pub fn strip_think_tags(text: &str) -> String {
             }
             return String::new();
         }
+
+        if let Some(end) = text.find(close) {
+            let after_close = &text[end + close.len()..];
+            return after_close.trim().to_string();
+        }
     }
 
     text.to_string()
@@ -106,6 +111,15 @@ fn extract_tagged_sections(text: &str, tag_pairs: &[(&str, &str)]) -> String {
                 break;
             }
         }
+
+        if !text.contains(open) {
+            if let Some(end) = text.find(close) {
+                let inner = text[..end].trim();
+                if !inner.is_empty() {
+                    extracted.push(inner.to_string());
+                }
+            }
+        }
     }
 
     extracted.join("\n")
@@ -140,6 +154,18 @@ mod tests {
             strip_think_tags(raw),
             "Answer: still useful trailing content"
         );
+    }
+
+    #[test]
+    fn orphan_closing_tag_strips_reasoning_prefix() {
+        let raw = "private reasoning</think>Final answer";
+        assert_eq!(strip_think_tags(raw), "Final answer");
+    }
+
+    #[test]
+    fn orphan_closing_tag_extracts_reasoning_prefix() {
+        let raw = "private reasoning</think>Final answer";
+        assert_eq!(extract_reasoning_content(raw), "private reasoning");
     }
 
     #[test]

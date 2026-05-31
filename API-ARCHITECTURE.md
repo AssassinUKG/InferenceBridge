@@ -60,6 +60,7 @@ External clients (HelixClaw, curl, etc.)
 | GET    | `/v1/context/status`      | `extensions::context_status` | KV cache fill ratio + token counts  |
 | GET    | `/v1/runtime/status`      | `extensions::runtime_status` | Full runtime status                 |
 | GET    | `/v1/debug/profile`       | `extensions::debug_profile`  | Debug/profiling info                |
+| POST   | `/v1/reliability/agent-action/validate` | `extensions::validate_agent_action` | Strip think tags, extract/repair JSON, validate strict AgentAction |
 | GET    | `/v1/sessions`            | `extensions::list_sessions`  | List chat sessions                  |
 | POST   | `/v1/sessions`            | `extensions::create_session` | Create a new session                |
 | DELETE | `/v1/sessions/:id`        | `extensions::delete_session` | Delete a session                    |
@@ -108,6 +109,18 @@ Client POST /v1/chat/completions
   -> Forwards to http://127.0.0.1:{internal_port}/completion
   -> Translates response back to OpenAI format
   -> Returns to client
+```
+
+### Agent Action Validation
+
+```
+Client POST /v1/reliability/agent-action/validate
+  -> extensions::validate_agent_action
+  -> Strips configured think tags (none, standard, qwen)
+  -> Extracts the first JSON object/array from noisy model output
+  -> Repairs JSON where safe
+  -> Validates strict AgentAction fields
+  -> Returns valid action or exact schema/repair errors
 ```
 
 ### Model Load

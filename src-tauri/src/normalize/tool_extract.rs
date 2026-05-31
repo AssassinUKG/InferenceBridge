@@ -7,19 +7,38 @@ use crate::models::profiles::{ModelProfile, ParserType};
 
 static QWEN_FUNCTION_RE: OnceLock<regex::Regex> = OnceLock::new();
 static QWEN_PARAM_RE: OnceLock<regex::Regex> = OnceLock::new();
+static TOOL_CODE_DIV_RE: OnceLock<regex::Regex> = OnceLock::new();
+static TOOL_CALL_EXPR_RE: OnceLock<regex::Regex> = OnceLock::new();
 static SQUARE_BRACKET_RE: OnceLock<regex::Regex> = OnceLock::new();
 static PARENTHESIS_RE: OnceLock<regex::Regex> = OnceLock::new();
 
 fn qwen_function_re() -> &'static regex::Regex {
     QWEN_FUNCTION_RE.get_or_init(|| {
-        regex::Regex::new(r"<function=([^>]+)>(.*?)</function>").expect("valid Qwen function regex")
+        regex::Regex::new(r"(?s)<function=([^>]+)>(.*?)(?:</function>|$)")
+            .expect("valid Qwen function regex")
     })
 }
 
 fn qwen_param_re() -> &'static regex::Regex {
     QWEN_PARAM_RE.get_or_init(|| {
-        regex::Regex::new(r"<parameter=([^>]+)>(.*?)</parameter>")
+        regex::Regex::new(r"(?s)<parameter=([^>]+)>(.*?)(?:</parameter>|$)")
             .expect("valid Qwen parameter regex")
+    })
+}
+
+fn tool_code_div_re() -> &'static regex::Regex {
+    TOOL_CODE_DIV_RE.get_or_init(|| {
+        regex::Regex::new(r#"(?s)<div\s+class=["']tool_code["']\s*>(.*?)</div>"#)
+            .expect("valid tool_code div regex")
+    })
+}
+
+fn tool_call_expr_re() -> &'static regex::Regex {
+    TOOL_CALL_EXPR_RE.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?s)<tool_call>\s*(?:_\.)?([a-zA-Z][a-zA-Z0-9_\-]*)\s*\((.*?)\)\s*(?:</tool_call>)?"#,
+        )
+        .expect("valid plain tool_call expression regex")
     })
 }
 
@@ -58,7 +77,27 @@ pub fn extract_tool_calls(text: &str) -> (Vec<ToolCall>, String) {
     // Try Qwen-style <function=name><parameter=key>value</parameter></function>
     extract_qwen_function_calls(&mut remaining, &mut calls);
 
+    // Try HTML/Python-ish fallbacks emitted by some agent prompts.
+    extract_html_tool_code_calls(&mut remaining, &mut calls);
+    extract_plain_tool_call_expressions(&mut remaining, &mut calls);
+
+    if !calls.is_empty() {
+        remove_empty_tool_wrappers(&mut remaining);
+    }
+
+    if !calls.is_empty() {
+        remove_empty_tool_wrappers(&mut remaining);
+    }
+
     (calls, remaining.trim().to_string())
+}
+
+fn remove_empty_tool_wrappers(text: &mut String) {
+    *text = text
+        .replace("<tool_call>", "")
+        .replace("</tool_call>", "")
+        .trim()
+        .to_string();
 }
 
 pub fn extract_tool_calls_for_profile(
@@ -75,6 +114,13 @@ pub fn extract_tool_calls_for_profile(
             if calls.is_empty() && profile.allow_fallback_extraction {
                 extract_hermes_calls(&mut remaining, &mut calls);
             }
+            if calls.is_empty() && profile.allow_fallback_extraction {
+                extract_html_tool_code_calls(&mut remaining, &mut calls);
+                extract_plain_tool_call_expressions(&mut remaining, &mut calls);
+            }
+            if calls.is_empty() && profile.allow_fallback_extraction {
+                extract_json_tool_objects(&mut remaining, &mut calls);
+            }
             // Safety net: if llama-server didn't inject the Qwen chat template, the model may
             // fall back to text-format tool calls instead of <function=...> XML.
             // Try both known fallback formats in order.
@@ -89,6 +135,11 @@ pub fn extract_tool_calls_for_profile(
                         "qwen safety-net: [tool_call]name({{...}}) format detected - \
                         check chat template config on llama-server"
                     );
+                } else if extract_bare_tool_call_json(&mut remaining, &mut calls) {
+                    tracing::info!(
+                        "qwen safety-net: bare <tool_call>{{...}} format detected - \
+                        check chat template config on llama-server"
+                    );
                 }
             }
         }
@@ -97,6 +148,13 @@ pub fn extract_tool_calls_for_profile(
             if calls.is_empty() && profile.allow_fallback_extraction {
                 extract_qwen_function_calls(&mut remaining, &mut calls);
             }
+            if calls.is_empty() && profile.allow_fallback_extraction {
+                extract_html_tool_code_calls(&mut remaining, &mut calls);
+                extract_plain_tool_call_expressions(&mut remaining, &mut calls);
+            }
+            if calls.is_empty() && profile.allow_fallback_extraction {
+                extract_json_tool_objects(&mut remaining, &mut calls);
+            }
         }
         ParserType::NativeApi => {
             if profile.allow_fallback_extraction {
@@ -104,8 +162,19 @@ pub fn extract_tool_calls_for_profile(
                 if calls.is_empty() {
                     extract_qwen_function_calls(&mut remaining, &mut calls);
                 }
+                if calls.is_empty() {
+                    extract_html_tool_code_calls(&mut remaining, &mut calls);
+                    extract_plain_tool_call_expressions(&mut remaining, &mut calls);
+                }
+                if calls.is_empty() {
+                    extract_json_tool_objects(&mut remaining, &mut calls);
+                }
             }
         }
+    }
+
+    if !calls.is_empty() {
+        remove_empty_tool_wrappers(&mut remaining);
     }
 
     (calls, remaining.trim().to_string())
@@ -137,6 +206,254 @@ fn extract_hermes_calls(text: &mut String, calls: &mut Vec<ToolCall>) {
     }
 }
 
+fn extract_html_tool_code_calls(text: &mut String, calls: &mut Vec<ToolCall>) -> bool {
+    let mut removals = Vec::new();
+
+    for cap in tool_code_div_re().captures_iter(text) {
+        let full_match = cap.get(0).unwrap();
+        let body = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+        let Some(value) = super::json_repair::repair_json(body) else {
+            continue;
+        };
+
+        let Some(name) = value
+            .get("tool_name")
+            .or_else(|| value.get("name"))
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+
+        let arguments = value
+            .get("tool_argument")
+            .or_else(|| value.get("tool_arguments"))
+            .or_else(|| value.get("arguments"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+
+        calls.push(ToolCall {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name.to_string(),
+            arguments,
+            raw_text: Some(full_match.as_str().to_string()),
+        });
+        removals.push((full_match.start(), full_match.end()));
+    }
+
+    if removals.is_empty() {
+        return false;
+    }
+
+    let mut new_text = text.clone();
+    for (start, end) in removals.into_iter().rev() {
+        new_text.replace_range(start..end, "");
+    }
+    *text = new_text;
+    true
+}
+
+fn extract_plain_tool_call_expressions(text: &mut String, calls: &mut Vec<ToolCall>) -> bool {
+    let mut removals = Vec::new();
+
+    for cap in tool_call_expr_re().captures_iter(text) {
+        let full_match = cap.get(0).unwrap();
+        let Some(name_match) = cap.get(1) else {
+            continue;
+        };
+        let args_text = cap.get(2).map(|m| m.as_str()).unwrap_or("");
+        let Some(arguments) = parse_call_expression_arguments(args_text) else {
+            continue;
+        };
+
+        calls.push(ToolCall {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: name_match.as_str().to_string(),
+            arguments,
+            raw_text: Some(full_match.as_str().to_string()),
+        });
+        removals.push((full_match.start(), full_match.end()));
+    }
+
+    if removals.is_empty() {
+        return false;
+    }
+
+    let mut new_text = text.clone();
+    for (start, end) in removals.into_iter().rev() {
+        new_text.replace_range(start..end, "");
+    }
+    *text = new_text;
+    true
+}
+
+fn extract_json_tool_objects(text: &mut String, calls: &mut Vec<ToolCall>) -> bool {
+    if extract_json_tool_fences(text, calls) {
+        return true;
+    }
+    extract_standalone_json_tool_object(text, calls)
+}
+
+fn extract_json_tool_fences(text: &mut String, calls: &mut Vec<ToolCall>) -> bool {
+    let mut found_any = false;
+    loop {
+        let Some(fence_start) = text.find("```") else {
+            break;
+        };
+        let body_start = fence_start + 3;
+        let Some(rel_fence_end) = text[body_start..].find("```") else {
+            break;
+        };
+        let fence_end = body_start + rel_fence_end + 3;
+        let body = &text[body_start..body_start + rel_fence_end];
+        let body = body
+            .trim_start()
+            .strip_prefix("json")
+            .unwrap_or(body.trim_start())
+            .trim_start();
+        let Some(rel_brace) = body.find('{') else {
+            break;
+        };
+        let Some(json_len) = balanced_json_object_len(&body[rel_brace..]) else {
+            break;
+        };
+        let json_str = &body[rel_brace..rel_brace + json_len];
+        let Some(value) = super::json_repair::repair_json(json_str) else {
+            break;
+        };
+        let Some((name, arguments)) = infer_bare_tool_call(value) else {
+            break;
+        };
+        calls.push(ToolCall {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            arguments,
+            raw_text: Some(text[fence_start..fence_end].to_string()),
+        });
+        *text = format!("{}{}", &text[..fence_start], &text[fence_end..]);
+        found_any = true;
+    }
+    found_any
+}
+
+fn extract_standalone_json_tool_object(text: &mut String, calls: &mut Vec<ToolCall>) -> bool {
+    let trimmed_start = text.trim_start();
+    let leading = text.len() - trimmed_start.len();
+    let Some(json_len) = balanced_json_object_len(trimmed_start) else {
+        return false;
+    };
+    let json_str = &trimmed_start[..json_len];
+    let Some(value) = super::json_repair::repair_json(json_str) else {
+        return false;
+    };
+    let Some((name, arguments)) = infer_bare_tool_call(value) else {
+        return false;
+    };
+    let remove_end = leading + json_len;
+    calls.push(ToolCall {
+        id: uuid::Uuid::new_v4().to_string(),
+        name,
+        arguments,
+        raw_text: Some(text[leading..remove_end].to_string()),
+    });
+    *text = format!("{}{}", &text[..leading], &text[remove_end..]);
+    true
+}
+
+fn parse_call_expression_arguments(args_text: &str) -> Option<serde_json::Value> {
+    let trimmed = args_text.trim();
+    if trimmed.is_empty() {
+        return Some(serde_json::Value::Object(serde_json::Map::new()));
+    }
+    if let Some(value) = super::json_repair::repair_json(trimmed) {
+        return Some(value);
+    }
+
+    let mut args = serde_json::Map::new();
+    for part in split_top_level_commas(trimmed) {
+        let (key, value) = part.split_once('=')?;
+        let key = key.trim().trim_matches(|ch| ch == '"' || ch == '\'');
+        if key.is_empty() {
+            return None;
+        }
+        args.insert(key.to_string(), parse_call_expression_value(value.trim()));
+    }
+    Some(serde_json::Value::Object(args))
+}
+
+fn split_top_level_commas(text: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (idx, ch) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote.is_some() && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(current_quote) = quote {
+            if ch == current_quote {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(text[start..idx].trim());
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    if start <= text.len() {
+        let tail = text[start..].trim();
+        if !tail.is_empty() {
+            parts.push(tail);
+        }
+    }
+    parts
+}
+
+fn parse_call_expression_value(text: &str) -> serde_json::Value {
+    let trimmed = text.trim();
+    if let Some(value) = super::json_repair::repair_json(trimmed) {
+        return value;
+    }
+    if let Some(value) = trimmed
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            trimmed
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+    {
+        return serde_json::Value::String(value.to_string());
+    }
+    match trimmed {
+        "true" => serde_json::Value::Bool(true),
+        "false" => serde_json::Value::Bool(false),
+        "null" | "None" | "none" => serde_json::Value::Null,
+        _ => trimmed
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|| serde_json::Value::String(trimmed.to_string())),
+    }
+}
+
 fn extract_qwen_function_calls(text: &mut String, calls: &mut Vec<ToolCall>) {
     let mut removals = Vec::new();
 
@@ -150,15 +467,16 @@ fn extract_qwen_function_calls(text: &mut String, calls: &mut Vec<ToolCall>) {
         for param_cap in qwen_param_re().captures_iter(body) {
             let key = param_cap.get(1).unwrap().as_str().trim();
             let raw_value = param_cap.get(2).unwrap().as_str();
-            let trimmed = raw_value.trim();
+            let normalized = trim_xml_line_padding(raw_value);
+            let trimmed = normalized.trim();
             let parse_as_json = (trimmed.starts_with('{') && trimmed.ends_with('}'))
                 || (trimmed.starts_with('[') && trimmed.ends_with(']'))
                 || (trimmed.starts_with('"') && trimmed.ends_with('"'));
             let json_val = if parse_as_json {
                 serde_json::from_str(trimmed)
-                    .unwrap_or_else(|_| serde_json::Value::String(raw_value.to_string()))
+                    .unwrap_or_else(|_| serde_json::Value::String(normalized.to_string()))
             } else {
-                serde_json::Value::String(raw_value.to_string())
+                serde_json::Value::String(normalized.to_string())
             };
             args.insert(key.to_string(), json_val);
         }
@@ -183,6 +501,10 @@ fn extract_qwen_function_calls(text: &mut String, calls: &mut Vec<ToolCall>) {
     }
 
     *text = new_text;
+}
+
+fn trim_xml_line_padding(value: &str) -> &str {
+    value.trim_matches(|ch| ch == '\r' || ch == '\n')
 }
 
 /// Finds the byte length of a balanced `{...}` JSON object starting at the beginning of `text`.
@@ -312,6 +634,108 @@ fn extract_parenthesis_tool_calls(text: &mut String, calls: &mut Vec<ToolCall>) 
     found_any
 }
 
+fn extract_bare_tool_call_json(text: &mut String, calls: &mut Vec<ToolCall>) -> bool {
+    let mut found_any = false;
+    loop {
+        let Some(start) = text.find("<tool_call>") else {
+            break;
+        };
+        let after = start + "<tool_call>".len();
+        let Some(rel_brace) = text[after..].find('{') else {
+            break;
+        };
+        let brace_start = after + rel_brace;
+        let Some(json_len) = balanced_json_object_len(&text[brace_start..]) else {
+            break;
+        };
+        let body_end = brace_start + json_len;
+        let json_str = &text[brace_start..body_end];
+        let Some(value) = super::json_repair::repair_json(json_str) else {
+            break;
+        };
+        let Some((name, arguments)) = infer_bare_tool_call(value) else {
+            break;
+        };
+        let close_end = text[body_end..]
+            .find("</tool_call>")
+            .map(|rel| body_end + rel + "</tool_call>".len())
+            .unwrap_or(body_end);
+        let raw_text = text[start..close_end].to_string();
+        calls.push(ToolCall {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            arguments,
+            raw_text: Some(raw_text),
+        });
+        *text = format!("{}{}", &text[..start], &text[close_end..]);
+        found_any = true;
+    }
+    found_any
+}
+
+fn infer_bare_tool_call(value: serde_json::Value) -> Option<(String, serde_json::Value)> {
+    if let Some(name) = value
+        .get("name")
+        .or_else(|| value.get("tool"))
+        .or_else(|| value.get("tool_name"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let arguments = value
+            .get("arguments")
+            .or_else(|| value.get("input"))
+            .or_else(|| value.get("tool_argument"))
+            .or_else(|| value.get("tool_arguments"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        return Some((name.to_string(), arguments));
+    }
+
+    let serde_json::Value::Object(args) = value else {
+        return None;
+    };
+
+    let inferred_name = if args
+        .get("pattern")
+        .and_then(|value| value.as_str())
+        .map(looks_like_glob_pattern)
+        .unwrap_or(false)
+    {
+        Some("glob")
+    } else if args
+        .get("command")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some()
+    {
+        Some("shell")
+    } else if args.len() == 1
+        && args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some()
+    {
+        Some("read_file")
+    } else {
+        None
+    }?;
+
+    Some((inferred_name.to_string(), serde_json::Value::Object(args)))
+}
+
+fn looks_like_glob_pattern(value: &str) -> bool {
+    let trimmed = value.trim();
+    !trimmed.is_empty()
+        && (trimmed.contains('*')
+            || trimmed.contains('?')
+            || trimmed.contains('[')
+            || trimmed.contains('{'))
+}
+
 fn unwrap_meta_tool_call(
     outer_name: &str,
     mut args: serde_json::Map<String, serde_json::Value>,
@@ -394,6 +818,16 @@ mod tests {
     }
 
     #[test]
+    fn qwen_profile_extracts_function_cut_at_end_of_text() {
+        let text = "<tool_call>\n<function=glob>\n<parameter=pattern>**/*.go</parameter>";
+        let (calls, remaining) = extract_tool_calls_for_profile(text, &qwen_profile());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "glob");
+        assert_eq!(calls[0].arguments["pattern"], "**/*.go");
+        assert!(remaining.trim().is_empty(), "remaining={remaining:?}");
+    }
+
+    #[test]
     fn legacy_extractor_still_supports_qwen_and_hermes() {
         let text = "<tool_call>{\"name\":\"ping\",\"arguments\":{\"x\":1}}</tool_call>";
         let (calls, remaining) = extract_tool_calls(text);
@@ -411,6 +845,13 @@ mod tests {
             calls[0].arguments["text"],
             serde_json::Value::String("  keep surrounding spaces  ".to_string())
         );
+    }
+
+    #[test]
+    fn qwen_xml_trims_template_line_padding() {
+        let text = "<function=read_file><parameter=path>\nmain.go\n</parameter></function>";
+        let (calls, _) = extract_tool_calls_for_profile(text, &qwen_profile());
+        assert_eq!(calls[0].arguments["path"], "main.go");
     }
 
     #[test]
@@ -503,6 +944,63 @@ mod tests {
         assert_eq!(calls[0].arguments["agent_id"], "Barry");
         assert!(remaining.contains("I'll dispatch"));
         assert!(remaining.contains("Done."));
+    }
+
+    #[test]
+    fn qwen_safety_net_parses_html_tool_code_div() {
+        let text = r#"Let me check.
+<div class="tool_code">{"tool_name":"glob","tool_argument":{"pattern":"*"}}</div>
+Done."#;
+        let (calls, remaining) = extract_tool_calls_for_profile(text, &qwen_profile());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "glob");
+        assert_eq!(calls[0].arguments["pattern"], "*");
+        assert!(remaining.contains("Let me check."));
+        assert!(remaining.contains("Done."));
+        assert!(!remaining.contains("tool_code"));
+    }
+
+    #[test]
+    fn qwen_safety_net_parses_plain_xml_tool_call_expression() {
+        let text = r#"Let me check what is in the current folder.
+<tool_call>_.glob(dir=".",pattern="**/*")"#;
+        let (calls, remaining) = extract_tool_calls_for_profile(text, &qwen_profile());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "glob");
+        assert_eq!(calls[0].arguments["dir"], ".");
+        assert_eq!(calls[0].arguments["pattern"], "**/*");
+        assert!(remaining.contains("Let me check"));
+        assert!(!remaining.contains("<tool_call>"));
+    }
+
+    #[test]
+    fn qwen_safety_net_repairs_bare_tool_call_json_with_inferred_tool() {
+        let text = r#"Let me inspect.
+<tool_call>
+{"pattern":"**/*.go"}"#;
+        let (calls, remaining) = extract_tool_calls_for_profile(text, &qwen_profile());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "glob");
+        assert_eq!(calls[0].arguments["pattern"], "**/*.go");
+        assert!(remaining.contains("Let me inspect."));
+        assert!(!remaining.contains("<tool_call>"));
+    }
+
+    #[test]
+    fn qwen_safety_net_parses_fenced_tool_input_json() {
+        let text = r#"```json
+{
+  "tool": "glob",
+  "input": {
+    "pattern": "**/*.go"
+  }
+}
+```"#;
+        let (calls, remaining) = extract_tool_calls_for_profile(text, &qwen_profile());
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "glob");
+        assert_eq!(calls[0].arguments["pattern"], "**/*.go");
+        assert!(remaining.is_empty());
     }
 
     #[test]

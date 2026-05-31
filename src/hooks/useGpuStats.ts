@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import type { GpuStats } from "../lib/types";
 import * as api from "../lib/tauri";
 
-const POLL_INTERVAL_MS = 3000;
+const POLL_INTERVAL_MS = 2000;
 
 export function useGpuStats() {
   const [stats, setStats] = useState<GpuStats | null>(null);

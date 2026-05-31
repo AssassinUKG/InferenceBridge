@@ -2,6 +2,12 @@
 node_modules/
 dist/
 .env
+.env.*
+!.env.example
+!.env.*.example
+*.env
+!example.env
+!*.example.env
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
@@ -33,6 +39,21 @@ Thumbs.db
 
 # User config (contains local paths — use inference-bridge.example.toml as template)
 /inference-bridge.toml
+
+# Common local secrets and credentials
+.envrc
+.npmrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.cer
+*.crt
+*.der
+*.jks
+*.keystore
+secrets.*
+.secrets/
 
 # Runtime app-support directories (used as config fallback in dev)
 /.inference-bridge/

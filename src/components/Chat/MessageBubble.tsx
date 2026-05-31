@@ -8,14 +8,31 @@ interface Props {
 
 function parseThinkBlocks(content: string): Array<{ type: "think" | "text"; text: string }> {
   const parts: Array<{ type: "think" | "text"; text: string }> = [];
-  const re = /<think>([\s\S]*?)<\/think>/g;
+  const orphanClose = ["</think>", "<|/think|>"]
+    .map((tag) => ({ tag, index: content.indexOf(tag) }))
+    .filter((item) => item.index >= 0)
+    .sort((a, b) => a.index - b.index)[0];
+
+  if (
+    orphanClose &&
+    !content.includes("<think>") &&
+    !content.includes("<|think|>")
+  ) {
+    const reasoning = content.slice(0, orphanClose.index).trim();
+    const text = content.slice(orphanClose.index + orphanClose.tag.length);
+    if (reasoning) parts.push({ type: "think", text: reasoning });
+    if (text) parts.push({ type: "text", text });
+    return parts;
+  }
+
+  const re = /<think>([\s\S]*?)<\/think>|<\|think\|>([\s\S]*?)<\|\/think\|>/g;
   let last = 0;
   let match: RegExpExecArray | null;
   while ((match = re.exec(content)) !== null) {
     if (match.index > last) {
       parts.push({ type: "text", text: content.slice(last, match.index) });
     }
-    parts.push({ type: "think", text: match[1].trim() });
+    parts.push({ type: "think", text: (match[1] ?? match[2] ?? "").trim() });
     last = match.index + match[0].length;
   }
   if (last < content.length) {
@@ -70,9 +87,18 @@ export function MessageBubble({ message }: Props) {
   const hasImage = !!imageSrc;
   const textContent = imageSrc === content ? "" : content;
 
-  const hasThinkTags = !isUser && textContent.includes("<think>");
+  const hasThinkTags =
+    !isUser &&
+    (textContent.includes("<think>") ||
+      textContent.includes("</think>") ||
+      textContent.includes("<|think|>") ||
+      textContent.includes("<|/think|>"));
   const parts = hasThinkTags ? parseThinkBlocks(textContent) : null;
-  const plainTextForCopy = textContent.replace(/<think>[\s\S]*?<\/think>/g, "").trim();
+  const plainTextForCopy = (parts ?? [{ type: "text" as const, text: textContent }])
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
+    .join("")
+    .trim();
 
   return (
     <div className={`group flex gap-3 px-4 py-3 ${isUser ? "" : "bg-gray-800/30"}`}>

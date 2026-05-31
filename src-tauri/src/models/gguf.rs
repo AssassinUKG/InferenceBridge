@@ -93,7 +93,11 @@ fn seek_fwd<R: Seek>(r: &mut R, n: u64) -> Option<()> {
 }
 
 fn read_str<R: Read + Seek>(r: &mut R, v1: bool) -> Option<String> {
-    let len = if v1 { read_u32(r)? as u64 } else { read_u64(r)? };
+    let len = if v1 {
+        read_u32(r)? as u64
+    } else {
+        read_u64(r)?
+    };
     if len > 1 << 20 {
         return None; // sanity: no metadata string > 1 MB
     }
@@ -110,12 +114,20 @@ fn skip_val<R: Read + Seek>(r: &mut R, ty: u32, v1: bool) -> Option<()> {
         T_U32 | T_I32 | T_F32 => seek_fwd(r, 4),
         T_U64 | T_I64 | T_F64 => seek_fwd(r, 8),
         T_STRING => {
-            let len = if v1 { read_u32(r)? as u64 } else { read_u64(r)? };
+            let len = if v1 {
+                read_u32(r)? as u64
+            } else {
+                read_u64(r)?
+            };
             seek_fwd(r, len)
         }
         T_ARRAY => {
             let elem_ty = read_u32(r)?;
-            let count = if v1 { read_u32(r)? as u64 } else { read_u64(r)? };
+            let count = if v1 {
+                read_u32(r)? as u64
+            } else {
+                read_u64(r)?
+            };
             // Fixed-size elements: one seek covers the whole array
             let fixed = match elem_ty {
                 T_U8 | T_I8 | T_BOOL => Some(count),

@@ -26,6 +26,7 @@ struct SseTimings {
 
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
+    RawDelta(String),
     Token(String),
     ReasoningDelta(String),
     Done {
@@ -67,12 +68,31 @@ async fn emit_parsed_content(
     tx: &mpsc::Sender<StreamEvent>,
     parser_buffer: &mut String,
     in_think: &mut bool,
+    hidden_tool_close: &mut Option<&'static str>,
 ) {
     const OPEN_TAGS: [&str; 2] = ["<think>", "<|think|>"];
     const CLOSE_TAGS: [&str; 2] = ["</think>", "<|/think|>"];
+    const TOOL_OPEN_TAGS: [(&str, Option<&str>); 3] = [
+        ("<tool_call>", Some("</tool_call>")),
+        ("<div class=\"tool_code\">", Some("</div>")),
+        ("<div class='tool_code'>", Some("</div>")),
+    ];
 
     loop {
-        if *in_think {
+        if let Some(close_tag) = hidden_tool_close {
+            if let Some(close_idx) = parser_buffer.find(*close_tag) {
+                let drain_len = close_idx + close_tag.len();
+                parser_buffer.drain(..drain_len);
+                *hidden_tool_close = None;
+                continue;
+            }
+
+            let keep = longest_partial_suffix(parser_buffer, &[*close_tag]);
+            if parser_buffer.len() > keep {
+                parser_buffer.replace_range(..parser_buffer.len() - keep, "");
+            }
+            break;
+        } else if *in_think {
             let next_close = CLOSE_TAGS
                 .iter()
                 .filter_map(|tag| parser_buffer.find(tag).map(|idx| (idx, *tag)))
@@ -99,10 +119,61 @@ async fn emit_parsed_content(
             }
             break;
         } else {
+            let next_close = CLOSE_TAGS
+                .iter()
+                .filter_map(|tag| parser_buffer.find(tag).map(|idx| (idx, *tag)))
+                .min_by_key(|(idx, _)| *idx);
             let next_open = OPEN_TAGS
                 .iter()
                 .filter_map(|tag| parser_buffer.find(tag).map(|idx| (idx, *tag)))
                 .min_by_key(|(idx, _)| *idx);
+            let next_tool_open = TOOL_OPEN_TAGS
+                .iter()
+                .filter_map(|(tag, close)| parser_buffer.find(tag).map(|idx| (idx, *tag, *close)))
+                .min_by_key(|(idx, _, _)| *idx);
+
+            if let Some((close_idx, close_tag)) = next_close {
+                let open_idx = next_open.map(|(idx, _)| idx);
+                if open_idx.map_or(true, |idx| close_idx < idx) {
+                    let reasoning = parser_buffer[..close_idx].to_string();
+                    if !reasoning.is_empty() {
+                        let _ = tx.send(StreamEvent::ReasoningDelta(reasoning)).await;
+                    }
+                    let drain_len = close_idx + close_tag.len();
+                    parser_buffer.drain(..drain_len);
+                    continue;
+                }
+            }
+
+            if let Some((open_idx, open_tag)) = next_open {
+                let tool_idx = next_tool_open.map(|(idx, _, _)| idx);
+                if tool_idx.map_or(false, |idx| idx < open_idx) {
+                    // Handled below so the earliest hidden marker wins.
+                } else {
+                    if open_idx > 0 {
+                        let visible = parser_buffer[..open_idx].to_string();
+                        let _ = tx.send(StreamEvent::Token(visible)).await;
+                    }
+                    let drain_len = open_idx + open_tag.len();
+                    parser_buffer.drain(..drain_len);
+                    *in_think = true;
+                    continue;
+                }
+            }
+
+            if let Some((tool_idx, tool_tag, close_tag)) = next_tool_open {
+                if tool_idx > 0 {
+                    let visible = parser_buffer[..tool_idx].to_string();
+                    let _ = tx.send(StreamEvent::Token(visible)).await;
+                }
+                let drain_len = tool_idx + tool_tag.len();
+                parser_buffer.drain(..drain_len);
+                *hidden_tool_close = close_tag;
+                if hidden_tool_close.is_none() {
+                    parser_buffer.clear();
+                }
+                continue;
+            }
 
             if let Some((open_idx, open_tag)) = next_open {
                 if open_idx > 0 {
@@ -115,7 +186,19 @@ async fn emit_parsed_content(
                 continue;
             }
 
-            let keep = longest_partial_suffix(parser_buffer, &OPEN_TAGS);
+            let tool_open_tags = TOOL_OPEN_TAGS
+                .iter()
+                .map(|(tag, _)| *tag)
+                .collect::<Vec<_>>();
+            let keep = longest_partial_suffix(
+                parser_buffer,
+                &[
+                    OPEN_TAGS.as_slice(),
+                    CLOSE_TAGS.as_slice(),
+                    tool_open_tags.as_slice(),
+                ]
+                .concat(),
+            );
             if parser_buffer.len() > keep {
                 let visible = parser_buffer[..parser_buffer.len() - keep].to_string();
                 parser_buffer.replace_range(..parser_buffer.len() - keep, "");
@@ -148,6 +231,7 @@ pub async fn consume_sse_stream_with_timeouts(
     let mut buffer = String::new();
     let mut parser_buffer = String::new();
     let mut in_think = false;
+    let mut hidden_tool_close: Option<&'static str> = None;
     let mut tokens_predicted: u32 = 0;
     let mut tokens_evaluated: u32 = 0;
     let mut decode_tokens_per_second: f64 = 0.0;
@@ -224,7 +308,9 @@ pub async fn consume_sse_stream_with_timeouts(
             if let Some(data) = line.strip_prefix("data: ") {
                 if data.trim() == "[DONE]" {
                     if !parser_buffer.is_empty() {
-                        if in_think {
+                        if hidden_tool_close.is_some() {
+                            parser_buffer.clear();
+                        } else if in_think {
                             let _ = tx
                                 .send(StreamEvent::ReasoningDelta(parser_buffer.clone()))
                                 .await;
@@ -251,9 +337,16 @@ pub async fn consume_sse_stream_with_timeouts(
                         if let Some(content) = json.content.as_deref() {
                             if !content.is_empty() {
                                 full_text.push_str(content);
+                                let _ = tx.send(StreamEvent::RawDelta(content.to_string())).await;
                                 parser_buffer.push_str(content);
                                 got_first_token = true;
-                                emit_parsed_content(&tx, &mut parser_buffer, &mut in_think).await;
+                                emit_parsed_content(
+                                    &tx,
+                                    &mut parser_buffer,
+                                    &mut in_think,
+                                    &mut hidden_tool_close,
+                                )
+                                .await;
                             }
                         }
 
@@ -264,23 +357,21 @@ pub async fn consume_sse_stream_with_timeouts(
                             if let Some(value) = json.tokens_evaluated {
                                 tokens_evaluated = value as u32;
                             }
-                            if let Some(value) = json
-                                .timings
-                                .as_ref()
-                                .and_then(|t| t.predicted_per_second)
+                            if let Some(value) =
+                                json.timings.as_ref().and_then(|t| t.predicted_per_second)
                             {
                                 decode_tokens_per_second = value;
                             }
-                            if let Some(value) = json
-                                .timings
-                                .as_ref()
-                                .and_then(|t| t.prompt_per_second)
+                            if let Some(value) =
+                                json.timings.as_ref().and_then(|t| t.prompt_per_second)
                             {
                                 prompt_tokens_per_second = Some(value);
                             }
 
                             if !parser_buffer.is_empty() {
-                                if in_think {
+                                if hidden_tool_close.is_some() {
+                                    parser_buffer.clear();
+                                } else if in_think {
                                     let _ = tx
                                         .send(StreamEvent::ReasoningDelta(parser_buffer.clone()))
                                         .await;
@@ -312,7 +403,9 @@ pub async fn consume_sse_stream_with_timeouts(
     }
 
     if !parser_buffer.is_empty() {
-        if in_think {
+        if hidden_tool_close.is_some() {
+            parser_buffer.clear();
+        } else if in_think {
             let _ = tx
                 .send(StreamEvent::ReasoningDelta(parser_buffer.clone()))
                 .await;
@@ -344,15 +437,67 @@ pub async fn consume_sse_stream_with_timeouts(
 
 #[cfg(test)]
 mod tests {
-    use super::longest_partial_suffix;
+    use super::{emit_parsed_content, longest_partial_suffix, StreamEvent};
+    use tokio::sync::mpsc;
 
     #[test]
     fn longest_partial_suffix_handles_multibyte_unicode() {
-        assert_eq!(longest_partial_suffix("–", &["<think>"]), 0);
+        assert_eq!(longest_partial_suffix("\u{e9}", &["<think>"]), 0);
     }
 
     #[test]
     fn longest_partial_suffix_keeps_partial_tag_after_unicode_prefix() {
-        assert_eq!(longest_partial_suffix("–<thi", &["<think>"]), 4);
+        assert_eq!(longest_partial_suffix("\u{e9}<thi", &["<think>"]), 4);
+    }
+
+    #[tokio::test]
+    async fn parsed_content_routes_orphan_close_prefix_to_reasoning() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut parser_buffer = "scratch notes</think>Final answer".to_string();
+        let mut in_think = false;
+        let mut hidden_tool_close = None;
+
+        emit_parsed_content(
+            &tx,
+            &mut parser_buffer,
+            &mut in_think,
+            &mut hidden_tool_close,
+        )
+        .await;
+        drop(tx);
+
+        match rx.recv().await {
+            Some(StreamEvent::ReasoningDelta(text)) => assert_eq!(text, "scratch notes"),
+            other => panic!("expected reasoning delta, got {other:?}"),
+        }
+        match rx.recv().await {
+            Some(StreamEvent::Token(text)) => assert_eq!(text, "Final answer"),
+            other => panic!("expected visible token, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parsed_content_suppresses_streamed_tool_call_markup() {
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut parser_buffer =
+            "Let me check.\n<tool_call>_.glob(dir=\".\",pattern=\"**/*\")".to_string();
+        let mut in_think = false;
+        let mut hidden_tool_close = None;
+
+        emit_parsed_content(
+            &tx,
+            &mut parser_buffer,
+            &mut in_think,
+            &mut hidden_tool_close,
+        )
+        .await;
+        drop(tx);
+
+        match rx.recv().await {
+            Some(StreamEvent::Token(text)) => assert_eq!(text, "Let me check.\n"),
+            other => panic!("expected visible preamble, got {other:?}"),
+        }
+        assert!(rx.recv().await.is_none());
+        assert_eq!(hidden_tool_close, Some("</tool_call>"));
     }
 }

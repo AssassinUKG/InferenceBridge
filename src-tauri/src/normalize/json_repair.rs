@@ -6,8 +6,7 @@ use std::sync::OnceLock;
 static TRAILING_COMMA_RE: OnceLock<regex::Regex> = OnceLock::new();
 
 fn trailing_comma_re() -> &'static regex::Regex {
-    TRAILING_COMMA_RE
-        .get_or_init(|| regex::Regex::new(r",\s*([}\]])").unwrap())
+    TRAILING_COMMA_RE.get_or_init(|| regex::Regex::new(r",\s*([}\]])").unwrap())
 }
 
 /// Attempt to repair malformed JSON and return the parsed value.

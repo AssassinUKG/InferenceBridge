@@ -1,7 +1,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::api::errors::{ApiError, ApiErrorBody, ApiErrorResponse};
 use crate::context::tracker;
@@ -65,6 +65,68 @@ pub async fn debug_profile(
     crate::commands::model::get_effective_profile_for_shared(&s, query.model.as_deref())
         .map(Json)
         .map_err(ApiErrorResponse::bad_request)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DebugLogsQuery {
+    pub limit: Option<usize>,
+}
+
+pub async fn debug_logs(
+    Query(query): Query<DebugLogsQuery>,
+) -> Json<Vec<crate::logging::LogEntry>> {
+    Json(crate::logging::list(query.limit.unwrap_or(500)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ValidateAgentActionRequest {
+    pub text: String,
+    #[serde(default)]
+    pub think_tag_style: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ValidateAgentActionResponse {
+    pub object: &'static str,
+    pub valid: bool,
+    pub action: Option<crate::normalize::agent_action::AgentAction>,
+    pub repaired_json: Option<serde_json::Value>,
+    pub visible_text: String,
+    pub errors: Vec<String>,
+}
+
+pub async fn validate_agent_action(
+    Json(req): Json<ValidateAgentActionRequest>,
+) -> Result<Json<ValidateAgentActionResponse>, ApiErrorResponse> {
+    let style = match req
+        .think_tag_style
+        .as_deref()
+        .unwrap_or("qwen")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "none" => crate::models::profiles::ThinkTagStyle::None,
+        "standard" | "think" => crate::models::profiles::ThinkTagStyle::Standard,
+        "qwen" | "" => crate::models::profiles::ThinkTagStyle::Qwen,
+        other => {
+            return Err(ApiErrorResponse::bad_request(format!(
+                "Unsupported think_tag_style '{other}'. Use none, standard, or qwen."
+            )));
+        }
+    };
+
+    let result =
+        crate::normalize::agent_action::extract_repair_validate_agent_action(&req.text, style);
+
+    Ok(Json(ValidateAgentActionResponse {
+        object: "agent_action.validation",
+        valid: result.valid,
+        action: result.action,
+        repaired_json: result.repaired_json,
+        visible_text: result.visible_text,
+        errors: result.errors,
+    }))
 }
 
 pub async fn list_sessions(

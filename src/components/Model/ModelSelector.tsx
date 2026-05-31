@@ -7,6 +7,7 @@ import type {
 } from "../../lib/types";
 import { useGpuStats } from "../../hooks/useGpuStats";
 import * as api from "../../lib/tauri";
+import { parseCliArgs } from "../../lib/args";
 import type { LoadModelOptions } from "../../lib/tauri";
 
 interface Props {
@@ -50,6 +51,162 @@ function fmtToolFormat(f: string) {
 function fmtNum(v: number | null | undefined) {
   if (v == null) return "n/a";
   return v.toLocaleString();
+}
+
+function fmtSamplingValue(v: number | null | undefined) {
+  if (v == null) return "n/a";
+  return Number.isInteger(v) ? v.toString() : v.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function profileDefaultSummary(model: ModelInfo) {
+  const parts = [
+    `temp ${fmtSamplingValue(model.default_temperature)}`,
+    `top-p ${fmtSamplingValue(model.default_top_p)}`,
+    `top-k ${fmtSamplingValue(model.default_top_k)}`,
+  ];
+  if (model.default_min_p != null) parts.push(`min-p ${fmtSamplingValue(model.default_min_p)}`);
+  if (model.default_presence_penalty != null) {
+    parts.push(`presence ${fmtSamplingValue(model.default_presence_penalty)}`);
+  }
+  return parts.join(" | ");
+}
+
+interface SavedModelConfig {
+  name: string;
+  contextSize: number;
+  fitMode: string;
+  useJinja: boolean;
+  reasoningMode: string;
+  templateMode: string;
+  chatTemplateKwargsJson: string;
+  extraArgs: string;
+}
+
+interface RecommendedModelConfig {
+  name: string;
+  source: string;
+  reasoningMode: string;
+  templateMode?: string;
+  useJinja?: boolean;
+  chatTemplateKwargsJson?: string;
+  extraArgs: string;
+}
+
+function buildArgs(values: {
+  temp?: number | null;
+  topP?: number | null;
+  topK?: number | null;
+  minP?: number | null;
+  repeatPenalty?: number | null;
+  presencePenalty?: number | null;
+}) {
+  const args: string[] = [];
+  if (values.temp != null) args.push("--temp", fmtSamplingValue(values.temp));
+  if (values.topP != null) args.push("--top-p", fmtSamplingValue(values.topP));
+  if (values.topK != null) args.push("--top-k", fmtSamplingValue(values.topK));
+  if (values.minP != null) args.push("--min-p", fmtSamplingValue(values.minP));
+  if (values.repeatPenalty != null) {
+    args.push("--repeat-penalty", fmtSamplingValue(values.repeatPenalty));
+  }
+  if (values.presencePenalty != null) {
+    args.push("--presence-penalty", fmtSamplingValue(values.presencePenalty));
+  }
+  return args.join(" ");
+}
+
+function recommendedProfilesForModel(model: ModelInfo): RecommendedModelConfig[] {
+  const family = model.family.toLowerCase();
+  const name = model.filename.toLowerCase();
+
+  if (family.includes("qwen") || name.includes("qwen")) {
+    const isCoder = name.includes("coder");
+    const codingArgs = isCoder
+      ? buildArgs({ temp: 0.7, topP: 0.8, topK: 20, minP: 0, repeatPenalty: 1.05 })
+      : buildArgs({ temp: 0.7, topP: 0.8, topK: 20, minP: 0, repeatPenalty: 1.0, presencePenalty: 0 });
+
+    return [
+      {
+        name: "General",
+        source: "Qwen/Unsloth non-thinking recommendation",
+        reasoningMode: "off",
+        templateMode: "repo",
+        useJinja: true,
+        chatTemplateKwargsJson: '{"preserve_thinking": false}',
+        extraArgs: buildArgs({ temp: 0.7, topP: 0.8, topK: 20, minP: 0, repeatPenalty: 1.0, presencePenalty: 0 }),
+      },
+      {
+        name: "Coding",
+        source: isCoder ? "Qwen3-Coder recommendation" : "Qwen non-thinking conservative coding preset",
+        reasoningMode: "off",
+        templateMode: "repo",
+        useJinja: true,
+        chatTemplateKwargsJson: '{"preserve_thinking": false}',
+        extraArgs: codingArgs,
+      },
+      {
+        name: "Tools",
+        source: "Strict tool/research preset",
+        reasoningMode: "off",
+        templateMode: "repo",
+        useJinja: true,
+        chatTemplateKwargsJson: '{"preserve_thinking": false}',
+        extraArgs: buildArgs({ temp: 0.2, topP: 0.8, topK: 20, minP: 0, repeatPenalty: 1.0, presencePenalty: 0 }),
+      },
+      {
+        name: "Thinking",
+        source: "Qwen thinking recommendation",
+        reasoningMode: "on",
+        templateMode: "repo",
+        useJinja: true,
+        chatTemplateKwargsJson: '{"preserve_thinking": true}',
+        extraArgs: buildArgs({ temp: 0.6, topP: 0.95, topK: 20, minP: 0, repeatPenalty: 1.0, presencePenalty: 0 }),
+      },
+    ];
+  }
+
+  const generalArgs = buildArgs({
+    temp: model.default_temperature ?? 0.7,
+    topP: model.default_top_p ?? 0.9,
+    topK: model.default_top_k ?? -1,
+    minP: model.default_min_p,
+    presencePenalty: model.default_presence_penalty,
+  });
+
+  const profiles: RecommendedModelConfig[] = [
+    {
+      name: "General",
+      source: "Detected model profile defaults",
+      reasoningMode: model.supports_reasoning ? "auto" : "off",
+      extraArgs: generalArgs,
+    },
+    {
+      name: "Coding",
+      source: "Conservative deterministic preset",
+      reasoningMode: model.supports_reasoning ? "off" : "off",
+      extraArgs: buildArgs({ temp: 0.2, topP: 0.9, topK: model.default_top_k ?? -1, minP: model.default_min_p }),
+    },
+    {
+      name: "Tools",
+      source: "Strict tool/research preset",
+      reasoningMode: "off",
+      extraArgs: buildArgs({ temp: 0.2, topP: 0.8, topK: model.default_top_k ?? -1, minP: model.default_min_p }),
+    },
+  ];
+
+  if (model.supports_reasoning) {
+    profiles.push({
+      name: "Thinking",
+      source: "Detected reasoning-capable model profile",
+      reasoningMode: "on",
+      extraArgs: generalArgs,
+    });
+  }
+
+  return profiles;
+}
+
+function savedConfigKey(modelName: string) {
+  return `inference-bridge:model-configs:${modelName}`;
 }
 
 // ─── Panel wrapper ─────────────────────────────────────────────────────────────
@@ -208,6 +365,11 @@ export function ModelSelector({
         context_window: null,
         max_context_window: null,
         max_output_tokens: null,
+        default_temperature: null,
+        default_top_p: null,
+        default_top_k: null,
+        default_min_p: null,
+        default_presence_penalty: null,
         quant: null,
         tool_call_format: "NativeApi",
         think_tag_style: "None",
@@ -791,6 +953,7 @@ function LoadedModelRow({
             />
             <StatTile label="Max Output" value={`${fmtNum(model.max_output_tokens)} tokens`} />
             <StatTile label="Tool Format" value={fmtToolFormat(model.tool_call_format)} />
+            <StatTile label="Profile Defaults" value={profileDefaultSummary(model)} />
             <StatTile label="Reasoning" value={model.think_tag_style === "None" ? "Off" : model.think_tag_style} />
           </div>
         </div>
@@ -829,9 +992,62 @@ function ModelRow({
   const [templateMode, setTemplateMode] = useState(model.template_mode ?? "builtin");
   const [chatTemplateKwargsJson, setChatTemplateKwargsJson] = useState("");
   const [extraArgs, setExtraArgs] = useState("");
+  const [configName, setConfigName] = useState("");
+  const [savedConfigs, setSavedConfigs] = useState<SavedModelConfig[]>(() => {
+    try {
+      const parsed = JSON.parse(window.localStorage.getItem(savedConfigKey(model.filename)) ?? "[]");
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  });
   const [supportsVision, setSupportsVision] = useState(model.supports_vision);
   const [visionSaving, setVisionSaving] = useState(false);
   const isExternalProvider = !model.provider_managed;
+  const recommendedProfiles = recommendedProfilesForModel(model);
+
+  function persistSavedConfigs(configs: SavedModelConfig[]) {
+    setSavedConfigs(configs);
+    window.localStorage.setItem(savedConfigKey(model.filename), JSON.stringify(configs));
+  }
+
+  function applySavedConfig(config: SavedModelConfig) {
+    setContextSize(config.contextSize);
+    setFitMode(config.fitMode);
+    setUseJinja(config.useJinja);
+    setReasoningMode(config.reasoningMode);
+    setTemplateMode(config.templateMode);
+    setChatTemplateKwargsJson(config.chatTemplateKwargsJson);
+    setExtraArgs(config.extraArgs);
+  }
+
+  function applyRecommendedConfig(config: RecommendedModelConfig) {
+    setReasoningMode(config.reasoningMode);
+    if (config.useJinja != null) setUseJinja(config.useJinja);
+    if (config.templateMode) setTemplateMode(config.templateMode);
+    setChatTemplateKwargsJson(config.chatTemplateKwargsJson ?? "");
+    setExtraArgs(config.extraArgs);
+  }
+
+  function saveCurrentConfig() {
+    const name = configName.trim() || "Custom";
+    const config: SavedModelConfig = {
+      name,
+      contextSize,
+      fitMode,
+      useJinja,
+      reasoningMode,
+      templateMode,
+      chatTemplateKwargsJson,
+      extraArgs,
+    };
+    persistSavedConfigs([...savedConfigs.filter((item) => item.name !== name), config]);
+    setConfigName("");
+  }
+
+  function removeSavedConfig(name: string) {
+    persistSavedConfigs(savedConfigs.filter((item) => item.name !== name));
+  }
 
   async function toggleVisionOverride() {
     const next = !supportsVision;
@@ -853,10 +1069,7 @@ function ModelRow({
     reasoningMode,
     templateMode,
     chatTemplateKwargsJson: chatTemplateKwargsJson.trim() || undefined,
-    extraArgs: extraArgs
-      .split(/\r?\n|,/)
-      .map((value) => value.trim())
-      .filter(Boolean),
+    extraArgs: parseCliArgs(extraArgs),
   };
   // Use GPU stats hook for live VRAM/overflow info
   const gpuStats = useGpuStats();
@@ -1102,6 +1315,78 @@ function ModelRow({
             </button>}
           </div>
 
+          {!isExternalProvider && (
+            <div
+              className="mt-3 rounded px-3 py-2"
+              style={{ background: "var(--surface-3)", border: "1px solid var(--border)" }}
+            >
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[10px] uppercase tracking-widest" style={{ color: "var(--text-2)" }}>
+                  Model configs
+                </span>
+                {recommendedProfiles.map((profile) => (
+                  <button
+                    key={profile.name}
+                    onClick={() => applyRecommendedConfig(profile)}
+                    className="rounded px-2 py-1 text-[10px] font-semibold transition"
+                    style={{
+                      background: "rgba(34,211,238,0.1)",
+                      border: "1px solid rgba(34,211,238,0.24)",
+                      color: "#67e8f9",
+                    }}
+                    title={`${profile.source}: ${profile.extraArgs}`}
+                  >
+                    {profile.name}
+                  </button>
+                ))}
+                {savedConfigs.map((config) => (
+                  <span key={config.name} className="inline-flex items-center gap-1">
+                    <button
+                      onClick={() => applySavedConfig(config)}
+                      className="rounded px-2 py-1 text-[10px] font-semibold transition"
+                      style={{
+                        background: "var(--surface-2)",
+                        border: "1px solid var(--border)",
+                        color: "var(--text-0)",
+                      }}
+                    >
+                      {config.name}
+                    </button>
+                    <button
+                      onClick={() => removeSavedConfig(config.name)}
+                      className="rounded px-1.5 py-1 text-[10px] transition"
+                      style={{
+                        background: "transparent",
+                        border: "1px solid var(--border)",
+                        color: "var(--text-2)",
+                      }}
+                      title={`Remove ${config.name}`}
+                    >
+                      x
+                    </button>
+                  </span>
+                ))}
+                <div className="ml-auto flex min-w-[220px] items-center gap-1">
+                  <input
+                    type="text"
+                    value={configName}
+                    onChange={(e) => setConfigName(e.target.value)}
+                    placeholder="Config name"
+                    className="min-w-0 flex-1 rounded px-2 py-1 text-xs"
+                    style={{ background: "var(--surface-1)", border: "1px solid var(--border)", color: "var(--text-0)" }}
+                  />
+                  <button
+                    onClick={saveCurrentConfig}
+                    className="shrink-0 rounded px-2 py-1 text-[10px] font-semibold transition"
+                    style={{ background: "#22d3ee", border: "none", color: "#0a0a0a" }}
+                  >
+                    Save
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
           {!isExternalProvider && <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <div>
               <div className="mb-1 text-[10px] uppercase tracking-widest" style={{ color: "var(--text-2)" }}>
@@ -1184,7 +1469,7 @@ function ModelRow({
               <textarea
                 value={extraArgs}
                 onChange={(e) => setExtraArgs(e.target.value)}
-                placeholder="--no-mmproj, --temp 0.6"
+                placeholder="--temp 0.6 --top-p 0.95 --cache-type-k q8_0"
                 rows={2}
                 className="w-full rounded px-2 py-1.5 text-xs"
                 style={{ background: "var(--surface-1)", border: "1px solid var(--border)", color: "var(--text-0)" }}

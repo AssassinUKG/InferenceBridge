@@ -215,11 +215,24 @@ async fn resolve_template_selection(
         template_name
             .as_ref()
             .map(|name| format!("builtin:{name}"))
-            .or(Some("builtin:fallback".to_string())),
+            .or({
+                if process.use_jinja {
+                    Some("gguf:embedded-jinja".to_string())
+                } else {
+                    Some("builtin:fallback".to_string())
+                }
+            }),
         None,
         template_name,
         process.use_jinja,
     ))
+}
+
+fn qwen_profile_needs_jinja(profile: &crate::models::profiles::ModelProfile) -> bool {
+    matches!(
+        profile.tool_call_format,
+        crate::models::profiles::ToolCallFormat::QwenXml
+    )
 }
 
 fn preview_matches_effective_launch(
@@ -609,6 +622,15 @@ pub async fn backend_load_model_with_overrides(
         }
         if let Some(extra_args) = overrides.extra_args.as_ref() {
             process_config.extra_args = extra_args.clone();
+        }
+
+        let effective_profile = detect_effective_profile(&model.filename);
+        if qwen_profile_needs_jinja(&effective_profile) && !process_config.use_jinja {
+            tracing::warn!(
+                model = %model.filename,
+                "Qwen tool-call profile requires llama.cpp Jinja chat-template mode; enabling --jinja for this launch"
+            );
+            process_config.use_jinja = true;
         }
 
         let (template_mode, template_source, template_file, template_name, use_jinja) =
@@ -1120,6 +1142,11 @@ pub async fn list_models(state: tauri::State<'_, SharedState>) -> Result<Vec<Mod
                     .and_then(|g| g.context_length)
                     .or(m.profile.max_context_window),
                 max_output_tokens: m.profile.default_max_output_tokens,
+                default_temperature: m.profile.default_temperature,
+                default_top_p: m.profile.default_top_p,
+                default_top_k: m.profile.default_top_k,
+                default_min_p: m.profile.default_min_p,
+                default_presence_penalty: m.profile.default_presence_penalty,
                 quant: extract_quant(&m.filename),
                 tool_call_format: format!("{:?}", m.profile.tool_call_format),
                 think_tag_style: format!("{:?}", m.profile.think_tag_style),
@@ -1229,6 +1256,11 @@ async fn list_active_external_provider_models(state: SharedState) -> Option<Vec<
                     context_window: context,
                     max_context_window: context,
                     max_output_tokens: model.max_output_tokens,
+                    default_temperature: None,
+                    default_top_p: None,
+                    default_top_k: None,
+                    default_min_p: None,
+                    default_presence_penalty: None,
                     quant: None,
                     tool_call_format: "ProviderNative".to_string(),
                     think_tag_style: "None".to_string(),
@@ -1397,6 +1429,7 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
         model_load_progress,
         active_generation,
         last_generation_metrics,
+        live_stream,
     ) = {
         let s = state.read().await;
         let process_state = s.process.state();
@@ -1422,6 +1455,7 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
             s.model_load_progress.clone(),
             s.active_generation.clone(),
             s.last_generation_metrics.clone(),
+            s.live_stream.clone(),
         )
     }; // read lock released before any async I/O
 
@@ -1578,6 +1612,7 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
         model_load_progress: effective_model_load_progress,
         active_generation,
         last_generation_metrics,
+        live_stream,
     })
 }
 
@@ -1942,6 +1977,11 @@ pub struct ModelInfo {
     pub context_window: Option<u32>,
     pub max_context_window: Option<u32>,
     pub max_output_tokens: Option<u32>,
+    pub default_temperature: Option<f32>,
+    pub default_top_p: Option<f32>,
+    pub default_top_k: Option<i32>,
+    pub default_min_p: Option<f32>,
+    pub default_presence_penalty: Option<f32>,
     pub quant: Option<String>,
     pub tool_call_format: String,
     pub think_tag_style: String,
@@ -1987,6 +2027,7 @@ pub struct ProcessStatusInfo {
     pub scheduler_limit: Option<u32>,
     pub last_launch_preview: Option<LaunchPreview>,
     pub last_generation_metrics: Option<RuntimePerformanceMetrics>,
+    pub live_stream: Option<crate::state::LiveStreamSnapshot>,
 }
 
 #[derive(Clone, serde::Serialize)]

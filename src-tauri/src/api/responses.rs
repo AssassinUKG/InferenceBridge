@@ -17,7 +17,8 @@ use crate::normalize::think_strip::{
     estimate_token_count, extract_reasoning_content_with_style, strip_think_tags_with_style,
 };
 use crate::state::{
-    begin_api_generation, finish_api_generation, summarize_reasoning_tokens, SharedState,
+    append_live_stream_delta, begin_api_generation, finish_api_generation,
+    summarize_reasoning_tokens, SharedState,
 };
 
 #[derive(Debug, Deserialize, Clone)]
@@ -362,8 +363,12 @@ pub async fn responses(
 
             while let Some(event) = rx.recv().await {
                 match event {
+                    StreamEvent::RawDelta(raw) => {
+                        append_live_stream_delta(&state_for_stream, "raw", &raw).await;
+                    }
                     StreamEvent::Token(token) => {
                         full_text.push_str(&token);
+                        append_live_stream_delta(&state_for_stream, "content", &token).await;
                         let chunk = serde_json::json!({
                             "type": "response.output_text.delta",
                             "response_id": response_id,
@@ -373,6 +378,7 @@ pub async fn responses(
                         yield Ok(Event::default().data(chunk.to_string()));
                     }
                     StreamEvent::ReasoningDelta(reasoning) => {
+                        append_live_stream_delta(&state_for_stream, "reasoning", &reasoning).await;
                         let chunk = serde_json::json!({
                             "type": "response.reasoning.delta",
                             "response_id": response_id,
@@ -440,6 +446,7 @@ pub async fn responses(
                         return;
                     }
                     StreamEvent::Error(error) => {
+                        append_live_stream_delta(&state_for_stream, "error", &error).await;
                         finish_api_generation(&state_for_stream, "error").await;
                         let error_chunk = serde_json::json!({
                             "type": "response.error",
@@ -469,6 +476,15 @@ pub async fn responses(
     let visible_text = strip_think_tags_with_style(&response.content, profile.think_tag_style);
     let reasoning_text =
         extract_reasoning_content_with_style(&response.content, profile.think_tag_style);
+    if !response.content.is_empty() {
+        append_live_stream_delta(&state, "raw", &response.content).await;
+    }
+    if !reasoning_text.is_empty() {
+        append_live_stream_delta(&state, "reasoning", &reasoning_text).await;
+    }
+    if !visible_text.is_empty() {
+        append_live_stream_delta(&state, "content", &visible_text).await;
+    }
     let reasoning_tokens = summarize_reasoning_tokens(
         response
             .tokens_predicted

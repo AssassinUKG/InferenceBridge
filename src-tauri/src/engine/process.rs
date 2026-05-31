@@ -360,6 +360,7 @@ impl LlamaProcess {
         }
         if config.flash_attn {
             args.push("--flash-attn".to_string());
+            args.push("on".to_string());
         }
         if !config.use_mmap {
             args.push("--no-mmap".to_string());

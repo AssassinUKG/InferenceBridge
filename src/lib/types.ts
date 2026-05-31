@@ -9,6 +9,11 @@ export interface ModelInfo {
   context_window: number | null;
   max_context_window: number | null;
   max_output_tokens: number | null;
+  default_temperature: number | null;
+  default_top_p: number | null;
+  default_top_k: number | null;
+  default_min_p: number | null;
+  default_presence_penalty: number | null;
   quant: string | null;
   tool_call_format: string;
   think_tag_style: string;
@@ -64,6 +69,7 @@ export interface GenerationRequest {
 export interface RuntimePerformanceMetrics {
   source: string;
   model: string;
+  request_id: string;
   started_at: string;
   finished_at: string;
   elapsed_ms: number;
@@ -73,6 +79,28 @@ export interface RuntimePerformanceMetrics {
   prompt_tokens_per_second: number | null;
   decode_tokens_per_second: number | null;
   end_to_end_tokens_per_second: number | null;
+}
+
+export interface LiveStreamEvent {
+  timestamp: string;
+  kind: string;
+  text: string;
+}
+
+export interface LiveStreamSnapshot {
+  request_id: string;
+  source: string;
+  model: string;
+  started_at: string;
+  status: string;
+  raw_output: string;
+  visible_output: string;
+  reasoning_output: string;
+  events: LiveStreamEvent[];
+}
+
+export interface LiveStreamDelta extends LiveStreamEvent {
+  request_id: string;
 }
 
 export interface ProcessStatusInfo {
@@ -99,6 +127,7 @@ export interface ProcessStatusInfo {
   scheduler_limit: number | null;
   last_launch_preview: LaunchPreview | null;
   last_generation_metrics: RuntimePerformanceMetrics | null;
+  live_stream: LiveStreamSnapshot | null;
 }
 
 export interface ApiPortOwnerInfo {
