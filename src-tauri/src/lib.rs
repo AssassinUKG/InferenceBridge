@@ -7,6 +7,7 @@ pub mod logging;
 pub mod models;
 pub mod normalize;
 pub mod providers;
+pub mod replay;
 pub mod session;
 pub mod state;
 pub mod templates;
@@ -536,6 +537,7 @@ async fn headless_load_model(state: &state::SharedState, model_name: &str, ctx_s
             || matches!(
                 profile.tool_call_format,
                 crate::models::profiles::ToolCallFormat::QwenXml
+                    | crate::models::profiles::ToolCallFormat::Gemma4Native
             );
         let template_source = if use_jinja {
             Some("gguf:embedded-jinja".to_string())

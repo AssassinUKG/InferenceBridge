@@ -72,17 +72,17 @@ function StatCard({
 
   return (
     <div
-      className="min-w-0 rounded px-4 py-3"
+      className="min-w-0 rounded px-3 py-2"
       style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}
     >
-      <div className="text-[10px] uppercase tracking-[0.16em]" style={{ color: "var(--text-2)" }}>
+      <div className="text-[10px] uppercase tracking-[0.12em]" style={{ color: "var(--text-2)" }}>
         {label}
       </div>
-      <div className="mt-1 truncate text-lg font-semibold" style={{ color }} title={value}>
+      <div className="mt-0.5 truncate text-base font-semibold" style={{ color }} title={value}>
         {value}
       </div>
       {detail && (
-        <div className="mt-0.5 truncate text-xs" style={{ color: "var(--text-1)" }} title={detail}>
+        <div className="truncate text-[11px]" style={{ color: "var(--text-1)" }} title={detail}>
           {detail}
         </div>
       )}
@@ -109,7 +109,7 @@ function LiveActivityPanel({
 
   return (
     <section
-      className="rounded px-4 py-4"
+      className="rounded px-3 py-3"
       style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
     >
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -125,7 +125,7 @@ function LiveActivityPanel({
                 boxShadow: isActive ? `0 0 0 6px rgba(52, 211, 153, 0.12)` : "none",
               }}
             />
-            <span className="text-lg font-semibold" style={{ color: "var(--text-0)" }}>
+            <span className="text-base font-semibold" style={{ color: "var(--text-0)" }}>
               {isActive ? "Generating" : "Idle"}
             </span>
           </div>
@@ -152,7 +152,7 @@ function LiveActivityPanel({
         </div>
       </div>
 
-      <div className="mt-4 grid gap-3 md:grid-cols-3">
+      <div className="mt-3 grid gap-3 md:grid-cols-3">
         <div>
           <div className="text-[10px] uppercase tracking-[0.14em]" style={{ color: "var(--text-2)" }}>
             Source
@@ -256,9 +256,9 @@ export function ContextPanel({ status, processStatus, gpuStats }: Props) {
   }
 
   return (
-    <div className="mx-auto flex h-full max-w-6xl flex-col gap-4 overflow-y-auto p-4">
+    <div className="mx-auto flex h-full max-w-none flex-col gap-3 overflow-y-auto p-3 xl:max-w-7xl">
       <section
-        className="rounded px-4 py-4"
+        className="rounded px-3 py-3"
         style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
       >
         <div className="flex flex-wrap items-start justify-between gap-4">
@@ -266,7 +266,7 @@ export function ContextPanel({ status, processStatus, gpuStats }: Props) {
             <div className="text-[10px] uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
               Runtime
             </div>
-            <div className="mt-1 truncate text-xl font-semibold" style={{ color: "var(--text-0)" }}>
+            <div className="mt-1 truncate text-lg font-semibold" style={{ color: "var(--text-0)" }}>
               {shortModelName(processStatus?.model)}
             </div>
             <div className="mt-1 text-xs" style={{ color: "var(--text-1)" }}>
@@ -317,7 +317,7 @@ export function ContextPanel({ status, processStatus, gpuStats }: Props) {
         </div>
       </section>
 
-      <section className="grid gap-3 lg:grid-cols-4 md:grid-cols-2">
+      <section className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
         <StatCard
           label="Decode Speed"
           value={formatRate(last?.decode_tokens_per_second)}
@@ -344,9 +344,9 @@ export function ContextPanel({ status, processStatus, gpuStats }: Props) {
         />
       </section>
 
-      <section className="grid gap-3 lg:grid-cols-3">
+      <section className="grid gap-2 xl:grid-cols-3">
         <div
-          className="rounded px-4 py-4"
+          className="rounded px-3 py-3"
           style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
         >
           <div className="text-[10px] uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
@@ -360,7 +360,7 @@ export function ContextPanel({ status, processStatus, gpuStats }: Props) {
               color={kvColor}
             />
           </div>
-          <div className="mt-4 grid grid-cols-3 gap-2 text-xs">
+          <div className="mt-3 grid grid-cols-3 gap-2 text-xs">
             <div>
               <div style={{ color: "var(--text-2)" }}>Pinned</div>
               <div className="mt-1 font-medium" style={{ color: "var(--text-0)" }}>
@@ -383,7 +383,7 @@ export function ContextPanel({ status, processStatus, gpuStats }: Props) {
         </div>
 
         <div
-          className="rounded px-4 py-4"
+          className="rounded px-3 py-3"
           style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
         >
           <div className="text-[10px] uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
@@ -397,7 +397,7 @@ export function ContextPanel({ status, processStatus, gpuStats }: Props) {
               color={requestPressure > 80 ? "#fbbf24" : "#34d399"}
             />
           </div>
-          <div className="mt-4 grid grid-cols-2 gap-2 text-xs">
+          <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
             <div>
               <div style={{ color: "var(--text-2)" }}>Parallel</div>
               <div className="mt-1 font-medium" style={{ color: "var(--text-0)" }}>
@@ -414,7 +414,7 @@ export function ContextPanel({ status, processStatus, gpuStats }: Props) {
         </div>
 
         <div
-          className="rounded px-4 py-4"
+          className="rounded px-3 py-3"
           style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
         >
           <div className="text-[10px] uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
@@ -442,7 +442,7 @@ export function ContextPanel({ status, processStatus, gpuStats }: Props) {
         </div>
       </section>
 
-      <section className="grid gap-3 lg:grid-cols-4 md:grid-cols-2">
+      <section className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
         <StatCard
           label="Active Source"
           value={activeGeneration?.source ?? "idle"}
@@ -473,7 +473,7 @@ export function ContextPanel({ status, processStatus, gpuStats }: Props) {
       />
 
       <section
-        className="rounded px-4 py-4"
+        className="rounded px-3 py-3"
         style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
       >
         <div className="text-[10px] uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>

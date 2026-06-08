@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { useModel } from "./hooks/useModel";
 import { useSession } from "./hooks/useSession";
@@ -13,24 +13,143 @@ import { SettingsPanel } from "./components/Model/SettingsPanel";
 import { ContextPanel } from "./components/Context/ContextPanel";
 import { DebugInspector } from "./components/Debug/DebugInspector";
 import { ModelBrowser } from "./components/Model/ModelBrowser";
-import type { AppSettings, LiveStreamDelta, LiveStreamSnapshot } from "./lib/types";
+import type { AppSettings, LiveStreamDelta, LiveStreamSnapshot, LoadProgress } from "./lib/types";
 import * as api from "./lib/tauri";
+import type { DownloadProgress } from "./lib/tauri";
 
-type Tab = "chat" | "models" | "browse" | "context" | "debug" | "settings";
+type Tab = "chat" | "models" | "browse" | "context" | "logs" | "debug" | "settings";
 
 const TAB_LABELS: Record<Tab, string> = {
   chat: "Chat",
   models: "Models",
   browse: "Browse",
   context: "Context",
+  logs: "Logs",
   debug: "API",
   settings: "Settings",
 };
+
+function streamHasDelta(stream: LiveStreamSnapshot, delta: LiveStreamDelta) {
+  return stream.events.some(
+    (event) =>
+      event.timestamp === delta.timestamp &&
+      event.kind === delta.kind &&
+      event.text === delta.text
+  );
+}
 
 interface ContextWorkspaceProps {
   contextStatus: ReturnType<typeof useContext>;
   processStatus: ReturnType<typeof useModel>["processStatus"];
   gpuStats: ReturnType<typeof useGpuStats>;
+}
+
+interface UiNotice {
+  id: string;
+  tone: "info" | "success" | "error";
+  title: string;
+  message: string;
+}
+
+function NotificationCenter() {
+  const [notices, setNotices] = useState<UiNotice[]>([]);
+
+  const pushNotice = (notice: Omit<UiNotice, "id">) => {
+    const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    setNotices((current) => [...current, { ...notice, id }].slice(-5));
+    if (notice.tone !== "error") {
+      window.setTimeout(() => {
+        setNotices((current) => current.filter((item) => item.id !== id));
+      }, 6500);
+    }
+  };
+
+  useEffect(() => {
+    const cleanups: Array<Promise<() => void>> = [];
+    cleanups.push(
+      listen<LoadProgress>("model-load-progress", (event) => {
+        const progress = event.payload;
+        if (progress.error) {
+          pushNotice({
+            tone: "error",
+            title: "Operation failed",
+            message: progress.error,
+          });
+        } else if (progress.done) {
+          pushNotice({
+            tone: "success",
+            title: "Operation complete",
+            message: progress.message,
+          });
+        }
+      })
+    );
+    cleanups.push(
+      listen<DownloadProgress>("model-download-progress", (event) => {
+        const progress = event.payload;
+        if (progress.error) {
+          pushNotice({
+            tone: "error",
+            title: "Download failed",
+            message: `${progress.filename}: ${progress.error}`,
+          });
+        } else if (progress.done) {
+          pushNotice({
+            tone: "success",
+            title: "Download complete",
+            message: progress.filename,
+          });
+        }
+      })
+    );
+    return () => {
+      cleanups.forEach((cleanup) => cleanup.then((fn) => fn()));
+    };
+  }, []);
+
+  if (notices.length === 0) {
+    return null;
+  }
+
+  return (
+    <div className="pointer-events-none fixed bottom-4 right-4 z-50 flex w-[420px] max-w-[calc(100vw-32px)] flex-col gap-2">
+      {notices.map((notice) => {
+        const color =
+          notice.tone === "error" ? "#f87171" : notice.tone === "success" ? "#34d399" : "#22d3ee";
+        return (
+          <div
+            key={notice.id}
+            className="pointer-events-auto rounded-lg px-4 py-3 shadow-2xl"
+            style={{
+              background: "rgba(58,58,60,0.98)",
+              border: "1px solid rgba(255,255,255,0.14)",
+              color: "var(--text-0)",
+              boxShadow: "0 18px 48px rgba(0,0,0,0.45)",
+            }}
+          >
+            <div className="flex items-start gap-2">
+              <span className="mt-0.5 h-4 w-4 shrink-0 rounded-full text-center text-[10px] leading-4" style={{ background: color, color: "#111" }}>✓</span>
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-semibold" style={{ color: "var(--text-0)" }}>
+                  {notice.title}
+                </div>
+                <div className="mt-2 break-words text-xs leading-5" style={{ color: "var(--text-1)" }}>
+                  {notice.message}
+                </div>
+              </div>
+              <button
+                onClick={() => setNotices((current) => current.filter((item) => item.id !== notice.id))}
+                className="rounded px-1 text-xs"
+                style={{ color: "var(--text-2)", border: "none", background: "transparent", cursor: "pointer" }}
+              >
+                x
+              </button>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 function LiveStreamFeed({ snapshot }: { snapshot: LiveStreamSnapshot | null }) {
@@ -55,12 +174,12 @@ function LiveStreamFeed({ snapshot }: { snapshot: LiveStreamSnapshot | null }) {
           if (!current || current.request_id !== event.payload.request_id) {
             return current;
           }
+          if (streamHasDelta(current, event.payload)) {
+            return current;
+          }
           const next: LiveStreamSnapshot = {
             ...current,
             raw_output:
-              event.payload.kind === "content" ||
-              event.payload.kind === "reasoning" ||
-              event.payload.kind === "tool_call" ||
               event.payload.kind === "raw" ||
               event.payload.kind === "error"
                 ? current.raw_output + event.payload.text
@@ -170,7 +289,8 @@ void LiveStreamFeed;
 
 function LiveStreamFeedV2({ snapshot }: { snapshot: LiveStreamSnapshot | null }) {
   const [streams, setStreams] = useState<LiveStreamSnapshot[]>(() => (snapshot ? [snapshot] : []));
-  const [mode, setMode] = useState<"full" | "visible" | "reasoning" | "events" | "json">("full");
+  const [mode, setMode] = useState<"full" | "visible" | "reasoning" | "events" | "json">("visible");
+  const [showHistory, setShowHistory] = useState(false);
   const outputRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -211,7 +331,8 @@ function LiveStreamFeedV2({ snapshot }: { snapshot: LiveStreamSnapshot | null })
 
   const latest = streams[streams.length - 1] ?? null;
   const isRunning = latest?.status === "running";
-  const copyOutput = streams.map((stream) => liveStreamBlock(stream, mode)).join("\n\n");
+  const visibleStreams = showHistory ? streams : latest ? [latest] : [];
+  const copyOutput = visibleStreams.map((stream) => liveStreamBlock(stream, mode)).join("\n\n");
 
   return (
     <section className="flex h-full min-h-0 flex-col" style={{ background: "var(--surface-1)" }}>
@@ -233,6 +354,17 @@ function LiveStreamFeedV2({ snapshot }: { snapshot: LiveStreamSnapshot | null })
               : "Waiting for the next generation."}
           </div>
         </div>
+        <button
+          onClick={() => setShowHistory((value) => !value)}
+          className="rounded px-2 py-1 text-xs"
+          style={{
+            background: showHistory ? "var(--surface-2)" : "transparent",
+            border: "1px solid var(--border)",
+            color: showHistory ? "var(--text-0)" : "var(--text-1)",
+          }}
+        >
+          {showHistory ? "History" : "Latest"}
+        </button>
         {(["full", "visible", "reasoning", "events", "json"] as const).map((item) => (
           <button
             key={item}
@@ -254,15 +386,23 @@ function LiveStreamFeedV2({ snapshot }: { snapshot: LiveStreamSnapshot | null })
         >
           Copy
         </button>
+        <button
+          onClick={() => setStreams([])}
+          disabled={streams.length === 0}
+          className="rounded px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-40"
+          style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}
+        >
+          Clear
+        </button>
       </div>
       <div ref={outputRef} className="min-h-0 flex-1 overflow-auto px-3 py-3" style={{ background: "var(--bg)" }}>
-        {streams.length === 0 ? (
+        {visibleStreams.length === 0 ? (
           <div className="font-mono text-xs leading-5" style={{ color: "var(--text-2)" }}>
             No stream output captured yet. Start a chat/API completion and this pane will fill live.
           </div>
         ) : (
           <div className="space-y-3">
-            {streams.map((stream) => {
+            {visibleStreams.map((stream) => {
               const output = liveStreamOutput(stream, mode);
               const running = stream.status === "running";
               const completedAt = liveCompletedAt(stream);
@@ -314,14 +454,13 @@ function upsertLiveStream(current: LiveStreamSnapshot[], next: LiveStreamSnapsho
 }
 
 function appendLiveDelta(stream: LiveStreamSnapshot, delta: LiveStreamDelta): LiveStreamSnapshot {
+  if (streamHasDelta(stream, delta)) {
+    return stream;
+  }
   return {
     ...stream,
     raw_output:
-      delta.kind === "content" ||
-      delta.kind === "reasoning" ||
-      delta.kind === "tool_call" ||
-      delta.kind === "raw" ||
-      delta.kind === "error"
+      delta.kind === "raw" || delta.kind === "error"
         ? stream.raw_output + delta.text
         : stream.raw_output,
     visible_output: delta.kind === "content" ? stream.visible_output + delta.text : stream.visible_output,
@@ -331,8 +470,8 @@ function appendLiveDelta(stream: LiveStreamSnapshot, delta: LiveStreamDelta): Li
 }
 
 function liveStreamOutput(stream: LiveStreamSnapshot, mode: "full" | "visible" | "reasoning" | "events" | "json") {
-  if (mode === "full") return stream.raw_output;
-  if (mode === "visible") return stream.visible_output;
+  if (mode === "full") return scrubToolLogNoise(stream.raw_output) || liveToolSummary(stream);
+  if (mode === "visible") return scrubToolLogNoise(stream.visible_output) || bufferedVisibleText(stream) || liveToolSummary(stream);
   if (mode === "reasoning") return stream.reasoning_output;
   if (mode === "json") return JSON.stringify(stream, null, 2);
   return stream.events.map((event) => `[${formatLiveDateTime(event.timestamp)}] ${event.kind}\n${event.text}`).join("\n\n");
@@ -380,152 +519,83 @@ function emptyLiveStreamMessage(mode: string) {
   return "No output captured for this request.";
 }
 
-function ContextWorkspace({ contextStatus, processStatus, gpuStats }: ContextWorkspaceProps) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const dragRef = useRef<{
-    startY: number;
-    startHeight: number;
-    containerHeight: number;
-  } | null>(null);
-  const [feedOpen, setFeedOpen] = useState(true);
-  const [feedHeight, setFeedHeight] = useState(280);
+function scrubToolLogNoise(text: string) {
+  let cleaned = text
+    .replace(/<\|channel\|?>thought[\s\S]*?<channel\|>/g, "")
+    .replace(/<\|channel>thought[\s\S]*?<channel\|>/g, "")
+    .replace(/<\|tool_call>[\s\S]*?(?:<tool_call\|>|<\/tool_call>)/g, "")
+    .replace(/<tool_call>[\s\S]*?(?:<tool_call\|>|<\/tool_call>)/g, "");
+  const markerIndex = ["<|tool_call>", "<tool_call>", "<|channel>thought", "<|channel|>thought"]
+    .map((marker) => cleaned.indexOf(marker))
+    .filter((index) => index >= 0)
+    .sort((a, b) => a - b)[0];
+  if (markerIndex != null) {
+    cleaned = cleaned.slice(0, markerIndex);
+  }
+  return cleaned.trim();
+}
 
-  useEffect(() => {
-    const onMove = (event: PointerEvent) => {
-      const drag = dragRef.current;
-      if (!drag) return;
-      const next = drag.startHeight - (event.clientY - drag.startY);
-      const max = Math.max(220, drag.containerHeight - 220);
-      setFeedHeight(Math.max(180, Math.min(next, max)));
-    };
+function bufferedVisibleText(stream: LiveStreamSnapshot) {
+  return scrubToolLogNoise(
+    stream.events
+      .filter((event) => event.kind === "content_buffered")
+      .map((event) => event.text)
+      .join("")
+  );
+}
 
-    const onUp = () => {
-      dragRef.current = null;
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
+function liveToolSummary(stream: LiveStreamSnapshot) {
+  const calls = stream.events.filter((event) => event.kind === "tool_call");
+  if (calls.length === 0) return "";
+  const names = calls.flatMap((event) => {
+    try {
+      const parsed = JSON.parse(event.text);
+      const items = Array.isArray(parsed) ? parsed : [parsed];
+      return items
+        .map((item) => item?.function?.name ?? item?.name)
+        .filter((name): name is string => typeof name === "string" && name.trim().length > 0);
+    } catch {
+      return [];
+    }
+  });
+  return names.length > 0
+    ? `Tool call${names.length === 1 ? "" : "s"}: ${names.join(", ")}`
+    : `${calls.length} tool call event${calls.length === 1 ? "" : "s"} captured.`;
+}
 
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    return () => {
-      window.removeEventListener("pointermove", onMove);
-      window.removeEventListener("pointerup", onUp);
-    };
-  }, []);
-
-  const startResize = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const containerHeight = containerRef.current?.getBoundingClientRect().height ?? window.innerHeight;
-    dragRef.current = {
-      startY: event.clientY,
-      startHeight: feedHeight,
-      containerHeight,
-    };
-    document.body.style.cursor = "row-resize";
-    document.body.style.userSelect = "none";
-    event.preventDefault();
-  };
-
+function LogsWorkspace({ snapshot }: { snapshot: LiveStreamSnapshot | null }) {
   return (
-    <div ref={containerRef} className="flex h-full min-h-0 flex-col overflow-hidden">
-      <div className="min-h-0 flex-1">
-        <ContextPanel
-          status={contextStatus}
-          processStatus={processStatus}
-          gpuStats={gpuStats}
-        />
+    <div className="flex h-full min-h-0 flex-col overflow-hidden">
+      <div
+        className="flex h-12 shrink-0 items-center justify-between gap-3 px-4"
+        style={{ borderBottom: "1px solid var(--border)", background: "var(--surface-1)" }}
+      >
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold" style={{ color: "var(--text-0)" }}>
+            Logs
+          </div>
+          <div className="truncate text-xs" style={{ color: "var(--text-2)" }}>
+            Live LLM streams, raw transport, visible text, reasoning, events, and JSON snapshots.
+          </div>
+        </div>
+        <div className="shrink-0 text-xs" style={{ color: "var(--text-1)" }}>
+          {snapshot ? `${snapshot.source} - ${snapshot.status}` : "No active stream"}
+        </div>
       </div>
-
-      {feedOpen ? (
-        <>
-          <div
-            role="separator"
-            aria-orientation="horizontal"
-            onPointerDown={startResize}
-            className="group flex h-2 shrink-0 cursor-row-resize items-center"
-            style={{ background: "var(--bg)" }}
-          >
-            <div
-              className="h-px w-full transition-colors group-hover:h-1"
-              style={{ background: "var(--border)" }}
-            />
-          </div>
-
-          <div
-            className="flex min-h-0 shrink-0 flex-col overflow-hidden"
-            style={{
-              height: feedHeight,
-              minHeight: 180,
-              maxHeight: "72vh",
-              borderTop: "1px solid var(--border)",
-              background: "var(--bg)",
-            }}
-          >
-            <div
-              className="flex h-10 shrink-0 items-center justify-between gap-2 px-3"
-              style={{
-                borderBottom: "1px solid var(--border)",
-                background: "var(--surface-1)",
-              }}
-            >
-              <div className="min-w-0">
-                <div className="truncate text-xs font-semibold uppercase tracking-[0.16em]" style={{ color: "var(--text-2)" }}>
-                  Live Feed Dock
-                </div>
-              </div>
-              <div className="flex items-center gap-1">
-                <button
-                  onClick={() => setFeedHeight(220)}
-                  className="rounded px-2 py-1 text-xs"
-                  style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}
-                >
-                  S
-                </button>
-                <button
-                  onClick={() => setFeedHeight(340)}
-                  className="rounded px-2 py-1 text-xs"
-                  style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}
-                >
-                  M
-                </button>
-                <button
-                  onClick={() => {
-                    const containerHeight = containerRef.current?.getBoundingClientRect().height ?? 800;
-                    setFeedHeight(Math.max(440, Math.floor(containerHeight * 0.58)));
-                  }}
-                  className="rounded px-2 py-1 text-xs"
-                  style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}
-                >
-                  L
-                </button>
-                <button
-                  onClick={() => setFeedOpen(false)}
-                  className="rounded px-2 py-1 text-xs"
-                  style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}
-                >
-                  Hide
-                </button>
-              </div>
-            </div>
-
-            <div className="min-h-0 flex-1">
-              <LiveStreamFeedV2 snapshot={processStatus?.live_stream ?? null} />
-            </div>
-          </div>
-        </>
-      ) : (
-        <button
-          onClick={() => setFeedOpen(true)}
-          className="h-8 shrink-0 border-t text-xs font-semibold uppercase tracking-[0.16em]"
-          style={{
-            background: "var(--surface-1)",
-            borderColor: "var(--border)",
-            color: "var(--text-1)",
-          }}
-        >
-          Show Live LLM Feed
-        </button>
-      )}
+      <div className="min-h-0 flex-1">
+        <LiveStreamFeedV2 snapshot={snapshot} />
+      </div>
     </div>
+  );
+}
+
+function ContextWorkspace({ contextStatus, processStatus, gpuStats }: ContextWorkspaceProps) {
+  return (
+    <ContextPanel
+      status={contextStatus}
+      processStatus={processStatus}
+      gpuStats={gpuStats}
+    />
   );
 }
 
@@ -555,6 +625,24 @@ function launchPreviewMatchesLoadedModel(
   );
 }
 
+function filenameLooksVisionCapable(modelName: string | null) {
+  const name = modelName?.trim().toLowerCase() ?? "";
+  if (!name) return false;
+  return (
+    name.includes("gemma-4") ||
+    name.includes("gemma4") ||
+    name.includes("-vl") ||
+    name.includes("_vl") ||
+    name.includes("vision") ||
+    name.includes("llava") ||
+    name.includes("internvl") ||
+    name.includes("minicpm-v") ||
+    name.includes("minicpmv") ||
+    name.includes("pixtral") ||
+    name.includes("smolvlm")
+  );
+}
+
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("chat");
   const [settings, setSettings] = useState<AppSettings | null>(null);
@@ -570,14 +658,16 @@ function App() {
   const loadedModelEntry = loadedModelName
     ? model.models.find((entry) => entry.filename === loadedModelName) ?? null
     : null;
-  const loadedModelVisionConfigured = loadedModelEntry?.supports_vision ?? false;
+  const loadedModelVisionConfigured =
+    loadedModelEntry?.supports_vision ?? filenameLooksVisionCapable(loadedModelName);
   const loadedModelSupportsVision =
-    loadedModelVisionConfigured &&
-    launchPreviewMatchesLoadedModel(
-      loadedModelName,
-      model.processStatus?.last_launch_preview?.model_path
-    ) &&
-    !!model.processStatus?.last_launch_preview?.mmproj_path;
+    loadedModelEntry?.vision_runtime_ready ||
+    (loadedModelVisionConfigured &&
+      launchPreviewMatchesLoadedModel(
+        loadedModelName,
+        model.processStatus?.last_launch_preview?.model_path
+      ) &&
+      !!model.processStatus?.last_launch_preview?.mmproj_path);
   const loadedModelVisionStatusText =
     loadedModelVisionConfigured && !loadedModelSupportsVision && loadedModelName
       ? `The loaded model ${loadedModelName} was started without a matching mmproj sidecar, so pasted images will not be seen correctly. Reload a vision-ready model first.`
@@ -629,10 +719,11 @@ function App() {
     }
   }, [hasModel, session.sessions.length, session.activeId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const tabs: Tab[] = ["chat", "models", "browse", "context", "debug", "settings"];
+  const tabs: Tab[] = ["chat", "models", "browse", "context", "logs", "debug", "settings"];
 
   return (
     <div className="flex h-screen flex-col" style={{ background: "var(--bg)", color: "var(--text-0)" }}>
+      <NotificationCenter />
       {/* Compact header */}
       <header
         className="flex shrink-0 items-center gap-4 px-4"
@@ -834,6 +925,7 @@ function App() {
               streamingText={chat.streamingText}
               streamingReasoning={chat.streamingReasoning}
               tokensPerSecond={chat.tokensPerSecond}
+              processStatus={model.processStatus}
               error={chat.error}
               hasModel={hasModel}
               hasSession={!!session.activeId}
@@ -879,6 +971,10 @@ function App() {
               processStatus={model.processStatus}
               gpuStats={gpuStats}
             />
+          </div>
+
+          <div className={`h-full ${activeTab === "logs" ? "block" : "hidden"}`}>
+            <LogsWorkspace snapshot={model.processStatus?.live_stream ?? null} />
           </div>
 
           <div className={`h-full ${activeTab === "debug" ? "block" : "hidden"}`}>

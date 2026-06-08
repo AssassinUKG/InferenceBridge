@@ -7,6 +7,7 @@ use crate::models::profiles::{ModelFamily, ModelProfile};
 use crate::normalize::images::normalize_inline_image_payload;
 use crate::state::{append_live_stream_delta, begin_live_generation, SharedState};
 use crate::templates::engine::{render_prompt, ChatMessage};
+use serde_json::json;
 
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -81,6 +82,79 @@ async fn begin_generation(
     begin_live_generation(state, source, session_id, model)
         .await
         .cancel
+}
+
+fn build_openai_content_parts(text: &str, image_base64: Option<&str>) -> serde_json::Value {
+    let mut parts = Vec::new();
+    if !text.trim().is_empty() {
+        parts.push(json!({
+            "type": "text",
+            "text": text,
+        }));
+    }
+    if let Some(image_base64) = image_base64 {
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": {
+                "url": format!("data:image/png;base64,{image_base64}"),
+            },
+        }));
+    }
+    serde_json::Value::Array(parts)
+}
+
+fn strip_legacy_image_markers(text: &str) -> String {
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !(trimmed.starts_with("[img-") && trimmed.ends_with(']'))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
+fn openai_response_text(value: &serde_json::Value) -> String {
+    value
+        .get("choices")
+        .and_then(|choices| choices.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .and_then(|message| message.get("content"))
+        .and_then(|content| content.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn openai_usage_tokens(value: &serde_json::Value, key: &str) -> Option<u32> {
+    value
+        .get("usage")
+        .and_then(|usage| usage.get(key))
+        .and_then(|tokens| tokens.as_u64())
+        .and_then(|tokens| u32::try_from(tokens).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_openai_content_parts, strip_legacy_image_markers};
+
+    #[test]
+    fn strips_legacy_image_markers_for_openai_image_parts() {
+        assert_eq!(
+            strip_legacy_image_markers("[img-1]\nwhat is this?"),
+            "what is this?"
+        );
+    }
+
+    #[test]
+    fn builds_openai_image_content_parts_without_marker_text() {
+        let parts = build_openai_content_parts("what is this?", Some("QUFB"));
+        let array = parts.as_array().expect("content should be parts array");
+        assert_eq!(array.len(), 2);
+        assert_eq!(array[0]["type"], "text");
+        assert_eq!(array[1]["type"], "image_url");
+    }
 }
 
 async fn finish_generation(state: &SharedState, status: &str) {
@@ -350,6 +424,147 @@ pub async fn send_message(
 
     let messages = apply_thinking_preference(messages, &profile, show_thinking);
 
+    if normalized_inline_image.is_some() {
+        let openai_messages = messages
+            .iter()
+            .zip(db_messages.iter())
+            .map(|(message, stored)| {
+                let image_payload = stored
+                    .image_base64
+                    .as_deref()
+                    .and_then(|image| normalize_inline_image_payload(image).ok());
+                json!({
+                    "role": if message.role == "assistant" { "assistant" } else { message.role.as_str() },
+                    "content": if image_payload.is_some() {
+                        build_openai_content_parts(
+                            &strip_legacy_image_markers(&message.content),
+                            image_payload.as_deref(),
+                        )
+                    } else {
+                        serde_json::Value::String(message.content.clone())
+                    },
+                })
+            })
+            .collect::<Vec<_>>();
+
+        {
+            let mut s = state.write().await;
+            s.last_prompt = Some(
+                serde_json::to_string_pretty(&json!({
+                    "endpoint": "/v1/chat/completions",
+                    "messages": openai_messages,
+                }))
+                .unwrap_or_default(),
+            );
+        }
+
+        let generation_started_at = now_rfc3339();
+        let generation_started = std::time::Instant::now();
+        let _cancel = begin_generation(
+            state.inner(),
+            "gui",
+            Some(session_id.clone()),
+            model_name.clone(),
+        )
+        .await;
+        let port = {
+            let s = state.read().await;
+            s.process.port()
+        };
+        let scheduler = {
+            let s = state.read().await;
+            s.request_scheduler.clone()
+        };
+        let _permit = scheduler.acquire().await;
+        let client = LlamaClient::new(port);
+        let request = json!({
+            "model": model_name,
+            "messages": openai_messages,
+            "stream": false,
+            "max_tokens": max_tokens.or(profile.default_max_output_tokens),
+            "temperature": temperature.or(profile.default_temperature),
+            "top_p": top_p.or(profile.default_top_p),
+            "top_k": top_k.or(profile.default_top_k),
+        });
+        let response = client
+            .chat_completion(&request)
+            .await
+            .map_err(|e| format!("Vision completion failed: {e}"))?;
+        let raw_text = openai_response_text(&response);
+        if !raw_text.is_empty() {
+            append_live_stream_delta(state.inner(), "raw", &raw_text).await;
+        }
+        let stripped = if show_thinking == Some(true) {
+            crate::normalize::think_strip::strip_control_channel_markers(&raw_text)
+        } else {
+            crate::normalize::think_strip::strip_think_tags_with_style(
+                &raw_text,
+                profile.think_tag_style,
+            )
+        };
+        if !stripped.is_empty() {
+            append_live_stream_delta(state.inner(), "content", &stripped).await;
+            let _ = app.emit("stream-token", &stripped);
+        }
+        let prompt_tokens = openai_usage_tokens(&response, "prompt_tokens");
+        let completion_tokens = openai_usage_tokens(&response, "completion_tokens");
+        {
+            let mut s = state.write().await;
+            s.last_parse_trace = Some(build_parse_trace(&profile, &raw_text, &stripped, ""));
+            s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
+                source: "gui-vision".to_string(),
+                model: s
+                    .loaded_model
+                    .clone()
+                    .unwrap_or_else(|| "Unknown".to_string()),
+                request_id: String::new(),
+                started_at: generation_started_at,
+                finished_at: now_rfc3339(),
+                elapsed_ms: generation_started.elapsed().as_millis() as u64,
+                time_to_first_token_ms: None,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: match (prompt_tokens, completion_tokens) {
+                    (Some(prompt), Some(completion)) => Some(prompt + completion),
+                    _ => None,
+                },
+                prompt_tokens_per_second: None,
+                decode_tokens_per_second: None,
+                end_to_end_tokens_per_second: match (
+                    completion_tokens,
+                    generation_started.elapsed().as_millis() as u64,
+                ) {
+                    (Some(tokens), elapsed_ms) if elapsed_ms > 0 => {
+                        Some(tokens as f64 / (elapsed_ms as f64 / 1000.0))
+                    }
+                    _ => None,
+                },
+            });
+        }
+        let assistant_message_id = {
+            let s = state.read().await;
+            let db = s.session_db.lock().map_err(|e| e.to_string())?;
+            db.add_message(&session_id, "assistant", &stripped, 0, None)
+                .map_err(|e| e.to_string())?
+        };
+        {
+            let s = state.read().await;
+            let db = s.session_db.lock().map_err(|e| e.to_string())?;
+            db.update_message_generation_stats(
+                assistant_message_id,
+                completion_tokens.unwrap_or_else(|| {
+                    crate::normalize::think_strip::estimate_token_count(&stripped)
+                }),
+                prompt_tokens,
+                completion_tokens,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        let _ = app.emit("stream-done", 0.0f64);
+        finish_generation(state.inner(), "completed").await;
+        return Ok(stripped);
+    }
+
     let prompt = render_prompt(&messages, &profile);
     {
         let mut s = state.write().await;
@@ -454,13 +669,13 @@ pub async fn send_message(
         }
     }
 
-    let stripped = if profile.has_think_tags() && show_thinking != Some(true) {
+    let stripped = if show_thinking == Some(true) {
+        crate::normalize::think_strip::strip_control_channel_markers(&full_text)
+    } else {
         crate::normalize::think_strip::strip_think_tags_with_style(
             &full_text,
             profile.think_tag_style,
         )
-    } else {
-        full_text.clone()
     };
     let parse_trace = build_parse_trace(&profile, &full_text, &stripped, &reasoning_text);
     {

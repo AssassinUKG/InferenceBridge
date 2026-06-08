@@ -1,4 +1,5 @@
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use serde::{Deserialize, Serialize};
@@ -11,13 +12,13 @@ use crate::api::completions::{
     StopParam, TopParam,
 };
 use crate::api::errors::ApiErrorResponse;
-use crate::engine::client::LlamaClient;
+use crate::engine::client::{CompletionResponse, LlamaClient, Timings};
 use crate::engine::streaming::{self, StreamEvent};
 use crate::normalize::think_strip::{
     estimate_token_count, extract_reasoning_content_with_style, strip_think_tags_with_style,
 };
 use crate::state::{
-    append_live_stream_delta, begin_api_generation, finish_api_generation,
+    append_live_stream_delta_for_request, begin_api_generation, finish_api_generation_for_request,
     summarize_reasoning_tokens, SharedState,
 };
 
@@ -259,6 +260,7 @@ fn build_usage(
 
 pub async fn responses(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ApiErrorResponse> {
     if let Some(upstream) = crate::api::upstream::active_openai_provider(&state).await {
@@ -266,6 +268,9 @@ pub async fn responses(
             .await;
     }
 
+    let original_request_body = body.clone();
+    let client_request_id =
+        crate::replay::preferred_client_correlation_id(&headers, &original_request_body);
     let req: ResponsesRequest = serde_json::from_value(body)
         .map_err(|error| ApiErrorResponse::bad_request(error.to_string()))?;
     let previous_response_id = req.previous_response_id.clone();
@@ -283,14 +288,25 @@ pub async fn responses(
     .await?;
     let profile = crate::models::overrides::detect_effective_profile(&model_name);
 
-    let server_defaults = {
+    let (server_defaults, llama_port, context_limit) = {
         let s = state.read().await;
         (
-            s.config.server.default_temperature,
-            s.config.server.default_top_p,
-            s.config.server.default_top_k,
-            s.config.server.default_max_tokens,
+            (
+                s.config.server.default_temperature,
+                s.config.server.default_top_p,
+                s.config.server.default_top_k,
+                s.config.server.default_max_tokens,
+            ),
             s.process.port(),
+            s.model_stats
+                .as_ref()
+                .map(|stats| stats.context_size)
+                .or_else(|| {
+                    s.last_launch_preview
+                        .as_ref()
+                        .and_then(|preview| preview.context_size)
+                })
+                .or(requested_context_size),
         )
     };
 
@@ -303,6 +319,7 @@ pub async fn responses(
             &server_defaults.2,
             &server_defaults.3,
         ),
+        context_limit,
     )
     .await?;
 
@@ -325,7 +342,7 @@ pub async fn responses(
     };
     let _permit = scheduler.acquire().await;
 
-    let client = LlamaClient::new(server_defaults.4);
+    let client = LlamaClient::new(llama_port);
     let generation_started_at = chrono::Utc::now().to_rfc3339();
     let generation_started = std::time::Instant::now();
 
@@ -336,6 +353,7 @@ pub async fn responses(
         })?;
 
         let gen = begin_api_generation(&state, model_name.clone()).await;
+        let request_id = gen.request_id.clone();
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {
             let _ = streaming::consume_sse_stream(response, tx, gen.cancel).await;
@@ -364,11 +382,11 @@ pub async fn responses(
             while let Some(event) = rx.recv().await {
                 match event {
                     StreamEvent::RawDelta(raw) => {
-                        append_live_stream_delta(&state_for_stream, "raw", &raw).await;
+                        append_live_stream_delta_for_request(&state_for_stream, &request_id, "raw", &raw).await;
                     }
                     StreamEvent::Token(token) => {
                         full_text.push_str(&token);
-                        append_live_stream_delta(&state_for_stream, "content", &token).await;
+                        append_live_stream_delta_for_request(&state_for_stream, &request_id, "content", &token).await;
                         let chunk = serde_json::json!({
                             "type": "response.output_text.delta",
                             "response_id": response_id,
@@ -378,7 +396,7 @@ pub async fn responses(
                         yield Ok(Event::default().data(chunk.to_string()));
                     }
                     StreamEvent::ReasoningDelta(reasoning) => {
-                        append_live_stream_delta(&state_for_stream, "reasoning", &reasoning).await;
+                        append_live_stream_delta_for_request(&state_for_stream, &request_id, "reasoning", &reasoning).await;
                         let chunk = serde_json::json!({
                             "type": "response.reasoning.delta",
                             "response_id": response_id,
@@ -398,28 +416,63 @@ pub async fn responses(
                         let reasoning = extract_reasoning_content_with_style(&text, profile.think_tag_style);
                         let reasoning_tokens =
                             summarize_reasoning_tokens(Some(tokens_predicted), &visible, &reasoning);
+                        let replay_visible = visible.clone();
 
+                        let elapsed_ms = generation_started.elapsed().as_millis() as u64;
+                        let end_to_end_tps = end_to_end_tokens_per_second(
+                            Some(tokens_predicted),
+                            elapsed_ms,
+                        );
                         let mut s = state_for_stream.write().await;
-                        s.last_parse_trace = Some(build_parse_trace(&profile, &text, &visible));
+                        s.last_parse_trace = Some(build_parse_trace(&profile, &text, &replay_visible));
                         s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
                             source: "responses-api".to_string(),
                             model: model_name.clone(),
-                            request_id: String::new(),
+                            request_id: request_id.clone(),
                             started_at: generation_started_at.clone(),
                             finished_at: chrono::Utc::now().to_rfc3339(),
-                            elapsed_ms: generation_started.elapsed().as_millis() as u64,
+                            elapsed_ms,
                             time_to_first_token_ms: None,
                             prompt_tokens: Some(tokens_evaluated),
                             completion_tokens: Some(tokens_predicted),
                             total_tokens: Some(tokens_evaluated + tokens_predicted),
                             prompt_tokens_per_second,
                             decode_tokens_per_second: Some(decode_tokens_per_second),
-                            end_to_end_tokens_per_second: end_to_end_tokens_per_second(
-                                Some(tokens_predicted),
-                                generation_started.elapsed().as_millis() as u64,
-                            ),
+                            end_to_end_tokens_per_second: end_to_end_tps,
                         });
                         drop(s);
+                        let stream_response = CompletionResponse {
+                            content: text.clone(),
+                            stop: true,
+                            tokens_predicted: Some(tokens_predicted),
+                            tokens_evaluated: Some(tokens_evaluated),
+                            timings: Some(Timings {
+                                predicted_per_second: Some(decode_tokens_per_second),
+                                prompt_per_second: prompt_tokens_per_second,
+                            }),
+                        };
+                        let canonical = crate::replay::build_canonical_response(
+                            &profile,
+                            &request_id,
+                            client_request_id.clone(),
+                            "responses-api-stream",
+                            &model_name,
+                            &text,
+                            &replay_visible,
+                            Vec::new(),
+                            &stream_response,
+                            elapsed_ms,
+                            end_to_end_tps,
+                            llama_port,
+                            context_limit,
+                        );
+                        crate::replay::append_api_replay_record(
+                            "/v1/responses",
+                            original_request_body.clone(),
+                            &request,
+                            canonical,
+                        )
+                        .await;
 
                         let completed = serde_json::json!({
                             "type": "response.completed",
@@ -442,12 +495,12 @@ pub async fn responses(
                         });
                         yield Ok(Event::default().data(completed.to_string()));
                         yield Ok(Event::default().data("[DONE]"));
-                        finish_api_generation(&state_for_stream, "completed").await;
+                        finish_api_generation_for_request(&state_for_stream, &request_id, "completed").await;
                         return;
                     }
                     StreamEvent::Error(error) => {
-                        append_live_stream_delta(&state_for_stream, "error", &error).await;
-                        finish_api_generation(&state_for_stream, "error").await;
+                        append_live_stream_delta_for_request(&state_for_stream, &request_id, "error", &error).await;
+                        finish_api_generation_for_request(&state_for_stream, &request_id, "error").await;
                         let error_chunk = serde_json::json!({
                             "type": "response.error",
                             "error": {
@@ -468,22 +521,29 @@ pub async fn responses(
             .into_response());
     }
 
-    let response = client.complete(&request).await.map_err(|e| {
-        tracing::error!(error = %e, "Responses completion failed");
-        ApiErrorResponse::inference_failed(&e.to_string())
-    })?;
+    let gen = begin_api_generation(&state, model_name.clone()).await;
+    let request_id = gen.request_id.clone();
+    let response = match client.complete(&request).await {
+        Ok(response) => response,
+        Err(e) => {
+            finish_api_generation_for_request(&state, &request_id, "error").await;
+            tracing::error!(error = %e, "Responses completion failed");
+            return Err(ApiErrorResponse::inference_failed(&e.to_string()));
+        }
+    };
 
     let visible_text = strip_think_tags_with_style(&response.content, profile.think_tag_style);
     let reasoning_text =
         extract_reasoning_content_with_style(&response.content, profile.think_tag_style);
     if !response.content.is_empty() {
-        append_live_stream_delta(&state, "raw", &response.content).await;
+        append_live_stream_delta_for_request(&state, &request_id, "raw", &response.content).await;
     }
     if !reasoning_text.is_empty() {
-        append_live_stream_delta(&state, "reasoning", &reasoning_text).await;
+        append_live_stream_delta_for_request(&state, &request_id, "reasoning", &reasoning_text)
+            .await;
     }
     if !visible_text.is_empty() {
-        append_live_stream_delta(&state, "content", &visible_text).await;
+        append_live_stream_delta_for_request(&state, &request_id, "content", &visible_text).await;
     }
     let reasoning_tokens = summarize_reasoning_tokens(
         response
@@ -493,6 +553,8 @@ pub async fn responses(
         &reasoning_text,
     );
 
+    let elapsed_ms = generation_started.elapsed().as_millis() as u64;
+    let end_to_end_tps = end_to_end_tokens_per_second(response.tokens_predicted, elapsed_ms);
     {
         let mut s = state.write().await;
         s.last_parse_trace = Some(build_parse_trace(
@@ -503,10 +565,10 @@ pub async fn responses(
         s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
             source: "responses-api".to_string(),
             model: model_name.clone(),
-            request_id: String::new(),
+            request_id: request_id.clone(),
             started_at: generation_started_at,
             finished_at: chrono::Utc::now().to_rfc3339(),
-            elapsed_ms: generation_started.elapsed().as_millis() as u64,
+            elapsed_ms,
             time_to_first_token_ms: None,
             prompt_tokens: response.tokens_evaluated,
             completion_tokens: response.tokens_predicted,
@@ -522,13 +584,11 @@ pub async fn responses(
                 .timings
                 .as_ref()
                 .and_then(|timings| timings.predicted_per_second),
-            end_to_end_tokens_per_second: end_to_end_tokens_per_second(
-                response.tokens_predicted,
-                generation_started.elapsed().as_millis() as u64,
-            ),
+            end_to_end_tokens_per_second: end_to_end_tps,
         });
     }
 
+    let replay_visible_text = visible_text.clone();
     let output = vec![ResponsesOutputMessage {
         id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
         kind: "message",
@@ -536,6 +596,29 @@ pub async fn responses(
         role: "assistant",
         content: build_response_output(visible_text, reasoning_text),
     }];
+    let canonical = crate::replay::build_canonical_response(
+        &profile,
+        &request_id,
+        client_request_id,
+        "responses-api",
+        &model_name,
+        &response.content,
+        &replay_visible_text,
+        Vec::new(),
+        &response,
+        elapsed_ms,
+        end_to_end_tps,
+        llama_port,
+        context_limit,
+    );
+    crate::replay::append_api_replay_record(
+        "/v1/responses",
+        original_request_body,
+        &request,
+        canonical,
+    )
+    .await;
+    finish_api_generation_for_request(&state, &request_id, "completed").await;
 
     Ok(Json(ResponsesResponse {
         id: format!("resp_{}", uuid::Uuid::new_v4().simple()),

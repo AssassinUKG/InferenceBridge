@@ -121,7 +121,12 @@ pub async fn debug_api_request(
         if let Some(object) = parsed.as_object_mut() {
             object.insert("stream".to_string(), serde_json::Value::Bool(false));
         }
-        match crate::api::completions::chat_completions(AxumState(shared), axum::Json(parsed)).await
+        match crate::api::completions::chat_completions(
+            AxumState(shared),
+            axum::http::HeaderMap::new(),
+            axum::Json(parsed),
+        )
+        .await
         {
             Ok(response) => response,
             Err(status) => status.into_response(),
@@ -133,7 +138,13 @@ pub async fn debug_api_request(
         if let Some(object) = parsed.as_object_mut() {
             object.insert("stream".to_string(), serde_json::Value::Bool(false));
         }
-        match crate::api::responses::responses(AxumState(shared), axum::Json(parsed)).await {
+        match crate::api::responses::responses(
+            AxumState(shared),
+            axum::http::HeaderMap::new(),
+            axum::Json(parsed),
+        )
+        .await
+        {
             Ok(response) => response,
             Err(status) => status.into_response(),
         }

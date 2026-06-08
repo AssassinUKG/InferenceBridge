@@ -98,6 +98,18 @@ where
             Err(poisoned) => poisoned.into_inner(),
         };
 
+        if guard
+            .back()
+            .map(|last| {
+                last.level == entry.level
+                    && last.target == entry.target
+                    && last.message == entry.message
+            })
+            .unwrap_or(false)
+        {
+            return;
+        }
+
         if guard.len() >= LOG_CAPACITY {
             guard.pop_front();
         }

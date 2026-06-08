@@ -86,6 +86,36 @@ fn find_mmproj_for_model(model_path: &Path) -> Option<PathBuf> {
     candidates.into_iter().next()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{filename_supports_vision, find_mmproj_for_model};
+
+    #[test]
+    fn gemma4_12b_filename_is_vision_capable() {
+        assert!(filename_supports_vision(std::path::Path::new(
+            "gemma-4-12B-it-Q4_K_M.gguf"
+        )));
+    }
+
+    #[test]
+    fn finds_gemma4_mmproj_sidecar() {
+        let dir = std::env::temp_dir().join(format!(
+            "inference-bridge-mmproj-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp model dir");
+        let model = dir.join("gemma-4-12B-it-Q4_K_M.gguf");
+        let mmproj = dir.join("mmproj-gemma-4-12B-it-BF16.gguf");
+        std::fs::write(&model, b"").expect("write model placeholder");
+        std::fs::write(&mmproj, b"").expect("write mmproj placeholder");
+
+        let found = find_mmproj_for_model(&model).expect("mmproj should be found");
+        assert_eq!(found.file_name(), mmproj.file_name());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Process state machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum ProcessState {
@@ -616,6 +646,24 @@ impl LlamaProcess {
         self.state
     }
 
+    pub fn mark_idle_if_no_child(&mut self) -> bool {
+        if self.child.is_some() || self.state == ProcessState::Idle {
+            return false;
+        }
+
+        tracing::warn!(
+            state = ?self.state,
+            pid = self.current_pid,
+            port = self.current_port,
+            "Repairing stale llama-server process state with no child process"
+        );
+        self.current_model = None;
+        self.current_pid = None;
+        self.current_port = 0;
+        self.set_state(ProcessState::Idle);
+        true
+    }
+
     pub fn current_model(&self) -> Option<&str> {
         self.current_model.as_deref()
     }
@@ -925,6 +973,7 @@ impl LlamaProcess {
         for handle in self.io_tasks.drain(..) {
             handle.abort();
         }
+        self.mark_idle_if_no_child();
         Ok(())
     }
 

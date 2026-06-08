@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import type { MessageInfo } from "../../lib/types";
+import type { MessageInfo, ProcessStatusInfo } from "../../lib/types";
 import type { SamplingParams } from "../../lib/tauri";
 import { PRESETS, PRESET_ORDER, modelSupportsThinking, type PresetKey } from "../../lib/presets";
 import { MessageBubble } from "./MessageBubble";
@@ -11,6 +11,7 @@ interface Props {
   streamingText: string;
   streamingReasoning: string;
   tokensPerSecond: number | null;
+  processStatus?: ProcessStatusInfo | null;
   error: string | null;
   hasModel: boolean;
   hasSession: boolean;
@@ -33,6 +34,7 @@ export function ChatPanel({
   streamingText,
   streamingReasoning,
   tokensPerSecond,
+  processStatus = null,
   error,
   hasModel,
   hasSession,
@@ -53,6 +55,18 @@ export function ChatPanel({
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const canThink = modelSupportsThinking(loadedModel);
+  const lastMetrics = processStatus?.last_generation_metrics ?? null;
+  const activeGeneration = processStatus?.active_generation ?? null;
+  const liveGeneratedApprox = Math.max(0, Math.round((streamingText.length + streamingReasoning.length) / 4));
+  const generatedTokens = isStreaming
+    ? liveGeneratedApprox
+    : lastMetrics?.completion_tokens ?? null;
+  const promptTokens = lastMetrics?.prompt_tokens ?? null;
+  const totalTokens = lastMetrics?.total_tokens ?? null;
+  const displayTokSec =
+    isStreaming
+      ? tokensPerSecond ?? lastMetrics?.decode_tokens_per_second ?? null
+      : tokensPerSecond ?? lastMetrics?.decode_tokens_per_second ?? null;
 
   const applyPreset = (key: PresetKey) => {
     const preset = PRESETS[key];
@@ -150,7 +164,29 @@ export function ChatPanel({
   }
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex h-full flex-col">
+      <div
+        className="flex shrink-0 flex-wrap items-center gap-2 px-3 py-2"
+        style={{ borderBottom: "1px solid var(--border)", background: "var(--surface-1)" }}
+      >
+        <span
+          className={`h-2 w-2 rounded-full ${isStreaming ? "animate-pulse" : ""}`}
+          style={{ background: isStreaming ? "#34d399" : "#64748b" }}
+        />
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-xs font-semibold uppercase tracking-[0.14em]" style={{ color: "var(--text-2)" }}>
+            Chat
+          </div>
+          <div className="truncate text-xs" style={{ color: "var(--text-1)" }}>
+            {loadedModel ?? "model"} {activeGeneration ? `- ${activeGeneration.status}` : ""}
+          </div>
+        </div>
+        <ChatMetric label="Generated" value={generatedTokens == null ? "n/a" : generatedTokens.toLocaleString()} />
+        <ChatMetric label="Tok/sec" value={displayTokSec == null ? "n/a" : displayTokSec.toFixed(displayTokSec >= 100 ? 0 : 1)} tone="good" />
+        <ChatMetric label="Prompt" value={promptTokens == null ? "n/a" : promptTokens.toLocaleString()} />
+        <ChatMetric label="Total" value={totalTokens == null ? "n/a" : totalTokens.toLocaleString()} />
+        {lastMetrics?.elapsed_ms != null && <ChatMetric label="Elapsed" value={formatChatDuration(lastMetrics.elapsed_ms)} />}
+      </div>
       <div className="flex-1 overflow-y-auto">
         {messages.length === 0 && !isStreaming && (
           <div className="flex items-center justify-center h-full text-gray-600 text-sm">
@@ -164,13 +200,13 @@ export function ChatPanel({
         <div ref={bottomRef} />
       </div>
 
-      {(tokensPerSecond != null || error || composerError) && (
+      {(displayTokSec != null || error || composerError) && (
         <div className="px-4 py-1 text-xs border-t border-gray-700/50">
           {error || composerError ? (
             <span className="text-red-400">{composerError ?? error}</span>
           ) : (
             <span className="text-gray-500">
-              {tokensPerSecond?.toFixed(1)} tok/s
+              {displayTokSec?.toFixed(displayTokSec >= 100 ? 0 : 1)} tok/s
             </span>
           )}
         </div>
@@ -461,4 +497,27 @@ export function ChatPanel({
       </div>
     </div>
   );
+}
+
+function ChatMetric({ label, value, tone = "neutral" }: { label: string; value: string; tone?: "neutral" | "good" }) {
+  return (
+    <div
+      className="min-w-[72px] rounded px-2 py-1 text-right"
+      style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}
+    >
+      <div className="text-[9px] uppercase tracking-[0.12em]" style={{ color: "var(--text-2)" }}>
+        {label}
+      </div>
+      <div className="text-xs font-semibold tabular-nums" style={{ color: tone === "good" ? "#34d399" : "var(--text-0)" }}>
+        {value}
+      </div>
+    </div>
+  );
+}
+
+function formatChatDuration(ms: number) {
+  if (ms < 1000) return `${Math.round(ms)} ms`;
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  return minutes > 0 ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
 }

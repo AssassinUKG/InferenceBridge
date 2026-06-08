@@ -237,6 +237,46 @@ fn find_matching_asset<'a>(assets: &'a [GithubAsset], pattern: &str) -> Option<&
     })
 }
 
+fn safe_download_name(url: &str, tag: &str) -> String {
+    let tail = url
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("llama-server.zip");
+    let mut name = format!("{tag}-{tail}")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if name.len() > 180 {
+        name.truncate(180);
+    }
+    name
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &target)?;
+        } else if ty.is_file() {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
 /// Download and extract llama-server to our managed directory.
 /// Emits `model-load-progress` events with stage "downloading".
 pub async fn download_llama_server(
@@ -246,46 +286,24 @@ pub async fn download_llama_server(
     total_size: u64,
 ) -> anyhow::Result<PathBuf> {
     use futures_util::StreamExt;
+    use reqwest::header::{CONTENT_LENGTH, RANGE};
+    use std::io::{Seek, SeekFrom, Write};
 
     let dir = LlamaProcess::managed_binary_dir();
     std::fs::create_dir_all(&dir)?;
 
-    let temp_file = dir.join("download.tmp");
+    let download_name = safe_download_name(url, tag);
+    let temp_file = dir.join(format!("{download_name}.part"));
+    let complete_file = dir.join(format!("{download_name}.download"));
+    let stage_dir = dir.join(format!("{download_name}.extracting"));
+    let _ = std::fs::remove_file(&complete_file);
 
     let client = reqwest::Client::builder()
         .user_agent("InferenceBridge/0.1")
         .redirect(reqwest::redirect::Policy::limited(10))
-        .timeout(std::time::Duration::from_secs(600))
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .timeout(std::time::Duration::from_secs(1800))
         .build()?;
-
-    let response = client.get(url).send().await?;
-
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Download failed with status: {} (url: {})",
-            response.status(),
-            url
-        ));
-    }
-
-    // Log the actual content type and final URL to help debug redirect issues
-    let final_url = response.url().to_string();
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
-    tracing::info!(
-        final_url = %final_url,
-        content_type = %content_type,
-        "Download started"
-    );
-
-    let total = response.content_length().unwrap_or(total_size);
-    let mut stream = response.bytes_stream();
-    let mut file = std::fs::File::create(&temp_file)?;
-    let mut downloaded: u64 = 0;
 
     // Emit progress during download
     let emit_download = |downloaded: u64, total: u64| {
@@ -308,22 +326,124 @@ pub async fn download_llama_server(
         );
     };
 
-    emit_download(0, total);
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut final_total = total_size;
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        use std::io::Write;
-        file.write_all(&chunk)?;
-        downloaded += chunk.len() as u64;
-
-        // Emit every ~2MB to avoid flooding
-        if downloaded % (2 * 1024 * 1024) < chunk.len() as u64 {
-            emit_download(downloaded, total);
+    for attempt in 1..=5u32 {
+        let existing = std::fs::metadata(&temp_file).map(|m| m.len()).unwrap_or(0);
+        let mut request = client.get(url);
+        if existing > 0 {
+            request = request.header(RANGE, format!("bytes={existing}-"));
         }
-    }
-    drop(file);
 
-    emit_download(total, total);
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = Some(error.into());
+                tokio::time::sleep(std::time::Duration::from_millis(600 * attempt as u64)).await;
+                continue;
+            }
+        };
+
+        let status = response.status();
+        if existing > 0 && status == reqwest::StatusCode::OK {
+            tracing::warn!(
+                existing,
+                "Download server ignored Range resume; restarting partial download"
+            );
+            let _ = std::fs::remove_file(&temp_file);
+        } else if !(status.is_success() || status == reqwest::StatusCode::PARTIAL_CONTENT) {
+            last_error = Some(anyhow::anyhow!(
+                "Download failed with status: {} (url: {})",
+                status,
+                url
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(600 * attempt as u64)).await;
+            continue;
+        }
+
+        let existing = std::fs::metadata(&temp_file).map(|m| m.len()).unwrap_or(0);
+        let response_len = response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        final_total = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            total_size.max(existing + response_len)
+        } else {
+            response.content_length().unwrap_or(total_size)
+        };
+
+        let final_url = response.url().to_string();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_string();
+        tracing::info!(
+            attempt,
+            resume_from = existing,
+            final_url = %final_url,
+            content_type = %content_type,
+            "Download started"
+        );
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&temp_file)?;
+        file.seek(SeekFrom::Start(existing))?;
+        let mut downloaded = existing;
+        emit_download(downloaded, final_total);
+
+        let mut stream = response.bytes_stream();
+        let mut attempt_failed = false;
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => {
+                    file.write_all(&chunk)?;
+                    downloaded += chunk.len() as u64;
+
+                    if downloaded % (2 * 1024 * 1024) < chunk.len() as u64 {
+                        emit_download(downloaded, final_total);
+                    }
+                }
+                Err(error) => {
+                    last_error = Some(error.into());
+                    attempt_failed = true;
+                    break;
+                }
+            }
+        }
+        file.sync_all()?;
+        drop(file);
+
+        if attempt_failed {
+            tokio::time::sleep(std::time::Duration::from_millis(600 * attempt as u64)).await;
+            continue;
+        }
+
+        if final_total > 0 && downloaded < final_total {
+            last_error = Some(anyhow::anyhow!(
+                "Download incomplete: {} of {} bytes",
+                downloaded,
+                final_total
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(600 * attempt as u64)).await;
+            continue;
+        }
+
+        std::fs::rename(&temp_file, &complete_file)?;
+        break;
+    }
+
+    if !complete_file.exists() {
+        return Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Download failed")));
+    }
+
+    emit_download(final_total, final_total);
 
     // Extract
     let _ = app.emit(
@@ -337,17 +457,34 @@ pub async fn download_llama_server(
         },
     );
 
-    let server_path = extract_archive(&temp_file, &dir)?;
+    let is_cuda_runtime = url.to_lowercase().contains("cudart");
+    let extract_dest = if is_cuda_runtime {
+        dir.clone()
+    } else {
+        let _ = std::fs::remove_dir_all(&stage_dir);
+        std::fs::create_dir_all(&stage_dir)?;
+        stage_dir.clone()
+    };
+
+    let server_path = extract_archive(&complete_file, &extract_dest)?;
+
+    if !is_cuda_runtime {
+        copy_dir_all(&stage_dir, &dir)?;
+        let _ = std::fs::remove_dir_all(&stage_dir);
+    }
 
     // Clean up temp file
-    let _ = std::fs::remove_file(&temp_file);
+    let _ = std::fs::remove_file(&complete_file);
 
-    // Write version file
-    let version_path = dir.join(VERSION_FILE);
-    std::fs::write(version_path, tag)?;
+    // Write version file only for server binaries. CUDA runtime sidecar
+    // packages must not overwrite the installed llama-server version.
+    if !is_cuda_runtime {
+        let version_path = dir.join(VERSION_FILE);
+        std::fs::write(version_path, tag)?;
+    }
 
     tracing::info!(
-        path = %server_path.display(),
+        path = %dir.join("llama-server.exe").display(),
         version = %tag,
         "llama-server downloaded and installed"
     );
@@ -363,7 +500,11 @@ pub async fn download_llama_server(
         },
     );
 
-    Ok(server_path)
+    if is_cuda_runtime {
+        Ok(server_path)
+    } else {
+        Ok(dir.join("llama-server.exe"))
+    }
 }
 
 /// Extract the llama-server binary from a downloaded archive.

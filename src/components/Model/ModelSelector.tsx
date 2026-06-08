@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+﻿import { useEffect, useState, type ReactNode } from "react";
 import type {
   AppSettings,
   LoadProgress,
@@ -209,7 +209,7 @@ function savedConfigKey(modelName: string) {
   return `inference-bridge:model-configs:${modelName}`;
 }
 
-// ─── Panel wrapper ─────────────────────────────────────────────────────────────
+// â”€â”€â”€ Panel wrapper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function Panel({ children, className = "" }: { children: ReactNode; className?: string }) {
   return (
@@ -231,7 +231,7 @@ function Divider() {
   return <div style={{ height: "1px", background: "var(--border)" }} />;
 }
 
-// ─── VRAM bar ──────────────────────────────────────────────────────────────────
+// â”€â”€â”€ VRAM bar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 // Full bar = dedicated VRAM + system RAM (spill zone).
 // Green fill = used dedicated VRAM. Amber zone = system RAM overflow area.
 // Divider marks the boundary between dedicated (fast) and spill (slow) memory.
@@ -240,43 +240,54 @@ function VramBar({
   usedMb,
   dedicatedMb,
   systemRamMb,
+  mode = "current",
 }: {
   usedMb: number;
   dedicatedMb: number;
   systemRamMb: number;
+  mode?: "current" | "estimate";
 }) {
-  const totalMb = dedicatedMb + Math.min(systemRamMb, dedicatedMb * 4); // cap spill zone at 4x VRAM
-  const usedPct = totalMb > 0 ? (usedMb / totalMb) * 100 : 0;
-  const dedicatedPct = totalMb > 0 ? (dedicatedMb / totalMb) * 100 : 100;
+  const spillMb = Math.min(systemRamMb, dedicatedMb * 4); // cap spill zone at 4x VRAM
+  const showSpill = mode === "estimate";
+  const totalMb = showSpill ? dedicatedMb + spillMb : dedicatedMb;
+  const usedPct = totalMb > 0 ? Math.min((usedMb / totalMb) * 100, 100) : 0;
+  const dedicatedPct = showSpill && totalMb > 0 ? (dedicatedMb / totalMb) * 100 : 100;
 
   const usedGb = (usedMb / 1024).toFixed(1);
   const dedicatedGb = (dedicatedMb / 1024).toFixed(1);
-  const spillGb = (Math.min(systemRamMb, dedicatedMb * 4) / 1024).toFixed(0);
+  const spillGb = (spillMb / 1024).toFixed(0);
 
   // Fill colour: green while in dedicated zone, amber if spilling
   const fillColor = usedMb < dedicatedMb * 0.9 ? "#34d399" : "#f59e0b";
+  const label = mode === "estimate" ? "Predicted" : "Current";
+  const title =
+    mode === "estimate"
+      ? `Predicted model + KV memory: ${usedGb}/${dedicatedGb}GB dedicated | +${spillGb}GB RAM overflow zone`
+      : `Current live GPU VRAM from nvidia-smi: ${usedGb}/${dedicatedGb}GB dedicated`;
 
   return (
     <div className="flex items-center gap-2">
       <span className="text-[10px] uppercase tracking-widest whitespace-nowrap" style={{ color: "var(--text-2)" }}>
-        VRAM
+        {label}
       </span>
       <div
         className="relative rounded-full overflow-hidden"
         style={{ width: "110px", height: "6px", background: "var(--surface-3)" }}
-        title={`${usedGb}/${dedicatedGb}GB dedicated | +${spillGb}GB RAM overflow`}
+        title={title}
       >
-        {/* Spill zone (right portion = system RAM) — always amber tint */}
-        <div
-          style={{
-            position: "absolute",
-            left: `${dedicatedPct}%`,
-            top: 0,
-            height: "100%",
-            width: `${100 - dedicatedPct}%`,
-            background: "rgba(245,158,11,0.18)",
-          }}
-        />
+        {/* Spill zone (right portion = system RAM) â€” always amber tint */}
+        {showSpill && (
+          <div
+            style={{
+              position: "absolute",
+              left: `${dedicatedPct}%`,
+              top: 0,
+              height: "100%",
+              width: `${100 - dedicatedPct}%`,
+              background: "rgba(245,158,11,0.18)",
+            }}
+          />
+        )}
         {/* Used VRAM fill */}
         <div
           style={{
@@ -290,16 +301,18 @@ function VramBar({
           }}
         />
         {/* Divider at dedicated boundary */}
-        <div
-          style={{
-            position: "absolute",
-            left: `${dedicatedPct}%`,
-            top: 0,
-            width: "1px",
-            height: "100%",
-            background: "rgba(255,255,255,0.3)",
-          }}
-        />
+        {showSpill && (
+          <div
+            style={{
+              position: "absolute",
+              left: `${dedicatedPct}%`,
+              top: 0,
+              width: "1px",
+              height: "100%",
+              background: "rgba(255,255,255,0.3)",
+            }}
+          />
+        )}
       </div>
       <span className="text-[10px] whitespace-nowrap tabular-nums" style={{ color: "var(--text-1)" }}>
         {usedGb}/{dedicatedGb}GB
@@ -308,7 +321,7 @@ function VramBar({
   );
 }
 
-// ─── Main component ─────────────────────────────────────────────────────────
+// â”€â”€â”€ Main component â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 export function ModelSelector({
   models,
@@ -329,6 +342,7 @@ export function ModelSelector({
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<FilterKey>("all");
   const [copied, setCopied] = useState(false);
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const serverUrl = buildServerUrl(settings);
   const gpuStats = useGpuStats();
 
@@ -389,7 +403,14 @@ export function ModelSelector({
         gguf_architecture: null,
       })
     : null;
-  const modelCards = filteredModels.filter((m) => m.filename !== loadedModel);
+  const selectedModel =
+    filteredModels.find((m) => m.path === selectedPath) ??
+    activeModel ??
+    filteredModels[0] ??
+    null;
+  const localDiskGb = models
+    .filter((m) => m.provider_managed)
+    .reduce((sum, m) => sum + (m.size_gb || 0), 0);
 
   const handleCopyUrl = async () => {
     try {
@@ -405,276 +426,350 @@ export function ModelSelector({
   const apiRunning = apiState === "Running" || apiState === "Starting";
 
   return (
-    <div className="flex flex-col gap-3">
-      <Panel>
-        {/* ── Toolbar ── */}
-        <div className="flex flex-wrap items-center gap-2 px-3 py-2.5">
-          <StatusPill state={state} />
-          <button
-            onClick={() => onSetApiServerRunning(!apiRunning)}
-            className="flex items-center gap-2 rounded px-3 py-1.5 text-xs transition"
-            style={{
-              background: "var(--surface-2)",
-              color: "var(--text-0)",
-              border: "1px solid var(--border)",
-            }}
-          >
-            <span>Serve</span>
-            <span style={{ color: apiRunning ? "#34d399" : "var(--text-1)", fontWeight: 600 }}>
-              {apiRunning ? apiState : "Off"}
-            </span>
-            <span
-              className="relative shrink-0 rounded-full transition"
-              style={{
-                width: "28px",
-                height: "16px",
-                background: apiRunning ? "#22d3ee" : "var(--surface-3)",
-              }}
-            >
-              <span
-                className="absolute rounded-full bg-white transition-all"
-                style={{
-                  width: "12px",
-                  height: "12px",
-                  top: "2px",
-                  left: apiRunning ? "14px" : "2px",
-                }}
-              />
-            </span>
-          </button>
-          <ToolBtn onClick={onOpenSettings} icon={<GearIcon />} label="Settings" />
-          <ToolBtn
-            onClick={handleCopyUrl}
-            icon={<CopyIcon />}
-            label={copied ? "Copied!" : "Copy URL"}
-          />
-          <div className="flex-1" />
-          <span
-            className="truncate font-mono text-xs"
-            style={{ color: "var(--text-1)" }}
-          >
-            {serverUrl}
-          </span>
-          <span
-            className="rounded px-2 py-0.5 text-xs"
-            style={{
-              background: "var(--surface-2)",
-              color: "var(--text-1)",
-              border: "1px solid var(--border)",
-            }}
-          >
-            {models.length} model{models.length === 1 ? "" : "s"}
-          </span>
-          {settings && (
-            <ProviderBadge
-              providerName={settings.active_provider === "lm_studio" ? "LM Studio" : "Managed"}
-              managed={settings.active_provider !== "lm_studio"}
-            />
-          )}
-          {gpuStats && (
-            <VramBar
-              usedMb={gpuStats.used_mb}
-              dedicatedMb={gpuStats.dedicated_mb}
-              systemRamMb={gpuStats.system_ram_mb}
-            />
-          )}
-          <button
-            onClick={onScan}
-            disabled={isLoading}
-            className="flex items-center gap-1.5 rounded px-3 py-1.5 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-50"
-            style={{
-              background: "#22d3ee",
-              color: "#0a0a0a",
-              border: "none",
-            }}
-            onMouseEnter={(e) =>
-              ((e.currentTarget as HTMLButtonElement).style.filter = "brightness(1.1)")
-            }
-            onMouseLeave={(e) =>
-              ((e.currentTarget as HTMLButtonElement).style.filter = "")
-            }
-            aria-disabled={isLoading}
-          >
-            <PlusIcon />
-            {isLoading && !loadProgress ? "Scanning..." : "Scan"}
-          </button>
-        </div>
-
-        <Divider />
-
-        {/* ── Search + filters ── */}
-        <div className="flex flex-wrap items-center gap-2 px-3 py-2.5">
-          <label className="relative min-w-[220px] flex-1">
-            <span
-              className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2"
-              style={{ color: "var(--text-2)" }}
-            >
-              <SearchIcon />
-            </span>
-            <input
-              type="text"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search name, family, or quant..."
-              className="w-full rounded py-1.5 pl-8 pr-3 text-sm outline-none transition"
-              style={{
-                background: "var(--surface-2)",
-                border: "1px solid var(--border)",
-                color: "var(--text-0)",
-              }}
-              onFocus={(e) =>
-                ((e.currentTarget as HTMLInputElement).style.borderColor =
-                  "rgba(34,211,238,0.35)")
-              }
-              onBlur={(e) =>
-                ((e.currentTarget as HTMLInputElement).style.borderColor =
-                  "var(--border)")
-              }
-            />
-          </label>
-
-          <div className="flex items-center gap-1">
+    <div className="flex h-full min-h-0 overflow-hidden" style={{ background: "var(--bg)" }}>
+      <aside className="hidden w-[172px] shrink-0 border-r md:block" style={{ borderColor: "var(--border)", background: "var(--surface-1)" }}>
+        <div className="px-4 py-4">
+          <div className="text-sm font-semibold" style={{ color: "var(--text-0)" }}>My Models</div>
+          <div className="mt-4 space-y-1">
             {FILTERS.map((key) => (
               <button
                 key={key}
-                // onClick moved below to avoid duplicate
-                className="rounded px-2.5 py-1 text-xs font-medium uppercase tracking-wider transition"
+                onClick={() => setFilter(key)}
+                className="flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-sm transition"
                 style={{
-                  background: filter === key ? "rgba(34,211,238,0.12)" : "transparent",
-                  border:
-                    filter === key
-                      ? "1px solid rgba(34,211,238,0.25)"
-                      : "1px solid transparent",
-                  color: filter === key ? "#22d3ee" : "var(--text-1)",
-                  cursor: isLoading ? "not-allowed" : "pointer",
-                  opacity: isLoading ? 0.5 : 1,
-                }}
-                onClick={() => { if (!isLoading) setFilter(key); }}
-                disabled={isLoading}
-                aria-disabled={isLoading}
-                onMouseEnter={(e) => {
-                  if (!isLoading && filter !== key) {
-                    (e.currentTarget as HTMLButtonElement).style.color =
-                      "var(--text-0)";
-                  }
-                }}
-                onMouseLeave={(e) => {
-                  if (!isLoading && filter !== key) {
-                    (e.currentTarget as HTMLButtonElement).style.color =
-                      "var(--text-1)";
-                  }
+                  background: filter === key ? "rgba(99,102,241,0.55)" : "transparent",
+                  color: filter === key ? "#fff" : "var(--text-1)",
+                  border: "none",
+                  cursor: "pointer",
                 }}
               >
-                {key}
+                <span>{key === "all" ? "View All" : key[0].toUpperCase() + key.slice(1)}</span>
+                <span className="text-[10px]" style={{ opacity: 0.72 }}>
+                  {key === "all"
+                    ? models.length
+                    : key === "loaded"
+                      ? activeModel ? 1 : 0
+                      : models.filter((m) =>
+                          key === "reasoning" ? m.supports_reasoning :
+                          key === "tools" ? m.supports_tools :
+                          key === "vision" ? m.supports_vision : true
+                        ).length}
+                </span>
               </button>
             ))}
           </div>
+        </div>
+        <div className="absolute bottom-0 hidden w-[172px] border-t px-4 py-3 text-xs md:block" style={{ borderColor: "var(--border)", color: "var(--text-2)" }}>
+          {models.length} local models<br />
+          {localDiskGb.toFixed(2)} GB on disk
+        </div>
+      </aside>
 
-          <span className="ml-auto text-xs" style={{ color: "var(--text-2)" }}>
-            {filteredModels.length} / {models.length}
-            {processStatus?.backend && (
-              <> {" | "} <span style={{ color: "#22d3ee" }}>{processStatus.backend}</span></>
-            )}
-          </span>
+      <section className="flex min-w-0 flex-1 flex-col border-r" style={{ borderColor: "var(--border)" }}>
+        <div className="flex h-11 shrink-0 items-center gap-2 border-b px-4" style={{ borderColor: "var(--border)", background: "var(--surface-1)" }}>
+          <h2 className="text-sm font-semibold" style={{ color: "var(--text-0)" }}>My Models</h2>
+          <div className="ml-auto flex min-w-0 items-center gap-2">
+            <label className="relative w-[360px] max-w-[45vw]">
+              <span className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2" style={{ color: "var(--text-2)" }}>
+                <SearchIcon />
+              </span>
+              <input
+                type="text"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Filter models... (Ctrl + F)"
+                className="w-full rounded-md py-1.5 pl-8 pr-3 text-sm outline-none transition"
+                style={{ background: "var(--surface-2)", border: "1px solid var(--border-mid)", color: "var(--text-0)" }}
+              />
+            </label>
+            <ToolBtn onClick={onOpenSettings} icon={<GearIcon />} label="Settings" />
+            <button
+              onClick={onScan}
+              disabled={isLoading}
+              className="flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-50"
+              style={{ background: "#22d3ee", color: "#0a0a0a", border: "none" }}
+            >
+              <PlusIcon />
+              {isLoading && !loadProgress ? "Scanning..." : "Scan"}
+            </button>
+          </div>
         </div>
 
-        {/* ── Error ── */}
-        {error && (
-          <>
-            <Divider />
-            <div
-              className="px-3 py-2.5 text-sm"
-              style={{
-                background: "rgba(239,68,68,0.08)",
-                color: "#fca5a5",
-              }}
-            >
-              {error}
-            </div>
-          </>
+        {(error || loadProgress) && (
+          <div className="shrink-0 border-b" style={{ borderColor: "var(--border)" }}>
+            {error && <div className="px-4 py-2 text-sm" style={{ background: "rgba(239,68,68,0.08)", color: "#fca5a5" }}>{error}</div>}
+            {loadProgress && !loadProgress.done && <LoadingBar progress={loadProgress} />}
+            {loadProgress?.error && <div className="px-4 py-2 text-sm" style={{ background: "rgba(239,68,68,0.08)", color: "#fca5a5" }}>{loadProgress.error}</div>}
+          </div>
         )}
 
-        {/* ── Load progress ── */}
-        {loadProgress && !loadProgress.done && (
-          <>
-            <Divider />
-            <LoadingBar progress={loadProgress} />
-          </>
-        )}
-        {loadProgress?.error && (
-          <>
-            <Divider />
-            <div
-              className="px-3 py-2.5 text-sm"
-              style={{ background: "rgba(239,68,68,0.08)", color: "#fca5a5" }}
-            >
-              {loadProgress.error}
-            </div>
-          </>
-        )}
+        <div className="grid h-9 shrink-0 grid-cols-[120px_110px_minmax(220px,1fr)_130px_88px_116px] items-center border-b px-5 text-[11px] font-semibold" style={{ borderColor: "var(--border)", color: "var(--text-1)", background: "var(--surface-1)" }}>
+          <span>Arch</span>
+          <span>Params</span>
+          <span>LLM</span>
+          <span>Provider</span>
+          <span>Quant</span>
+          <span className="text-right">Actions</span>
+        </div>
 
-        {/* ── Loaded model ── */}
-        {activeModel && (
-          <>
-            <Divider />
-            <LoadedModelRow
-              model={activeModel}
-              previousModel={previousModel}
-              processStatus={processStatus}
-              onUnload={onUnload}
-              onSwapBack={() => onSwap()}
-              isLoading={isLoading}
-            />
-          </>
-        )}
-
-        {/* ── Model list ── */}
-        {models.length === 0 ? (
-          <>
-            <Divider />
-            <EmptyMsg
-              title="No models discovered yet"
-              body="Set model directories in Settings then scan to populate the library."
-            />
-          </>
-        ) : filter === "loaded" && !activeModel ? (
-          <>
-            <Divider />
-            <EmptyMsg
-              title="No model loaded"
-              body="Load a model to see it here."
-            />
-          </>
-        ) : filteredModels.length === 0 ? (
-          <>
-            <Divider />
-            <EmptyMsg
-              title="No matches"
-              body="Clear the search or change the capability filter."
-            />
-          </>
-        ) : modelCards.length > 0 ? (
-          <>
-            <Divider />
-            {modelCards.map((m, i) => (
-              <ModelRow
-                key={m.path}
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {models.length === 0 ? (
+            <EmptyMsg title="No models discovered yet" body="Set model directories in Settings then scan to populate the library." />
+          ) : filter === "loaded" && !activeModel ? (
+            <EmptyMsg title="No model loaded" body="Load a model to see it here." />
+          ) : filteredModels.length === 0 ? (
+            <EmptyMsg title="No matches" body="Clear the search or change the capability filter." />
+          ) : (
+            filteredModels.map((m) => (
+              <DenseModelRow
+                key={m.path || m.filename}
                 model={m}
+                selected={selectedModel?.path === m.path}
+                loaded={m.filename === loadedModel}
                 isLoading={isLoading}
                 showSwap={!!loadedModel && m.filename !== loadedModel}
-                isLast={i === modelCards.length - 1}
-                onLoad={(options) => onLoad(m.filename, options)}
-                onSwap={(options) => onSwap(m.filename, options)}
+                onSelect={() => setSelectedPath(m.path)}
+                onLoad={() => onLoad(m.filename)}
+                onSwap={() => onSwap(m.filename)}
               />
-            ))}
-          </>
-        ) : null}
-      </Panel>
+            ))
+          )}
+        </div>
+
+        <div className="flex h-9 shrink-0 items-center border-t px-5 text-xs" style={{ borderColor: "var(--border)", color: "var(--text-1)", background: "var(--surface-1)" }}>
+          You have {models.length} local models, taking up {localDiskGb.toFixed(2)} GB of disk space
+          <span className="ml-auto truncate font-mono text-[11px]" style={{ color: "var(--text-1)" }}>{serverUrl}</span>
+        </div>
+      </section>
+
+      <aside className="flex w-[360px] shrink-0 flex-col" style={{ background: "var(--surface-1)" }}>
+        <div className="border-b px-4 py-3" style={{ borderColor: "var(--border)" }}>
+          <div className="flex items-center gap-2">
+            <StatusPill state={state} />
+            <button
+              onClick={() => onSetApiServerRunning(!apiRunning)}
+              className="ml-auto flex items-center gap-2 rounded-md px-3 py-1.5 text-xs transition"
+              style={{ background: "var(--surface-2)", color: "var(--text-0)", border: "1px solid var(--border)" }}
+            >
+              <span>Serve</span>
+              <span style={{ color: apiRunning ? "#34d399" : "var(--text-1)", fontWeight: 600 }}>{apiRunning ? apiState : "Off"}</span>
+            </button>
+            <ToolBtn onClick={handleCopyUrl} icon={<CopyIcon />} label={copied ? "Copied!" : "URL"} />
+          </div>
+          {gpuStats && (
+            <div className="mt-3">
+              <VramBar usedMb={gpuStats.used_mb} dedicatedMb={gpuStats.dedicated_mb} systemRamMb={gpuStats.system_ram_mb} mode="current" />
+            </div>
+          )}
+        </div>
+
+        <ModelInspector
+          model={selectedModel}
+          loadedModel={loadedModel}
+          previousModel={previousModel}
+          processStatus={processStatus}
+          isLoading={isLoading}
+          onLoad={(modelName) => onLoad(modelName)}
+          onSwap={(modelName) => onSwap(modelName)}
+          onUnload={onUnload}
+          onSwapBack={() => onSwap()}
+        />
+      </aside>
+    </div>
+  );
+
+}
+
+// â”€â”€â”€ Status pill â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+function modelParamsLabel(model: ModelInfo) {
+  const text = `${model.filename} ${model.hf_repo ?? ""}`.toLowerCase();
+  const match = text.match(/(\d+(?:\.\d+)?)\s*(b|m)\b/);
+  return match ? `${match[1]}${match[2].toUpperCase()}` : "-";
+}
+
+function modelPublisher(model: ModelInfo) {
+  if (model.hf_repo?.includes("/")) return model.hf_repo.split("/")[0];
+  if (model.provider_name) return model.provider_name;
+  return "local";
+}
+
+function shortModelName(model: ModelInfo) {
+  return model.hf_repo ?? model.filename.replace(/\.gguf$/i, "");
+}
+
+function DenseModelRow({
+  model,
+  selected,
+  loaded,
+  isLoading,
+  showSwap,
+  onSelect,
+  onLoad,
+  onSwap,
+}: {
+  model: ModelInfo;
+  selected: boolean;
+  loaded: boolean;
+  isLoading: boolean;
+  showSwap: boolean;
+  onSelect: () => void;
+  onLoad: () => void;
+  onSwap: () => void;
+}) {
+  return (
+    <div
+      onClick={onSelect}
+      className="grid min-h-[45px] grid-cols-[120px_110px_minmax(220px,1fr)_130px_88px_116px] items-center border-b px-5 text-xs transition"
+      style={{
+        borderColor: "var(--border)",
+        background: selected ? "rgba(79,70,229,0.58)" : loaded ? "rgba(34,211,238,0.08)" : "transparent",
+        color: selected ? "#fff" : "var(--text-1)",
+        cursor: "pointer",
+      }}
+    >
+      <div className="min-w-0">
+        <span className="rounded px-1.5 py-0.5 font-mono text-[10px]" style={{ border: "1px solid rgba(255,255,255,0.22)", color: selected ? "#fff" : "var(--text-0)" }}>
+          {model.family || model.gguf_architecture || "gguf"}
+        </span>
+      </div>
+      <div>
+        <span className="rounded px-1.5 py-0.5 font-mono text-[10px]" style={{ border: "1px solid var(--border)", color: selected ? "#fff" : "var(--text-0)" }}>
+          {modelParamsLabel(model)}
+        </span>
+      </div>
+      <div className="min-w-0">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="truncate font-mono text-xs font-semibold" style={{ color: selected ? "#fff" : "var(--text-0)" }}>
+            {shortModelName(model)}
+          </span>
+          {loaded && <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-400" />}
+        </div>
+        <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+          {model.supports_reasoning && <MiniCap label="Reasoning" tone="#facc15" />}
+          {model.supports_tools && <MiniCap label="Tools" tone="#34d399" />}
+          {model.supports_vision && <MiniCap label="Vision" tone="#c4b5fd" />}
+          {formatContext(model.context_window, model.max_context_window) && <span className="text-[10px]" style={{ color: selected ? "rgba(255,255,255,0.72)" : "var(--text-2)" }}>{formatContext(model.context_window, model.max_context_window)}</span>}
+        </div>
+      </div>
+      <span className="truncate font-mono text-[11px]" title={modelPublisher(model)}>{modelPublisher(model)}</span>
+      <span className="font-mono text-[11px]" style={{ color: selected ? "#fff" : "#fbbf24" }}>{model.quant ?? "-"}</span>
+      <div className="flex justify-end gap-1.5">
+        {model.supports_tools && <IconPill title="Tool capable">âŒ˜</IconPill>}
+        {model.supports_vision && <IconPill title="Vision capable">â—‰</IconPill>}
+        <button
+          onClick={(e) => { e.stopPropagation(); showSwap ? onSwap() : onLoad(); }}
+          disabled={isLoading || !model.provider_managed || loaded}
+          className="rounded-md px-2 py-1 text-[11px] font-semibold disabled:opacity-45"
+          style={{ background: selected ? "rgba(255,255,255,0.16)" : "#22d3ee", color: selected ? "#fff" : "#061014", border: "none" }}
+        >
+          {loaded ? "Loaded" : showSwap ? "Swap" : "Load"}
+        </button>
+      </div>
     </div>
   );
 }
 
-// ─── Status pill ────────────────────────────────────────────────────────────
+function ModelInspector({
+  model,
+  loadedModel,
+  previousModel,
+  processStatus,
+  isLoading,
+  onLoad,
+  onSwap,
+  onUnload,
+  onSwapBack,
+}: {
+  model: ModelInfo | null;
+  loadedModel: string | null;
+  previousModel: string | null;
+  processStatus: ProcessStatusInfo | null;
+  isLoading: boolean;
+  onLoad: (modelName: string) => void;
+  onSwap: (modelName: string) => void;
+  onUnload: () => void;
+  onSwapBack: () => void;
+}) {
+  if (!model) {
+    return <EmptyMsg title="No model selected" body="Select a model to inspect details and launch controls." />;
+  }
+
+  const loaded = model.filename === loadedModel;
+  const liveContext =
+    processStatus?.model === model.filename ? processStatus.last_launch_preview?.context_size ?? null : null;
+
+  return (
+    <div className="min-h-0 flex-1 overflow-y-auto">
+      <div className="border-b px-4 py-4" style={{ borderColor: "var(--border)" }}>
+        <div className="flex items-start gap-2">
+          <div className="min-w-0 flex-1">
+            <h3 className="truncate text-base font-semibold" style={{ color: "var(--text-0)" }}>{shortModelName(model)}</h3>
+            <p className="mt-1 truncate font-mono text-xs" style={{ color: "var(--text-1)" }}>{model.filename}</p>
+          </div>
+          {loaded && <span className="rounded px-2 py-0.5 text-[10px] font-bold uppercase" style={{ background: "rgba(52,211,153,0.14)", color: "#6ee7b7", border: "1px solid rgba(52,211,153,0.28)" }}>Loaded</span>}
+        </div>
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          <ActionBtn label={loaded ? "Unload Model" : "Load Model"} disabled={isLoading || !model.provider_managed} variant={loaded ? "ghost" : "primary"} onClick={() => loaded ? onUnload() : onLoad(model.filename)} />
+          <ActionBtn label="Swap In" disabled={isLoading || loaded || !loadedModel || !model.provider_managed} variant="indigo" onClick={() => onSwap(model.filename)} />
+          {previousModel && previousModel !== model.filename && (
+            <button
+              onClick={onSwapBack}
+              disabled={isLoading}
+              className="col-span-2 rounded-md px-3 py-1.5 text-xs font-semibold"
+              style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}
+            >
+              Swap back to {previousModel}
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="border-b px-4 py-3" style={{ borderColor: "var(--border)" }}>
+        <div className="flex rounded-md p-0.5" style={{ background: "var(--surface-2)" }}>
+          {["Info", "Load", "Inference"].map((tab) => (
+            <button key={tab} className="flex-1 rounded px-2 py-1.5 text-xs font-semibold" style={{ background: tab === "Info" ? "var(--surface-3)" : "transparent", color: tab === "Info" ? "var(--text-0)" : "var(--text-1)", border: "none" }}>{tab}</button>
+          ))}
+        </div>
+      </div>
+
+      <section className="px-4 py-4">
+        <h4 className="mb-3 text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--text-0)" }}>Model Information</h4>
+        <InfoRow label="Model" value={shortModelName(model)} />
+        <InfoRow label="File" value={model.filename} />
+        <InfoRow label="Format" value={model.provider_managed ? "GGUF" : "OpenAI-compatible"} />
+        <InfoRow label="Quantization" value={model.quant ?? "-"} />
+        <InfoRow label="Arch" value={model.family || model.gguf_architecture || "-"} />
+        <InfoRow label="Params" value={modelParamsLabel(model)} />
+        <InfoRow label="Capabilities" value={[
+          model.supports_vision ? "Vision" : null,
+          model.supports_tools ? "Tool use" : null,
+          model.supports_reasoning ? "Reasoning" : null,
+        ].filter(Boolean).join(", ") || "Chat"} />
+        <InfoRow label="Context" value={liveContext ? `${fmtNum(liveContext)} live` : model.max_context_window ? `${fmtNum(model.max_context_window)} tokens` : "-"} />
+        <InfoRow label="Size on disk" value={model.size_gb ? `${model.size_gb.toFixed(2)} GB` : "-"} />
+        <InfoRow label="Provider" value={model.provider_name} />
+      </section>
+    </div>
+  );
+}
+
+function InfoRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex items-center gap-3 border-b py-2 text-xs last:border-b-0" style={{ borderColor: "var(--border)" }}>
+      <span className="w-24 shrink-0" style={{ color: "var(--text-0)" }}>{label}</span>
+      <span className="min-w-0 truncate rounded-full px-2 py-0.5 font-mono text-[11px]" title={value} style={{ background: "var(--surface-3)", color: "var(--text-1)" }}>{value}</span>
+    </div>
+  );
+}
+
+function MiniCap({ label, tone }: { label: string; tone: string }) {
+  return <span className="rounded px-1.5 py-0.5 text-[9px] font-semibold" style={{ color: tone, border: `1px solid ${tone}55`, background: `${tone}18` }}>{label}</span>;
+}
+
+function IconPill({ title, children }: { title: string; children: ReactNode }) {
+  return <span title={title} className="flex h-6 w-6 items-center justify-center rounded-md text-[11px]" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}>{children}</span>;
+}
 
 function StatusPill({ state }: { state: string }) {
   const isRunning = state === "Running";
@@ -715,7 +810,7 @@ function StatusPill({ state }: { state: string }) {
   );
 }
 
-// ─── Tool button ─────────────────────────────────────────────────────────────
+// â”€â”€â”€ Tool button â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function ToolBtn({
   label,
@@ -752,7 +847,7 @@ function ToolBtn({
   );
 }
 
-// ─── Loading bar ─────────────────────────────────────────────────────────────
+// â”€â”€â”€ Loading bar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function LoadingBar({ progress }: { progress: LoadProgress }) {
   const pct = Math.round(progress.progress * 100);
@@ -811,7 +906,7 @@ function LoadingBar({ progress }: { progress: LoadProgress }) {
   );
 }
 
-// ─── Loaded model row ─────────────────────────────────────────────────────────
+// â”€â”€â”€ Loaded model row â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function LoadedModelRow({
   model,
@@ -962,7 +1057,7 @@ function LoadedModelRow({
   );
 }
 
-// ─── Model row ───────────────────────────────────────────────────────────────
+// â”€â”€â”€ Model row â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function ModelRow({
   model,
@@ -1075,8 +1170,8 @@ function ModelRow({
   const gpuStats = useGpuStats();
 
   // KV-cache bytes per token using architecture metadata from GGUF.
-  // Default cache type is q8_0 (1 byte/element) — matches ProcessConfig default.
-  // Formula: n_layers × 2 (K+V) × n_kv_heads × head_dim × bytes_per_element
+  // Default cache type is q8_0 (1 byte/element) â€” matches ProcessConfig default.
+  // Formula: n_layers Ã— 2 (K+V) Ã— n_kv_heads Ã— head_dim Ã— bytes_per_element
   const KV_BPE = 1.0; // q8_0
   const kvBytesPerToken: number | null =
     model.n_layers != null && model.n_kv_heads != null && model.head_dim != null
@@ -1085,11 +1180,22 @@ function ModelRow({
 
   function estimateContextVRAM(tokens: number): number {
     const modelMb = (model.size_gb || 0) * 1024;
+    const graphOverheadMb = Math.max(512, Math.min(2048, modelMb * 0.08));
     if (kvBytesPerToken != null) {
-      return modelMb + (tokens * kvBytesPerToken) / (1024 * 1024);
+      const kvMb = (tokens * kvBytesPerToken) / (1024 * 1024);
+      return modelMb + graphOverheadMb + kvMb * 1.15;
     }
-    // Fallback when GGUF metadata unavailable (external providers, unparseable files)
-    return modelMb + (tokens * 2) / 1024;
+    // Fallback when GGUF metadata is unavailable. llama.cpp still allocates
+    // sizeable KV/cache/graph buffers; using a tiny bytes-per-token fallback
+    // under-reports large-context Gemma/Qwen loads by several GB.
+    const name = `${model.filename} ${model.family ?? ""}`.toLowerCase();
+    const fallbackKvMbPerToken =
+      name.includes("gemma-4-26b") || name.includes("a4b")
+        ? 0.04
+        : modelMb > 10 * 1024
+          ? 0.035
+          : 0.025;
+    return modelMb + graphOverheadMb + tokens * fallbackKvMbPerToken;
   }
 
 
@@ -1259,7 +1365,12 @@ function ModelRow({
             {/* VRAM/overflow monitor as slider bar */}
             {gpuStats && (
               <div className="mt-2">
-                <VramBar usedMb={estimateContextVRAM(contextSize)} dedicatedMb={gpuStats.dedicated_mb} systemRamMb={gpuStats.system_ram_mb} />
+                <VramBar
+                  usedMb={estimateContextVRAM(contextSize)}
+                  dedicatedMb={gpuStats.dedicated_mb}
+                  systemRamMb={gpuStats.system_ram_mb}
+                  mode="estimate"
+                />
               </div>
             )}
           </div>}
@@ -1268,8 +1379,8 @@ function ModelRow({
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
             <StatTile label="File Size" value={model.size_gb && model.size_gb > 0 ? `${model.size_gb.toFixed(2)} GB` : 'N/A'} />
             <StatTile label="Provider" value={model.provider_name} />
-            <StatTile label="Default Context" value={model.context_window ? `${fmtNum(model.context_window)} tokens` : '—'} />
-            <StatTile label="Max Context" value={model.max_context_window ? `${fmtNum(model.max_context_window)} tokens` : '—'} />
+            <StatTile label="Default Context" value={model.context_window ? `${fmtNum(model.context_window)} tokens` : 'â€”'} />
+            <StatTile label="Max Context" value={model.max_context_window ? `${fmtNum(model.max_context_window)} tokens` : 'â€”'} />
             <StatTile label="Tool Format" value={fmtToolFormat(model.tool_call_format)} />
           </div>
           {(!isExternalProvider && (!model.size_gb || model.size_gb === 0)) && (
@@ -1482,7 +1593,7 @@ function ModelRow({
   );
 }
 
-// ─── Empty state ──────────────────────────────────────────────────────────────
+// â”€â”€â”€ Empty state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function EmptyMsg({ title, body }: { title: string; body: string }) {
   return (
@@ -1497,7 +1608,7 @@ function EmptyMsg({ title, body }: { title: string; body: string }) {
   );
 }
 
-// ─── Stat tile ────────────────────────────────────────────────────────────────
+// â”€â”€â”€ Stat tile â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function StatTile({ label, value }: { label: string; value: string }) {
   return (
@@ -1518,7 +1629,7 @@ function StatTile({ label, value }: { label: string; value: string }) {
   );
 }
 
-// ─── Capability badge ─────────────────────────────────────────────────────────
+// â”€â”€â”€ Capability badge â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function CapBadge({ label, tone }: { label: string; tone: "amber" | "emerald" | "rose" | "cyan" | "violet" | "slate" }) {
   const colors: Record<string, [string, string]> = {
@@ -1548,7 +1659,7 @@ function CapBadge({ label, tone }: { label: string; tone: "amber" | "emerald" | 
   );
 }
 
-// ─── Action button ────────────────────────────────────────────────────────────
+// â”€â”€â”€ Action button â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function ProviderBadge({ providerName, managed }: { providerName: string; managed: boolean }) {
   return (
@@ -1622,7 +1733,7 @@ function ActionBtn({
   );
 }
 
-// ─── Icons ────────────────────────────────────────────────────────────────────
+// â”€â”€â”€ Icons â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 function GearIcon() {
   return (
@@ -1658,3 +1769,5 @@ function SearchIcon() {
     </svg>
   );
 }
+
+void [Panel, Divider, LoadedModelRow, ModelRow];

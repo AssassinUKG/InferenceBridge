@@ -138,7 +138,7 @@ fn shared_http_client() -> reqwest::Client {
     SHARED_HTTP_CLIENT
         .get_or_init(|| {
             reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(300))
+                .connect_timeout(std::time::Duration::from_secs(10))
                 .pool_max_idle_per_host(8)
                 .build()
                 .unwrap_or_default()
@@ -186,6 +186,23 @@ impl LlamaClient {
             anyhow::bail!("llama-server returned {status}: {body}");
         }
         Ok(resp)
+    }
+
+    /// Send an OpenAI-compatible chat completion request.
+    ///
+    /// Current llama.cpp multimodal support is most reliable through
+    /// `/v1/chat/completions` with content parts (`text` + `image_url`), while
+    /// the legacy `/completion` image_data path can leave literal `[img-N]`
+    /// markers in the prompt on newer libmtmd builds.
+    pub async fn chat_completion(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        let resp = self.client.post(&url).json(request).send().await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("llama-server returned {status}: {body}");
+        }
+        Ok(resp.json().await?)
     }
 
     /// Query slot information for context/KV monitoring.

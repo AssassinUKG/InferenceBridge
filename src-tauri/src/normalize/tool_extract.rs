@@ -96,6 +96,8 @@ fn remove_empty_tool_wrappers(text: &mut String) {
     *text = text
         .replace("<tool_call>", "")
         .replace("</tool_call>", "")
+        .replace("<|channel>thought", "")
+        .replace("<channel|>", "")
         .trim()
         .to_string();
 }
@@ -143,6 +145,16 @@ pub fn extract_tool_calls_for_profile(
                 }
             }
         }
+        ParserType::Gemma4StateMachine => {
+            extract_gemma4_native_calls(&mut remaining, &mut calls);
+            if calls.is_empty() && profile.allow_fallback_extraction {
+                extract_json_tool_objects(&mut remaining, &mut calls);
+            }
+            if calls.is_empty() && profile.allow_fallback_extraction {
+                extract_hermes_calls(&mut remaining, &mut calls);
+                extract_plain_tool_call_expressions(&mut remaining, &mut calls);
+            }
+        }
         ParserType::HermesFallback => {
             extract_hermes_calls(&mut remaining, &mut calls);
             if calls.is_empty() && profile.allow_fallback_extraction {
@@ -169,6 +181,11 @@ pub fn extract_tool_calls_for_profile(
                 if calls.is_empty() {
                     extract_json_tool_objects(&mut remaining, &mut calls);
                 }
+            } else if extract_json_tool_objects(&mut remaining, &mut calls) {
+                tracing::info!(
+                    "native-api safety-net: content-only JSON tool call detected - \
+                    check chat_format/template support on llama-server"
+                );
             }
         }
     }
@@ -312,25 +329,28 @@ fn extract_json_tool_fences(text: &mut String, calls: &mut Vec<ToolCall>) -> boo
             .strip_prefix("json")
             .unwrap_or(body.trim_start())
             .trim_start();
-        let Some(rel_brace) = body.find('{') else {
+        let Some(rel_brace) = body.find('{').or_else(|| body.find('[')) else {
             break;
         };
-        let Some(json_len) = balanced_json_object_len(&body[rel_brace..]) else {
+        let Some(json_len) = balanced_json_value_len(&body[rel_brace..]) else {
             break;
         };
         let json_str = &body[rel_brace..rel_brace + json_len];
         let Some(value) = super::json_repair::repair_json(json_str) else {
             break;
         };
-        let Some((name, arguments)) = infer_bare_tool_call(value) else {
+        let inferred = infer_bare_tool_calls(value);
+        if inferred.is_empty() {
             break;
-        };
-        calls.push(ToolCall {
-            id: uuid::Uuid::new_v4().to_string(),
-            name,
-            arguments,
-            raw_text: Some(text[fence_start..fence_end].to_string()),
-        });
+        }
+        for (name, arguments) in inferred {
+            calls.push(ToolCall {
+                id: uuid::Uuid::new_v4().to_string(),
+                name,
+                arguments,
+                raw_text: Some(text[fence_start..fence_end].to_string()),
+            });
+        }
         *text = format!("{}{}", &text[..fence_start], &text[fence_end..]);
         found_any = true;
     }
@@ -340,23 +360,26 @@ fn extract_json_tool_fences(text: &mut String, calls: &mut Vec<ToolCall>) -> boo
 fn extract_standalone_json_tool_object(text: &mut String, calls: &mut Vec<ToolCall>) -> bool {
     let trimmed_start = text.trim_start();
     let leading = text.len() - trimmed_start.len();
-    let Some(json_len) = balanced_json_object_len(trimmed_start) else {
+    let Some(json_len) = balanced_json_value_len(trimmed_start) else {
         return false;
     };
     let json_str = &trimmed_start[..json_len];
     let Some(value) = super::json_repair::repair_json(json_str) else {
         return false;
     };
-    let Some((name, arguments)) = infer_bare_tool_call(value) else {
+    let inferred = infer_bare_tool_calls(value);
+    if inferred.is_empty() {
         return false;
-    };
+    }
     let remove_end = leading + json_len;
-    calls.push(ToolCall {
-        id: uuid::Uuid::new_v4().to_string(),
-        name,
-        arguments,
-        raw_text: Some(text[leading..remove_end].to_string()),
-    });
+    for (name, arguments) in inferred {
+        calls.push(ToolCall {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            arguments,
+            raw_text: Some(text[leading..remove_end].to_string()),
+        });
+    }
     *text = format!("{}{}", &text[..leading], &text[remove_end..]);
     true
 }
@@ -503,6 +526,127 @@ fn extract_qwen_function_calls(text: &mut String, calls: &mut Vec<ToolCall>) {
     *text = new_text;
 }
 
+fn extract_gemma4_native_calls(text: &mut String, calls: &mut Vec<ToolCall>) -> bool {
+    let mut found_any = false;
+    loop {
+        let Some(start) = text
+            .find("<|tool_call>")
+            .or_else(|| text.find("<tool_call>"))
+        else {
+            break;
+        };
+        let open_len = if text[start..].starts_with("<|tool_call>") {
+            "<|tool_call>".len()
+        } else {
+            "<tool_call>".len()
+        };
+        let body_start = start + open_len;
+        let close_rel = text[body_start..]
+            .find("<tool_call|>")
+            .or_else(|| text[body_start..].find("</tool_call>"));
+        let body_end = close_rel.map(|rel| body_start + rel).unwrap_or(text.len());
+        let close_end = close_rel
+            .map(|rel| {
+                let close_start = body_start + rel;
+                if text[close_start..].starts_with("<tool_call|>") {
+                    close_start + "<tool_call|>".len()
+                } else {
+                    close_start + "</tool_call>".len()
+                }
+            })
+            .unwrap_or(body_end);
+        let body = text[body_start..body_end].trim();
+        let Some((name, arguments)) = parse_gemma4_native_body(body) else {
+            *text = format!("{}{}", &text[..start], &text[close_end..]);
+            found_any = true;
+            continue;
+        };
+        calls.push(ToolCall {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            arguments,
+            raw_text: Some(text[start..close_end].to_string()),
+        });
+        *text = format!("{}{}", &text[..start], &text[close_end..]);
+        found_any = true;
+    }
+    found_any
+}
+
+fn parse_gemma4_native_body(body: &str) -> Option<(String, serde_json::Value)> {
+    let rest = body.trim().strip_prefix("call:")?;
+    let brace_start = rest.find('{')?;
+    let name = rest[..brace_start].trim();
+    if name.is_empty() {
+        return None;
+    }
+    let args_text = &rest[brace_start..];
+    let args_len = balanced_gemma4_brace_len(args_text)?;
+    let args = parse_gemma4_argument_object(&args_text[..args_len]);
+    Some((name.to_string(), serde_json::Value::Object(args)))
+}
+
+fn balanced_gemma4_brace_len(text: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_quote = false;
+    let mut escaped = false;
+    for (idx, ch) in text.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_quote && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_quote = !in_quote;
+            continue;
+        }
+        if in_quote {
+            continue;
+        }
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_gemma4_argument_object(text: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut args = serde_json::Map::new();
+    let inner = text.trim().trim_start_matches('{').trim_end_matches('}');
+    for part in split_top_level_commas(inner) {
+        let Some((key, value)) = part.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().trim_matches(|ch| ch == '"' || ch == '\'');
+        if key.is_empty() {
+            continue;
+        }
+        args.insert(key.to_string(), parse_gemma4_argument_value(value));
+    }
+    args
+}
+
+fn parse_gemma4_argument_value(text: &str) -> serde_json::Value {
+    let trimmed = text.trim().trim_end_matches(',');
+    if let Some(value) = trimmed
+        .strip_prefix("<|\"|>")
+        .and_then(|value| value.strip_suffix("<|\"|>"))
+    {
+        return serde_json::Value::String(value.to_string());
+    }
+    parse_call_expression_value(trimmed)
+}
+
 fn trim_xml_line_padding(value: &str) -> &str {
     value.trim_matches(|ch| ch == '\r' || ch == '\n')
 }
@@ -532,6 +676,41 @@ fn balanced_json_object_len(text: &str) -> Option<usize> {
             b'}' if !in_string => {
                 depth -= 1;
                 if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn balanced_json_value_len(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let first = *bytes.first()?;
+    let closing = match first {
+        b'{' => b'}',
+        b'[' => b']',
+        _ => return None,
+    };
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if b == b'\\' && in_string {
+            escaped = true;
+            continue;
+        }
+        match b {
+            b'"' => in_string = !in_string,
+            b'{' | b'[' if !in_string => depth += 1,
+            b'}' | b']' if !in_string => {
+                depth -= 1;
+                if b == closing && depth == 0 {
                     return Some(i + 1);
                 }
             }
@@ -674,6 +853,22 @@ fn extract_bare_tool_call_json(text: &mut String, calls: &mut Vec<ToolCall>) -> 
 }
 
 fn infer_bare_tool_call(value: serde_json::Value) -> Option<(String, serde_json::Value)> {
+    if value.get("type").and_then(|value| value.as_str()) == Some("function") {
+        if let Some(function) = value.get("function").and_then(|value| value.as_object()) {
+            let name = function
+                .get("name")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let arguments = function
+                .get("arguments")
+                .or_else(|| function.get("parameters"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+            return Some((name.to_string(), arguments));
+        }
+    }
+
     if let Some(name) = value
         .get("name")
         .or_else(|| value.get("tool"))
@@ -725,6 +920,15 @@ fn infer_bare_tool_call(value: serde_json::Value) -> Option<(String, serde_json:
     }?;
 
     Some((inferred_name.to_string(), serde_json::Value::Object(args)))
+}
+
+fn infer_bare_tool_calls(value: serde_json::Value) -> Vec<(String, serde_json::Value)> {
+    match value {
+        serde_json::Value::Array(items) => {
+            items.into_iter().filter_map(infer_bare_tool_call).collect()
+        }
+        other => infer_bare_tool_call(other).into_iter().collect(),
+    }
 }
 
 fn looks_like_glob_pattern(value: &str) -> bool {
@@ -1001,6 +1205,76 @@ Done."#;
         assert_eq!(calls[0].name, "glob");
         assert_eq!(calls[0].arguments["pattern"], "**/*.go");
         assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn native_api_safety_net_parses_content_only_openai_tool_array() {
+        let mut profile = qwen_profile();
+        profile.parser_type = ParserType::NativeApi;
+        profile.tool_call_format = ToolCallFormat::NativeApi;
+        profile.renderer_type = RendererType::GemmaChat;
+        profile.think_tag_style = ThinkTagStyle::None;
+        profile.allow_fallback_extraction = false;
+
+        let text = r#"<|channel>thought
+<channel|>```json
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "read_file",
+      "parameters": {
+        "path": "package.json"
+      }
+    }
+  }
+]
+```"#;
+        let (calls, remaining) = extract_tool_calls_for_profile(text, &profile);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "package.json");
+        assert!(remaining.is_empty(), "remaining={remaining:?}");
+    }
+
+    #[test]
+    fn gemma4_profile_extracts_native_tool_call() {
+        let profile = ModelProfile::detect("google/gemma-4-12B-it");
+        let text = r#"<|channel>thought
+<channel|><|tool_call>call:web_search{query:<|"|>Gemma 4 12B tool calling<|"|>,limit:3}<tool_call|>"#;
+
+        let (calls, remaining) = extract_tool_calls_for_profile(text, &profile);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "web_search");
+        assert_eq!(calls[0].arguments["query"], "Gemma 4 12B tool calling");
+        assert_eq!(calls[0].arguments["limit"], 3.0);
+        assert!(!remaining.contains("tool_call"));
+    }
+
+    #[test]
+    fn gemma4_profile_extracts_plain_quoted_native_tool_call() {
+        let profile = ModelProfile::detect("gemma-4-26B-A4B-it-QAT-Q4_0.gguf");
+        let text = r#"<|tool_call>call:noop{status: "success"}<tool_call|>"#;
+
+        let (calls, remaining) = extract_tool_calls_for_profile(text, &profile);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "noop");
+        assert_eq!(calls[0].arguments["status"], "success");
+        assert!(remaining.trim().is_empty(), "remaining={remaining:?}");
+    }
+
+    #[test]
+    fn gemma4_profile_suppresses_malformed_native_tool_blob() {
+        let profile = ModelProfile::detect("gemma-4-26B-A4B-it-QAT-Q4_0.gguf");
+        let text = r#"<|channel>thought
+<channel|><|tool_call><|tool_call>callcall::todotodo__createcreate{{itemsitems:[:[<|"|><|"|>InspectInspect project project structure structure<|"|><|"|>]}}"#;
+
+        let (calls, remaining) = extract_tool_calls_for_profile(text, &profile);
+
+        assert!(calls.is_empty());
+        assert!(remaining.trim().is_empty(), "remaining={remaining:?}");
     }
 
     #[test]

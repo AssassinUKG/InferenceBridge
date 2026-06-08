@@ -69,9 +69,20 @@ async fn emit_parsed_content(
     parser_buffer: &mut String,
     in_think: &mut bool,
     hidden_tool_close: &mut Option<&'static str>,
+    hit_generation_boundary: &mut bool,
 ) {
-    const OPEN_TAGS: [&str; 2] = ["<think>", "<|think|>"];
-    const CLOSE_TAGS: [&str; 2] = ["</think>", "<|/think|>"];
+    const OPEN_TAGS: [&str; 3] = ["<think>", "<|think|>", "<|channel>thought"];
+    const CLOSE_TAGS: [&str; 3] = ["</think>", "<|/think|>", "<channel|>"];
+    const BOUNDARY_TAGS: [&str; 8] = [
+        "<turn|>",
+        "<|turn>",
+        "<end_of_turn>",
+        "<start_of_turn>",
+        "<|im_end|>",
+        "<|im_start|>",
+        "<|eot_id|>",
+        "<|start_header_id|>",
+    ];
     const TOOL_OPEN_TAGS: [(&str, Option<&str>); 3] = [
         ("<tool_call>", Some("</tool_call>")),
         ("<div class=\"tool_code\">", Some("</div>")),
@@ -79,7 +90,10 @@ async fn emit_parsed_content(
     ];
 
     loop {
-        if let Some(close_tag) = hidden_tool_close {
+        if *hit_generation_boundary {
+            parser_buffer.clear();
+            break;
+        } else if let Some(close_tag) = hidden_tool_close {
             if let Some(close_idx) = parser_buffer.find(*close_tag) {
                 let drain_len = close_idx + close_tag.len();
                 parser_buffer.drain(..drain_len);
@@ -127,10 +141,26 @@ async fn emit_parsed_content(
                 .iter()
                 .filter_map(|tag| parser_buffer.find(tag).map(|idx| (idx, *tag)))
                 .min_by_key(|(idx, _)| *idx);
+            let next_boundary = BOUNDARY_TAGS
+                .iter()
+                .filter_map(|tag| parser_buffer.find(tag).map(|idx| (idx, *tag)))
+                .min_by_key(|(idx, _)| *idx);
             let next_tool_open = TOOL_OPEN_TAGS
                 .iter()
                 .filter_map(|(tag, close)| parser_buffer.find(tag).map(|idx| (idx, *tag, *close)))
                 .min_by_key(|(idx, _, _)| *idx);
+
+            if let Some((boundary_idx, _)) = next_boundary {
+                if boundary_idx > 0 {
+                    let visible = parser_buffer[..boundary_idx].to_string();
+                    if !visible.is_empty() {
+                        let _ = tx.send(StreamEvent::Token(visible)).await;
+                    }
+                }
+                parser_buffer.clear();
+                *hit_generation_boundary = true;
+                break;
+            }
 
             if let Some((close_idx, close_tag)) = next_close {
                 let open_idx = next_open.map(|(idx, _)| idx);
@@ -195,6 +225,7 @@ async fn emit_parsed_content(
                 &[
                     OPEN_TAGS.as_slice(),
                     CLOSE_TAGS.as_slice(),
+                    BOUNDARY_TAGS.as_slice(),
                     tool_open_tags.as_slice(),
                 ]
                 .concat(),
@@ -216,7 +247,7 @@ pub async fn consume_sse_stream(
     tx: mpsc::Sender<StreamEvent>,
     cancel: CancellationToken,
 ) -> anyhow::Result<String> {
-    consume_sse_stream_with_timeouts(response, tx, cancel, 300, 120).await
+    consume_sse_stream_with_timeouts(response, tx, cancel, 900, 300).await
 }
 
 pub async fn consume_sse_stream_with_timeouts(
@@ -232,6 +263,7 @@ pub async fn consume_sse_stream_with_timeouts(
     let mut parser_buffer = String::new();
     let mut in_think = false;
     let mut hidden_tool_close: Option<&'static str> = None;
+    let mut hit_generation_boundary = false;
     let mut tokens_predicted: u32 = 0;
     let mut tokens_evaluated: u32 = 0;
     let mut decode_tokens_per_second: f64 = 0.0;
@@ -345,6 +377,7 @@ pub async fn consume_sse_stream_with_timeouts(
                                     &mut parser_buffer,
                                     &mut in_think,
                                     &mut hidden_tool_close,
+                                    &mut hit_generation_boundary,
                                 )
                                 .await;
                             }
@@ -369,17 +402,14 @@ pub async fn consume_sse_stream_with_timeouts(
                             }
 
                             if !parser_buffer.is_empty() {
-                                if hidden_tool_close.is_some() {
-                                    parser_buffer.clear();
-                                } else if in_think {
-                                    let _ = tx
-                                        .send(StreamEvent::ReasoningDelta(parser_buffer.clone()))
-                                        .await;
-                                } else {
-                                    let _ =
-                                        tx.send(StreamEvent::Token(parser_buffer.clone())).await;
-                                }
-                                parser_buffer.clear();
+                                emit_parsed_content(
+                                    &tx,
+                                    &mut parser_buffer,
+                                    &mut in_think,
+                                    &mut hidden_tool_close,
+                                    &mut hit_generation_boundary,
+                                )
+                                .await;
                             }
 
                             let _ = tx
@@ -403,15 +433,14 @@ pub async fn consume_sse_stream_with_timeouts(
     }
 
     if !parser_buffer.is_empty() {
-        if hidden_tool_close.is_some() {
-            parser_buffer.clear();
-        } else if in_think {
-            let _ = tx
-                .send(StreamEvent::ReasoningDelta(parser_buffer.clone()))
-                .await;
-        } else {
-            let _ = tx.send(StreamEvent::Token(parser_buffer.clone())).await;
-        }
+        emit_parsed_content(
+            &tx,
+            &mut parser_buffer,
+            &mut in_think,
+            &mut hidden_tool_close,
+            &mut hit_generation_boundary,
+        )
+        .await;
     }
 
     if full_text.is_empty() {
@@ -456,12 +485,14 @@ mod tests {
         let mut parser_buffer = "scratch notes</think>Final answer".to_string();
         let mut in_think = false;
         let mut hidden_tool_close = None;
+        let mut hit_generation_boundary = false;
 
         emit_parsed_content(
             &tx,
             &mut parser_buffer,
             &mut in_think,
             &mut hidden_tool_close,
+            &mut hit_generation_boundary,
         )
         .await;
         drop(tx);
@@ -483,12 +514,14 @@ mod tests {
             "Let me check.\n<tool_call>_.glob(dir=\".\",pattern=\"**/*\")".to_string();
         let mut in_think = false;
         let mut hidden_tool_close = None;
+        let mut hit_generation_boundary = false;
 
         emit_parsed_content(
             &tx,
             &mut parser_buffer,
             &mut in_think,
             &mut hidden_tool_close,
+            &mut hit_generation_boundary,
         )
         .await;
         drop(tx);
@@ -499,5 +532,61 @@ mod tests {
         }
         assert!(rx.recv().await.is_none());
         assert_eq!(hidden_tool_close, Some("</tool_call>"));
+    }
+
+    #[tokio::test]
+    async fn parsed_content_routes_gemma_channel_markers_to_reasoning() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut parser_buffer =
+            "<|channel>thought\nprivate notes\n<channel|>Final answer".to_string();
+        let mut in_think = false;
+        let mut hidden_tool_close = None;
+        let mut hit_generation_boundary = false;
+
+        emit_parsed_content(
+            &tx,
+            &mut parser_buffer,
+            &mut in_think,
+            &mut hidden_tool_close,
+            &mut hit_generation_boundary,
+        )
+        .await;
+        drop(tx);
+
+        match rx.recv().await {
+            Some(StreamEvent::ReasoningDelta(text)) => assert_eq!(text, "\nprivate notes\n"),
+            other => panic!("expected reasoning delta, got {other:?}"),
+        }
+        match rx.recv().await {
+            Some(StreamEvent::Token(text)) => assert_eq!(text, "Final answer"),
+            other => panic!("expected visible token, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parsed_content_truncates_at_gemma_turn_boundary() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut parser_buffer =
+            "Final answer.<turn|><|turn>user\nignore this continuation".to_string();
+        let mut in_think = false;
+        let mut hidden_tool_close = None;
+        let mut hit_generation_boundary = false;
+
+        emit_parsed_content(
+            &tx,
+            &mut parser_buffer,
+            &mut in_think,
+            &mut hidden_tool_close,
+            &mut hit_generation_boundary,
+        )
+        .await;
+        drop(tx);
+
+        match rx.recv().await {
+            Some(StreamEvent::Token(text)) => assert_eq!(text, "Final answer."),
+            other => panic!("expected visible answer before boundary, got {other:?}"),
+        }
+        assert!(hit_generation_boundary);
+        assert!(rx.recv().await.is_none());
     }
 }

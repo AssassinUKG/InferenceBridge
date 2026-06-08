@@ -78,7 +78,8 @@ function sameProcessStatus(
     a.api_port_owner?.pid === b.api_port_owner?.pid &&
     a.api_port_owner?.killable === b.api_port_owner?.killable &&
     a.last_launch_preview?.context_size === b.last_launch_preview?.context_size &&
-    a.last_launch_preview?.model_path === b.last_launch_preview?.model_path
+    a.last_launch_preview?.model_path === b.last_launch_preview?.model_path &&
+    a.last_launch_preview?.mmproj_path === b.last_launch_preview?.mmproj_path
   );
 }
 

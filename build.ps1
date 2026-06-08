@@ -6,7 +6,9 @@ param(
 
     [switch]$CleanInstall,
 
-    [switch]$KeepRunning
+    [switch]$KeepRunning,
+
+    [switch]$Run
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,7 +30,7 @@ function Run($Command, [string[]]$Arguments) {
 
 function Stop-RunningReleaseBinary {
     if ($KeepRunning) {
-        return
+        return $false
     }
 
     $releaseExe = Join-Path $PSScriptRoot "src-tauri\target\release\inference-bridge.exe"
@@ -40,7 +42,9 @@ function Stop-RunningReleaseBinary {
             $_.CommandLine.ToLowerInvariant().Contains($releaseExeLower)
         }
 
+    $wasRunning = $false
     if ($locked) {
+        $wasRunning = $true
         Step "Stopping running release binary before build"
         foreach ($proc in $locked) {
             Write-Host "    stopping inference-bridge.exe pid=$($proc.ProcessId)" -ForegroundColor DarkGray
@@ -52,6 +56,7 @@ function Stop-RunningReleaseBinary {
     # The managed llama-server is usually a child/runtime companion of the bridge.
     # Stop it too so a fresh post-build launch does not keep stale model/runtime args.
     Get-Process llama-server -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    return $wasRunning
 }
 
 if (-not $SkipInstall) {
@@ -86,7 +91,7 @@ switch ($Mode) {
     }
 
     "Release" {
-        Stop-RunningReleaseBinary
+        $wasRunning = Stop-RunningReleaseBinary
 
         Step "Building desktop release bundle"
         Run "npm.cmd" @("run", "tauri", "build")
@@ -94,5 +99,11 @@ switch ($Mode) {
         Write-Host ""
         Write-Host "InferenceBridge build complete." -ForegroundColor Green
         Write-Host "Installers and bundles are in: src-tauri\target\release\bundle" -ForegroundColor Green
+
+        if ($Run -or $wasRunning) {
+            $releaseExe = Join-Path $PSScriptRoot "src-tauri\target\release\inference-bridge.exe"
+            Step "Starting rebuilt release binary"
+            Start-Process -FilePath $releaseExe -WorkingDirectory $PSScriptRoot
+        }
     }
 }

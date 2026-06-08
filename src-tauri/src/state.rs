@@ -142,6 +142,7 @@ pub struct AppState {
     pub last_context_status: Option<ContextStatus>,
     pub last_generation_metrics: Option<RuntimePerformanceMetrics>,
     pub live_stream: Option<LiveStreamSnapshot>,
+    pub live_streams: Vec<LiveStreamSnapshot>,
     pub last_startup_duration_ms: Option<u64>,
     pub model_load_state: ModelLoadState,
     pub model_load_progress: Option<LoadProgress>,
@@ -179,6 +180,7 @@ impl AppState {
             last_context_status: None,
             last_generation_metrics: None,
             live_stream: None,
+            live_streams: Vec::new(),
             last_startup_duration_ms: None,
             model_load_state: ModelLoadState::Idle,
             model_load_progress: None,
@@ -219,7 +221,7 @@ pub async fn begin_api_generation(state: &SharedState, model: String) -> Generat
         .as_ref()
         .map(|generation| generation.model.clone())
         .unwrap_or_default();
-    s.live_stream = Some(LiveStreamSnapshot {
+    let snapshot = LiveStreamSnapshot {
         request_id: request_id.clone(),
         source: "api".to_string(),
         model,
@@ -229,8 +231,9 @@ pub async fn begin_api_generation(state: &SharedState, model: String) -> Generat
         visible_output: String::new(),
         reasoning_output: String::new(),
         events: Vec::new(),
-    });
-    if let (Some(handle), Some(snapshot)) = (s.app_handle.clone(), s.live_stream.clone()) {
+    };
+    push_live_stream_locked(&mut s, snapshot.clone());
+    if let Some(handle) = s.app_handle.clone() {
         let _ = handle.emit("llm-stream-start", snapshot);
     }
     GenerationHandle {
@@ -240,17 +243,48 @@ pub async fn begin_api_generation(state: &SharedState, model: String) -> Generat
 }
 
 pub async fn finish_api_generation(state: &SharedState, status: &str) {
+    let request_id = {
+        let s = state.read().await;
+        s.live_stream
+            .as_ref()
+            .map(|stream| stream.request_id.clone())
+            .or_else(|| {
+                s.active_generation
+                    .as_ref()
+                    .map(|generation| generation.id.clone())
+            })
+    };
+    if let Some(request_id) = request_id {
+        finish_api_generation_for_request(state, &request_id, status).await;
+    }
+}
+
+pub async fn finish_api_generation_for_request(
+    state: &SharedState,
+    request_id: &str,
+    status: &str,
+) {
     let mut s = state.write().await;
-    if let Some(active) = s.active_generation.as_mut() {
+    if let Some(active) = s
+        .active_generation
+        .as_mut()
+        .filter(|active| active.id == request_id)
+    {
         active.status = status.to_string();
     }
-    if let Some(stream) = s.live_stream.as_mut() {
+    let snapshot = update_live_stream_locked(&mut s, request_id, |stream| {
         stream.status = status.to_string();
-    }
-    if let (Some(handle), Some(snapshot)) = (s.app_handle.clone(), s.live_stream.clone()) {
+    });
+    if let (Some(handle), Some(snapshot)) = (s.app_handle.clone(), snapshot) {
         let _ = handle.emit("llm-stream-done", snapshot);
     }
-    s.active_generation = None;
+    if s.active_generation
+        .as_ref()
+        .map(|active| active.id == request_id)
+        .unwrap_or(false)
+    {
+        s.active_generation = None;
+    }
 }
 
 pub async fn begin_live_generation(
@@ -273,7 +307,7 @@ pub async fn begin_live_generation(
         started_at: started_at.clone(),
         status: "running".to_string(),
     });
-    s.live_stream = Some(LiveStreamSnapshot {
+    let snapshot = LiveStreamSnapshot {
         request_id: request_id.clone(),
         source: source.to_string(),
         model,
@@ -283,8 +317,9 @@ pub async fn begin_live_generation(
         visible_output: String::new(),
         reasoning_output: String::new(),
         events: Vec::new(),
-    });
-    if let (Some(handle), Some(snapshot)) = (s.app_handle.clone(), s.live_stream.clone()) {
+    };
+    push_live_stream_locked(&mut s, snapshot.clone());
+    if let Some(handle) = s.app_handle.clone() {
         let _ = handle.emit("llm-stream-start", snapshot);
     }
     GenerationHandle {
@@ -302,42 +337,66 @@ pub struct LiveStreamDelta {
 }
 
 pub async fn append_live_stream_delta(state: &SharedState, kind: &str, text: &str) {
+    let request_id = {
+        let s = state.read().await;
+        s.live_stream
+            .as_ref()
+            .map(|stream| stream.request_id.clone())
+            .or_else(|| {
+                s.active_generation
+                    .as_ref()
+                    .map(|generation| generation.id.clone())
+            })
+    };
+    if let Some(request_id) = request_id {
+        append_live_stream_delta_for_request(state, &request_id, kind, text).await;
+    }
+}
+
+pub async fn append_live_stream_delta_for_request(
+    state: &SharedState,
+    request_id: &str,
+    kind: &str,
+    text: &str,
+) {
     if text.is_empty() {
         return;
     }
 
     let (handle, delta) = {
         let mut s = state.write().await;
-        let Some(stream) = s.live_stream.as_mut() else {
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        let Some(delta) = update_live_stream_locked(&mut s, request_id, |stream| {
+            match kind {
+                "content" => {
+                    stream.visible_output.push_str(text);
+                }
+                "reasoning" => {
+                    stream.reasoning_output.push_str(text);
+                }
+                "raw" | "error" => {
+                    stream.raw_output.push_str(text);
+                }
+                "tool_call" => {}
+                _ => {
+                    stream.raw_output.push_str(text);
+                }
+            }
+            let event = LiveStreamEvent {
+                timestamp: timestamp.clone(),
+                kind: kind.to_string(),
+                text: text.to_string(),
+            };
+            stream.events.push(event);
+            if stream.events.len() > 500 {
+                let excess = stream.events.len() - 500;
+                stream.events.drain(0..excess);
+            }
+        }) else {
             return;
         };
-        let timestamp = chrono::Utc::now().to_rfc3339();
-        match kind {
-            "content" => {
-                stream.visible_output.push_str(text);
-            }
-            "reasoning" => {
-                stream.reasoning_output.push_str(text);
-            }
-            "tool_call" | "raw" | "error" => {
-                stream.raw_output.push_str(text);
-            }
-            _ => {
-                stream.raw_output.push_str(text);
-            }
-        }
-        let event = LiveStreamEvent {
-            timestamp: timestamp.clone(),
-            kind: kind.to_string(),
-            text: text.to_string(),
-        };
-        stream.events.push(event);
-        if stream.events.len() > 500 {
-            let excess = stream.events.len() - 500;
-            stream.events.drain(0..excess);
-        }
         let delta = LiveStreamDelta {
-            request_id: stream.request_id.clone(),
+            request_id: delta.request_id,
             timestamp,
             kind: kind.to_string(),
             text: text.to_string(),
@@ -348,6 +407,47 @@ pub async fn append_live_stream_delta(state: &SharedState, kind: &str, text: &st
     if let Some(handle) = handle {
         let _ = handle.emit("llm-stream-delta", delta);
     }
+}
+
+fn push_live_stream_locked(s: &mut AppState, snapshot: LiveStreamSnapshot) {
+    if let Some(existing) = s
+        .live_streams
+        .iter_mut()
+        .find(|stream| stream.request_id == snapshot.request_id)
+    {
+        *existing = snapshot.clone();
+    } else {
+        s.live_streams.push(snapshot.clone());
+        if s.live_streams.len() > 30 {
+            let excess = s.live_streams.len() - 30;
+            s.live_streams.drain(0..excess);
+        }
+    }
+    s.live_stream = Some(snapshot);
+}
+
+fn update_live_stream_locked<F>(
+    s: &mut AppState,
+    request_id: &str,
+    update: F,
+) -> Option<LiveStreamSnapshot>
+where
+    F: FnOnce(&mut LiveStreamSnapshot),
+{
+    let index = s
+        .live_streams
+        .iter()
+        .position(|stream| stream.request_id == request_id)?;
+    update(&mut s.live_streams[index]);
+    let snapshot = s.live_streams[index].clone();
+    if s.live_stream
+        .as_ref()
+        .map(|stream| stream.request_id == request_id)
+        .unwrap_or(false)
+    {
+        s.live_stream = Some(snapshot.clone());
+    }
+    Some(snapshot)
 }
 
 pub fn summarize_reasoning_tokens(

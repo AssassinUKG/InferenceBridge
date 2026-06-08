@@ -146,14 +146,17 @@ pub async fn load_model(
 
     let s = state.read().await;
     let loaded_name = s.loaded_model.clone().unwrap_or_else(|| model_name.clone());
-    // Use the requested context directly — that's what we told llama-server.
-    // Fall back to model_stats only when no explicit context was requested.
-    let actual_ctx = context_size.unwrap_or_else(|| {
-        s.model_stats
-            .as_ref()
-            .map(|st| st.context_size)
-            .unwrap_or(0)
-    });
+    let actual_ctx = s
+        .model_stats
+        .as_ref()
+        .map(|st| st.context_size)
+        .or_else(|| {
+            s.last_launch_preview
+                .as_ref()
+                .and_then(|preview| preview.context_size)
+        })
+        .or(context_size)
+        .unwrap_or(0);
 
     Ok(Json(LoadModelResponse {
         model_type: "llm".to_string(),

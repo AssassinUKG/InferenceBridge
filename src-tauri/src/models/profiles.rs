@@ -9,6 +9,7 @@ pub enum ModelFamily {
     Llama3,
     Phi,
     Mistral,
+    Gemma4,
     Gemma,
     Generic,
 }
@@ -18,6 +19,7 @@ pub enum ToolCallFormat {
     NativeApi,
     HermesXml,
     QwenXml,
+    Gemma4Native,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +34,7 @@ pub enum ParserType {
     NativeApi,
     HermesFallback,
     QwenStateMachine,
+    Gemma4StateMachine,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +43,7 @@ pub enum RendererType {
     QwenChat,
     Llama3Chat,
     GemmaChat,
+    Gemma4Chat,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +85,8 @@ impl ModelProfile {
             && (lower.contains("r1") || lower.contains("reasoning"))
         {
             Self::deepseek_r1()
+        } else if lower.contains("gemma-4") || lower.contains("gemma4") {
+            Self::gemma4()
         } else if lower.contains("gemma") {
             Self::gemma()
         } else if lower.contains("llama")
@@ -102,7 +108,7 @@ impl ModelProfile {
             Self::generic()
         };
 
-        profile.supports_vision = supports_vision;
+        profile.supports_vision = profile.supports_vision || supports_vision;
         profile
     }
 
@@ -346,6 +352,37 @@ impl ModelProfile {
         }
     }
 
+    fn gemma4() -> Self {
+        Self {
+            family: ModelFamily::Gemma4,
+            tool_call_format: ToolCallFormat::Gemma4Native,
+            think_tag_style: ThinkTagStyle::None,
+            interleaved_think_tool: true,
+            supports_parallel_tools: false,
+            supports_vision: true,
+            default_max_output_tokens: Some(8192),
+            default_context_window: None, // let llama-server use model metadata
+            max_context_window: Some(262144),
+            parser_type: ParserType::Gemma4StateMachine,
+            renderer_type: RendererType::Gemma4Chat,
+            stop_markers: vec![
+                "<turn|>".into(),
+                "<|turn>".into(),
+                "<end_of_turn>".into(),
+                "<start_of_turn>".into(),
+                "<tool_call|>".into(),
+            ],
+            allow_fallback_extraction: true,
+            default_presence_penalty: Some(0.0),
+            default_temperature: Some(0.7),
+            default_top_p: Some(0.9),
+            default_top_k: Some(40),
+            default_min_p: Some(0.0),
+            disable_thinking_for_tools: true,
+            split_tool_calling: false,
+        }
+    }
+
     fn generic() -> Self {
         Self {
             family: ModelFamily::Generic,
@@ -399,6 +436,7 @@ impl std::fmt::Display for ModelFamily {
             Self::Llama3 => write!(f, "Llama3"),
             Self::Phi => write!(f, "Phi"),
             Self::Mistral => write!(f, "Mistral"),
+            Self::Gemma4 => write!(f, "Gemma4"),
             Self::Gemma => write!(f, "Gemma"),
             Self::Generic => write!(f, "Generic"),
         }
@@ -422,6 +460,17 @@ mod tests {
         let profile = ModelProfile::detect("gemma-3-12b-it-q4_k_m.gguf");
         assert_eq!(profile.family, ModelFamily::Gemma);
         assert_eq!(profile.renderer_type, RendererType::GemmaChat);
+    }
+
+    #[test]
+    fn detect_gemma4_12b() {
+        let profile = ModelProfile::detect("google/gemma-4-12B-it");
+        assert_eq!(profile.family, ModelFamily::Gemma4);
+        assert_eq!(profile.renderer_type, RendererType::Gemma4Chat);
+        assert_eq!(profile.parser_type, ParserType::Gemma4StateMachine);
+        assert_eq!(profile.tool_call_format, ToolCallFormat::Gemma4Native);
+        assert!(profile.supports_vision);
+        assert_eq!(profile.max_context_window, Some(262144));
     }
 
     #[test]

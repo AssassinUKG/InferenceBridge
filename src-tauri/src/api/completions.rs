@@ -1,4 +1,5 @@
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use serde::{Deserialize, Serialize};
@@ -6,7 +7,9 @@ use std::collections::HashMap;
 
 use crate::api::errors::ApiErrorResponse;
 use crate::commands::model::RuntimeLoadOverrides;
-use crate::engine::client::{CompletionRequest, ImageData, LlamaClient};
+use crate::engine::client::{
+    CompletionRequest, CompletionResponse, ImageData, LlamaClient, Timings,
+};
 use crate::engine::process::{LaunchPreview, ProcessState};
 use crate::engine::streaming::{self, StreamEvent};
 use crate::models::profiles::{ModelProfile, ToolCallFormat};
@@ -15,7 +18,7 @@ use crate::normalize::think_strip::{
     extract_reasoning_content_with_style, strip_think_tags_with_style,
 };
 use crate::state::{
-    append_live_stream_delta, begin_api_generation, finish_api_generation,
+    append_live_stream_delta_for_request, begin_api_generation, finish_api_generation_for_request,
     summarize_reasoning_tokens, SharedState,
 };
 
@@ -144,6 +147,20 @@ impl ChatCompletionRequest {
     fn requested_top_k(&self) -> Option<i32> {
         self.top_k
             .or_else(|| self.top.as_ref().and_then(TopParam::as_top_k))
+    }
+
+    fn requested_thinking_disabled(&self) -> bool {
+        ["enable_thinking", "enableThinking", "thinking"]
+            .iter()
+            .filter_map(|key| self.extra.get(*key))
+            .any(|value| matches!(value, serde_json::Value::Bool(false)))
+            || self
+                .reasoning
+                .as_ref()
+                .and_then(|cfg| cfg.effort.as_deref())
+                .or(self.reasoning_effort.as_deref())
+                .map(|effort| effort.eq_ignore_ascii_case("none"))
+                .unwrap_or(false)
     }
 }
 
@@ -697,7 +714,7 @@ fn context_request_matches_preview(
     requested_context_size.map_or(true, |requested| {
         preview
             .and_then(|preview| preview.context_size)
-            .map_or(false, |current| current == requested)
+            .map_or(false, |current| current >= requested)
     })
 }
 
@@ -745,6 +762,79 @@ async fn publish_live_generation_metrics(
             elapsed_ms,
         ),
     });
+}
+
+async fn completion_failure_diagnostics(
+    state: &SharedState,
+    model_name: &str,
+    error: &anyhow::Error,
+) -> String {
+    let (port, loaded_model, loaded_ctx, launch_ctx, active_generation, stderr_lines) = {
+        let s = state.read().await;
+        (
+            s.process.port(),
+            s.loaded_model.clone(),
+            s.model_stats.as_ref().map(|stats| stats.context_size),
+            s.last_launch_preview
+                .as_ref()
+                .and_then(|preview| preview.context_size),
+            s.active_generation
+                .as_ref()
+                .map(|generation| generation.status.clone()),
+            s.process.last_stderr().await,
+        )
+    };
+
+    let client = LlamaClient::new(port);
+    let health = match client.health().await {
+        Ok(ok) => ok.to_string(),
+        Err(err) => format!("error: {err}"),
+    };
+    let slots = match client.get_slots().await {
+        Ok(slots) => {
+            let first = slots.first().map(|slot| {
+                let decoded = slot.next_token.as_ref().map(|token| token.n_decoded);
+                format!(
+                    "id={} n_ctx={} is_processing={} n_past={} decoded={:?}",
+                    slot.id, slot.n_ctx, slot.is_processing, slot.n_past, decoded
+                )
+            });
+            format!(
+                "ok count={} first={}",
+                slots.len(),
+                first.unwrap_or_else(|| "none".to_string())
+            )
+        }
+        Err(err) => format!("error: {err}"),
+    };
+    let props = match client.get_props().await {
+        Ok(props) => {
+            let n_ctx = props
+                .default_generation_settings
+                .as_ref()
+                .and_then(|settings| settings.n_ctx);
+            format!(
+                "ok n_ctx={:?} total_slots={:?} build_info={:?}",
+                n_ctx, props.total_slots, props.build_info
+            )
+        }
+        Err(err) => format!("error: {err}"),
+    };
+    let stderr_tail = stderr_lines
+        .iter()
+        .rev()
+        .take(8)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    format!(
+        "request_error={error}; model={model_name}; loaded_model={:?}; port={port}; loaded_ctx={:?}; launch_ctx={:?}; active_generation={:?}; health={health}; slots={slots}; props={props}; stderr_tail={}",
+        loaded_model, loaded_ctx, launch_ctx, active_generation, stderr_tail
+    )
 }
 
 async fn swap_model_for_api(
@@ -967,6 +1057,7 @@ fn render_tool_call_history(
 
     match format {
         ToolCallFormat::QwenXml => Some(render_qwen_tool_call(name, &arguments)),
+        ToolCallFormat::Gemma4Native => Some(render_gemma4_tool_call(name, &arguments)),
         ToolCallFormat::HermesXml | ToolCallFormat::NativeApi => {
             let value = serde_json::json!({
                 "name": name,
@@ -1008,6 +1099,32 @@ fn render_qwen_tool_call(name: &str, arguments: &serde_json::Value) -> String {
     out
 }
 
+fn render_gemma4_tool_call(name: &str, arguments: &serde_json::Value) -> String {
+    let mut out = format!("<|tool_call>call:{}", escape_qwen_xml_attr(name));
+    out.push('{');
+    if let serde_json::Value::Object(map) = arguments {
+        let mut first = true;
+        for (key, value) in map {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            out.push_str(key);
+            out.push(':');
+            out.push_str(&gemma4_argument_to_text(value));
+        }
+    }
+    out.push_str("}<tool_call|>");
+    out
+}
+
+fn gemma4_argument_to_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => format!("<|\"|>{}<|\"|>", text),
+        other => serde_json::to_string(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
 fn tool_argument_to_text(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(text) => text.clone(),
@@ -1037,6 +1154,7 @@ fn render_tool_response_history(
 
     match profile.tool_call_format {
         ToolCallFormat::QwenXml => format!("<tool_response>\n{}\n</tool_response>", body.trim()),
+        ToolCallFormat::Gemma4Native => format!("<|tool_response>{}<tool_response|>", body.trim()),
         ToolCallFormat::HermesXml | ToolCallFormat::NativeApi => body.trim().to_string(),
     }
 }
@@ -1075,6 +1193,9 @@ fn prepend_tool_schema_message(
         }
         ToolCallFormat::HermesXml => {
             "If a tool is needed, reply with exactly one Hermes XML tool call and no prose:\n<tool_call>{\"name\":\"TOOL_NAME\",\"arguments\":{\"PARAM_NAME\":\"VALUE\"}}</tool_call>"
+        }
+        ToolCallFormat::Gemma4Native => {
+            "If a tool is needed, reply with exactly one Gemma 4 native tool call and no prose:\n<|tool_call>call:TOOL_NAME{PARAM_NAME:<|\"|>VALUE<|\"|>}<tool_call|>"
         }
         ToolCallFormat::NativeApi => {
             "If a tool is needed, reply using the tool-calling format appropriate for your model family."
@@ -1125,6 +1246,20 @@ fn coerce_tool_arg_value(value: &mut serde_json::Value, schema: &serde_json::Val
                 _ => {}
             }
         }
+        serde_json::Value::String(text) if tool_schema_type_matches(schema_type, "array") => {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+                if parsed.is_array() {
+                    *value = parsed;
+                }
+            }
+        }
+        serde_json::Value::String(text) if tool_schema_type_matches(schema_type, "object") => {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text.trim()) {
+                if parsed.is_object() {
+                    *value = parsed;
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -1135,21 +1270,19 @@ fn coerce_tool_arguments_for_schema(
     tools: Option<&Vec<serde_json::Value>>,
 ) -> serde_json::Value {
     let mut repaired = arguments.clone();
-    let Some(properties) = tools
-        .and_then(|tools| {
-            tools.iter().find_map(|tool| {
-                let function = tool.get("function").unwrap_or(tool);
-                let name = function.get("name")?.as_str()?;
-                if name != tool_name {
-                    return None;
-                }
-                function
-                    .get("parameters")
-                    .and_then(|params| params.get("properties"))
-                    .and_then(|props| props.as_object())
-            })
+    let Some(properties) = tools.and_then(|tools| {
+        tools.iter().find_map(|tool| {
+            let function = tool.get("function").unwrap_or(tool);
+            let name = function.get("name")?.as_str()?;
+            if name != tool_name {
+                return None;
+            }
+            function
+                .get("parameters")
+                .and_then(|params| params.get("properties"))
+                .and_then(|props| props.as_object())
         })
-    else {
+    }) else {
         return repaired;
     };
 
@@ -1172,7 +1305,9 @@ fn tool_parameters_for_name<'a>(
         tools.iter().find_map(|tool| {
             let function = tool.get("function").unwrap_or(tool);
             let name = function.get("name")?.as_str()?;
-            (name == tool_name).then(|| function.get("parameters")).flatten()
+            (name == tool_name)
+                .then(|| function.get("parameters"))
+                .flatten()
         })
     })
 }
@@ -1190,7 +1325,10 @@ fn validate_tool_arguments(
     };
 
     let mut errors = Vec::new();
-    if let Some(required) = parameters.get("required").and_then(|value| value.as_array()) {
+    if let Some(required) = parameters
+        .get("required")
+        .and_then(|value| value.as_array())
+    {
         for name in required.iter().filter_map(|value| value.as_str()) {
             if !args.contains_key(name) {
                 errors.push(format!("missing required field `{name}`"));
@@ -1198,7 +1336,10 @@ fn validate_tool_arguments(
         }
     }
 
-    if let Some(properties) = parameters.get("properties").and_then(|value| value.as_object()) {
+    if let Some(properties) = parameters
+        .get("properties")
+        .and_then(|value| value.as_object())
+    {
         for (name, value) in args {
             let Some(schema) = properties.get(name) else {
                 continue;
@@ -1216,6 +1357,14 @@ fn validate_tool_arguments(
                     "field `{name}` has wrong type for schema `{}`",
                     serde_json::to_string(schema_type).unwrap_or_default()
                 ));
+            }
+            if let Some(enum_values) = schema.get("enum").and_then(|value| value.as_array()) {
+                if !enum_values.iter().any(|allowed| allowed == value) {
+                    errors.push(format!(
+                        "field `{name}` must be one of {}",
+                        serde_json::to_string(enum_values).unwrap_or_default()
+                    ));
+                }
             }
         }
     }
@@ -1256,20 +1405,18 @@ fn extract_first_json_object(text: &str) -> Option<serde_json::Value> {
     None
 }
 
-async fn repair_tool_arguments_once(
-    client: &LlamaClient,
+fn build_tool_argument_repair_request(
     profile: &ModelProfile,
     tool_name: &str,
+    schema: &serde_json::Value,
     arguments: &serde_json::Value,
-    tools: Option<&Vec<serde_json::Value>>,
     errors: &[String],
-) -> Option<serde_json::Value> {
-    let schema = tool_parameters_for_name(tool_name, tools)?;
+) -> CompletionRequest {
     let prompt = crate::templates::engine::render_prompt(
         &[
             crate::templates::engine::ChatMessage {
                 role: "system".to_string(),
-                content: "Repair tool-call JSON arguments. Return only one valid JSON object. Do not call the tool, explain, or wrap in Markdown.".to_string(),
+                content: "Repair tool-call JSON arguments. Return exactly one valid JSON object and nothing else. Do not call tools, explain, add Markdown, or include hidden reasoning.".to_string(),
             },
             crate::templates::engine::ChatMessage {
                 role: "user".to_string(),
@@ -1283,7 +1430,8 @@ async fn repair_tool_arguments_once(
         ],
         profile,
     );
-    let repair_request = CompletionRequest {
+
+    CompletionRequest {
         prompt,
         n_predict: Some(512),
         temperature: Some(0.0),
@@ -1299,7 +1447,20 @@ async fn repair_tool_arguments_once(
         special: true,
         image_data: vec![],
         grammar: None,
-    };
+    }
+}
+
+async fn repair_tool_arguments_once(
+    client: &LlamaClient,
+    profile: &ModelProfile,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    tools: Option<&Vec<serde_json::Value>>,
+    errors: &[String],
+) -> Option<serde_json::Value> {
+    let schema = tool_parameters_for_name(tool_name, tools)?;
+    let repair_request =
+        build_tool_argument_repair_request(profile, tool_name, schema, arguments, errors);
 
     let response = client.complete(&repair_request).await.ok()?;
     extract_first_json_object(&response.content)
@@ -1326,15 +1487,8 @@ async fn repaired_tool_arguments(
         return coerced;
     };
 
-    if let Some(repaired) = repair_tool_arguments_once(
-        client,
-        profile,
-        &tool_call.name,
-        &coerced,
-        tools,
-        &errors,
-    )
-    .await
+    if let Some(repaired) =
+        repair_tool_arguments_once(client, profile, &tool_call.name, &coerced, tools, &errors).await
     {
         let repaired = coerce_tool_arguments_for_schema(&tool_call.name, &repaired, tools);
         let repaired_errors = validate_tool_arguments(&tool_call.name, &repaired, tools);
@@ -1387,9 +1541,11 @@ pub(crate) async fn build_chat_request(
     profile: &ModelProfile,
     req: ChatCompletionRequest,
     server_defaults: (&Option<f32>, &Option<f32>, &Option<i32>, &Option<u32>),
+    context_limit: Option<u32>,
 ) -> Result<CompletionRequest, ApiErrorResponse> {
     let requested_top_p = req.requested_top_p();
     let requested_top_k = req.requested_top_k();
+    let thinking_disabled = req.requested_thinking_disabled();
     let (mut messages, image_data) = normalize_api_messages(&req.messages, profile).await?;
     prepend_tool_schema_message(&mut messages, profile, req.tools.as_ref());
     prepend_reasoning_guidance_message(
@@ -1398,7 +1554,14 @@ pub(crate) async fn build_chat_request(
         req.reasoning.as_ref(),
         req.reasoning_effort.as_deref(),
         req.reasoning_tokens,
+        thinking_disabled,
     );
+    let n_predict = req
+        .max_tokens
+        .or(profile.default_max_output_tokens)
+        .or(*server_defaults.3)
+        .map(|value| value as i32);
+    compact_messages_to_fit(&mut messages, profile, context_limit, n_predict);
 
     let mut stop = profile.stop_markers.clone();
     if let Some(user_stop) = req.stop {
@@ -1407,11 +1570,7 @@ pub(crate) async fn build_chat_request(
 
     Ok(CompletionRequest {
         prompt: crate::templates::engine::render_prompt(&messages, profile),
-        n_predict: req
-            .max_tokens
-            .or(profile.default_max_output_tokens)
-            .or(*server_defaults.3)
-            .map(|value| value as i32),
+        n_predict,
         temperature: req
             .temperature
             .or(profile.default_temperature)
@@ -1433,6 +1592,83 @@ pub(crate) async fn build_chat_request(
         image_data,
         grammar: None,
     })
+}
+
+fn compact_messages_to_fit(
+    messages: &mut Vec<crate::templates::engine::ChatMessage>,
+    profile: &ModelProfile,
+    context_limit: Option<u32>,
+    n_predict: Option<i32>,
+) {
+    let Some(context_limit) = context_limit.filter(|value| *value > 0) else {
+        return;
+    };
+    if messages.len() <= 2 {
+        return;
+    }
+
+    let output_reserve = n_predict
+        .filter(|value| *value > 0)
+        .map(|value| value as u32)
+        .unwrap_or(512)
+        .min(2048);
+    let budget = context_limit
+        .saturating_sub(output_reserve)
+        .max(context_limit / 2);
+    let mut removed = Vec::new();
+
+    while crate::normalize::think_strip::estimate_token_count(
+        &crate::templates::engine::render_prompt(messages, profile),
+    ) > budget
+        && messages.len() > 2
+    {
+        let pinned = messages
+            .iter()
+            .take_while(|message| message.role == "system")
+            .count()
+            .min(messages.len().saturating_sub(1));
+        let remove_index = if pinned < messages.len().saturating_sub(1) {
+            pinned
+        } else {
+            0
+        };
+        let removed_message = messages.remove(remove_index);
+        removed.push((removed_message.role, removed_message.content));
+    }
+
+    if !removed.is_empty() {
+        let summary = crate::context::compressor::compress_messages(&removed);
+        let insert_at = messages
+            .iter()
+            .take_while(|message| message.role == "system")
+            .count()
+            .min(messages.len());
+        messages.insert(
+            insert_at,
+            crate::templates::engine::ChatMessage {
+                role: "system".to_string(),
+                content: summary,
+            },
+        );
+    }
+
+    while crate::normalize::think_strip::estimate_token_count(
+        &crate::templates::engine::render_prompt(messages, profile),
+    ) > budget
+        && messages.len() > 2
+    {
+        let pinned = messages
+            .iter()
+            .take_while(|message| message.role == "system")
+            .count()
+            .min(messages.len().saturating_sub(1));
+        let remove_index = if pinned < messages.len().saturating_sub(1) {
+            pinned
+        } else {
+            0
+        };
+        messages.remove(remove_index);
+    }
 }
 
 fn launch_preview_matches_model(model_name: &str, preview_model_path: &str) -> bool {
@@ -1493,6 +1729,7 @@ fn prepend_reasoning_guidance_message(
     reasoning: Option<&ReasoningRequest>,
     reasoning_effort: Option<&str>,
     reasoning_tokens: Option<u32>,
+    thinking_disabled: bool,
 ) {
     let supports_reasoning = !matches!(
         profile.think_tag_style,
@@ -1506,11 +1743,20 @@ fn prepend_reasoning_guidance_message(
         .and_then(|cfg| cfg.max_tokens)
         .or(reasoning_tokens);
 
-    if !supports_reasoning && requested_effort.is_none() && requested_reasoning_tokens.is_none() {
+    if !supports_reasoning
+        && requested_effort.is_none()
+        && requested_reasoning_tokens.is_none()
+        && !thinking_disabled
+    {
         return;
     }
 
     let mut guidance = Vec::new();
+    if thinking_disabled {
+        guidance.push(
+            "Respond directly. Do not emit hidden reasoning, chain-of-thought, analysis/channel markers, or a 'Thinking process' section.".to_string(),
+        );
+    }
     match requested_effort.as_deref() {
         Some("none") => {
             guidance.push("Respond directly without emitting <think> blocks.".to_string())
@@ -1561,6 +1807,7 @@ fn build_usage(
 
 pub async fn chat_completions(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ApiErrorResponse> {
     if let Some(upstream) = crate::api::upstream::active_openai_provider(&state).await {
@@ -1572,6 +1819,9 @@ pub async fn chat_completions(
         .await;
     }
 
+    let original_request_body = body.clone();
+    let client_request_id =
+        crate::replay::preferred_client_correlation_id(&headers, &original_request_body);
     let req: ChatCompletionRequest = serde_json::from_value(body)
         .map_err(|error| ApiErrorResponse::bad_request(error.to_string()))?;
     let include_usage_details = req
@@ -1592,7 +1842,7 @@ pub async fn chat_completions(
     .await?;
     let profile = crate::models::overrides::detect_effective_profile(&model_name);
 
-    let (server_defaults, scheduler, llama_port) = {
+    let (server_defaults, scheduler, llama_port, context_limit) = {
         let s = state.read().await;
         (
             (
@@ -1603,6 +1853,15 @@ pub async fn chat_completions(
             ),
             s.request_scheduler.clone(),
             s.process.port(),
+            s.model_stats
+                .as_ref()
+                .map(|stats| stats.context_size)
+                .or_else(|| {
+                    s.last_launch_preview
+                        .as_ref()
+                        .and_then(|preview| preview.context_size)
+                })
+                .or(requested_context_size),
         )
     };
 
@@ -1615,6 +1874,7 @@ pub async fn chat_completions(
             &server_defaults.2,
             &server_defaults.3,
         ),
+        context_limit,
     )
     .await?;
 
@@ -1650,6 +1910,10 @@ pub async fn chat_completions(
             gen.cancel,
             include_usage_details,
             requested_tools,
+            client_request_id,
+            original_request_body,
+            llama_port,
+            context_limit,
         )
         .await;
     }
@@ -1657,36 +1921,76 @@ pub async fn chat_completions(
     let response = match client.complete(&request).await {
         Ok(response) => response,
         Err(e) => {
-            finish_api_generation(&state, "error").await;
-            tracing::error!(error = %e, "Completion failed");
-            return Err(ApiErrorResponse::inference_failed(&e.to_string()));
+            let diagnostics = completion_failure_diagnostics(&state, &model_name, &e).await;
+            finish_api_generation_for_request(&state, &request_id, "error").await;
+            tracing::error!(error = %e, diagnostics = %diagnostics, "Completion failed");
+            return Err(ApiErrorResponse::inference_failed(&diagnostics));
         }
     };
 
     let reasoning_text =
         extract_reasoning_content_with_style(&response.content, profile.think_tag_style);
     let stripped = strip_think_tags_with_style(&response.content, profile.think_tag_style);
+    let (tool_calls, text) =
+        crate::normalize::tool_extract::extract_tool_calls_for_profile(&stripped, &profile);
+    let content = if text.is_empty() {
+        None
+    } else {
+        Some(text.clone())
+    };
+    let mut api_tool_calls: Vec<serde_json::Value> = Vec::new();
+    for tool_call in &tool_calls {
+        api_tool_calls.push(
+            api_tool_call_value(
+                Some(&client),
+                &profile,
+                tool_call,
+                requested_tools.as_ref(),
+                None,
+            )
+            .await,
+        );
+    }
     if !response.content.is_empty() {
-        append_live_stream_delta(&state, "raw", &response.content).await;
+        append_live_stream_delta_for_request(&state, &request_id, "raw", &response.content).await;
     }
     if !reasoning_text.is_empty() {
-        append_live_stream_delta(&state, "reasoning", &reasoning_text).await;
+        append_live_stream_delta_for_request(&state, &request_id, "reasoning", &reasoning_text)
+            .await;
     }
-    if !stripped.is_empty() {
-        append_live_stream_delta(&state, "content", &stripped).await;
+    if !api_tool_calls.is_empty() {
+        append_live_stream_delta_for_request(
+            &state,
+            &request_id,
+            "tool_call",
+            &serde_json::to_string_pretty(&api_tool_calls).unwrap_or_default(),
+        )
+        .await;
     }
-    let reasoning_tokens =
-        summarize_reasoning_tokens(response.tokens_predicted, &stripped, &reasoning_text);
+    if let Some(text) = &content {
+        append_live_stream_delta_for_request(&state, &request_id, "content", text).await;
+    }
+    let reasoning_tokens = summarize_reasoning_tokens(
+        response.tokens_predicted,
+        content.as_deref().unwrap_or(""),
+        &reasoning_text,
+    );
+    let elapsed_ms = generation_started.elapsed().as_millis() as u64;
+    let end_to_end_tps = end_to_end_tokens_per_second(response.tokens_predicted, elapsed_ms);
     {
         let mut s = state.write().await;
-        s.last_parse_trace = Some(build_parse_trace(&profile, &response.content, &stripped));
+        s.last_parse_trace = Some(build_parse_trace(
+            &profile,
+            &response.content,
+            content.as_deref().unwrap_or(""),
+        ));
         s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
             source: "api".to_string(),
             model: model_name.clone(),
             request_id: request_id.clone(),
             started_at: generation_started_at,
             finished_at: chrono::Utc::now().to_rfc3339(),
-            elapsed_ms: generation_started.elapsed().as_millis() as u64,
+            elapsed_ms,
             time_to_first_token_ms: None,
             prompt_tokens: response.tokens_evaluated,
             completion_tokens: response.tokens_predicted,
@@ -1702,29 +2006,32 @@ pub async fn chat_completions(
                 .timings
                 .as_ref()
                 .and_then(|timings| timings.predicted_per_second),
-            end_to_end_tokens_per_second: end_to_end_tokens_per_second(
-                response.tokens_predicted,
-                generation_started.elapsed().as_millis() as u64,
-            ),
+            end_to_end_tokens_per_second: end_to_end_tps,
         });
     }
-    finish_api_generation(&state, "completed").await;
-    let (tool_calls, text) =
-        crate::normalize::tool_extract::extract_tool_calls_for_profile(&stripped, &profile);
-    let content = if text.is_empty() { None } else { Some(text) };
-    let mut api_tool_calls: Vec<serde_json::Value> = Vec::new();
-    for tool_call in &tool_calls {
-        api_tool_calls.push(
-            api_tool_call_value(
-                Some(&client),
-                &profile,
-                tool_call,
-                requested_tools.as_ref(),
-                None,
-            )
-            .await,
-        );
-    }
+    let canonical = crate::replay::build_canonical_response(
+        &profile,
+        &request_id,
+        client_request_id,
+        "chat-completions-api",
+        &model_name,
+        &response.content,
+        content.as_deref().unwrap_or(""),
+        api_tool_calls.clone(),
+        &response,
+        elapsed_ms,
+        end_to_end_tps,
+        llama_port,
+        context_limit,
+    );
+    crate::replay::append_api_replay_record(
+        "/v1/chat/completions",
+        original_request_body,
+        &request,
+        canonical,
+    )
+    .await;
+    finish_api_generation_for_request(&state, &request_id, "completed").await;
 
     Ok(Json(ChatCompletionResponse {
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -1767,13 +2074,18 @@ async fn stream_chat_completion(
     cancel: tokio_util::sync::CancellationToken,
     include_usage_details: bool,
     requested_tools: Option<Vec<serde_json::Value>>,
+    client_request_id: Option<String>,
+    original_request_body: serde_json::Value,
+    llama_port: u16,
+    context_limit: Option<u32>,
 ) -> Result<Response, ApiErrorResponse> {
     let response = match client.complete_stream(&request).await {
         Ok(response) => response,
         Err(e) => {
-            finish_api_generation(&state, "error").await;
-            tracing::error!(error = %e, "Stream completion failed");
-            return Err(ApiErrorResponse::inference_failed(&e.to_string()));
+            let diagnostics = completion_failure_diagnostics(&state, &model_name, &e).await;
+            finish_api_generation_for_request(&state, &request_id, "error").await;
+            tracing::error!(error = %e, diagnostics = %diagnostics, "Stream completion failed");
+            return Err(ApiErrorResponse::inference_failed(&diagnostics));
         }
     };
 
@@ -1785,6 +2097,10 @@ async fn stream_chat_completion(
     let id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let created = now_unix_secs();
     let state_for_stream = state.clone();
+    let buffer_tool_content = requested_tools
+        .as_ref()
+        .map(|tools| !tools.is_empty())
+        .unwrap_or(false);
 
     let stream = async_stream::stream! {
         let mut raw_full_text = String::new();
@@ -1808,10 +2124,9 @@ async fn stream_chat_completion(
             match event {
                 StreamEvent::RawDelta(raw) => {
                     raw_full_text.push_str(&raw);
-                    append_live_stream_delta(&state_for_stream, "raw", &raw).await;
+                    append_live_stream_delta_for_request(&state_for_stream, &request_id, "raw", &raw).await;
                 }
                 StreamEvent::Token(token) => {
-                    append_live_stream_delta(&state_for_stream, "content", &token).await;
                     if first_token_at.is_none() {
                         first_token_at = Some(std::time::Instant::now());
                     }
@@ -1826,24 +2141,29 @@ async fn stream_chat_completion(
                         first_token_at,
                         visible_tokens,
                     ).await;
-                    let chunk_json = serde_json::json!({
-                        "id": id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [{
-                            "index": 0,
-                            "delta": { "content": token },
-                            "finish_reason": serde_json::Value::Null
-                        }]
-                    });
-                    yield Ok::<Event, std::convert::Infallible>(Event::default().data(chunk_json.to_string()));
+                    if buffer_tool_content {
+                        append_live_stream_delta_for_request(&state_for_stream, &request_id, "content_buffered", &token).await;
+                    } else {
+                        append_live_stream_delta_for_request(&state_for_stream, &request_id, "content", &token).await;
+                        let chunk_json = serde_json::json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": { "content": token },
+                                "finish_reason": serde_json::Value::Null
+                            }]
+                        });
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(chunk_json.to_string()));
+                    }
                 }
                 StreamEvent::ReasoningDelta(reasoning) => {
                     raw_full_text.push_str("<think>");
                     raw_full_text.push_str(&reasoning);
                     raw_full_text.push_str("</think>");
-                    append_live_stream_delta(&state_for_stream, "reasoning", &reasoning).await;
+                    append_live_stream_delta_for_request(&state_for_stream, &request_id, "reasoning", &reasoning).await;
                     let chunk_json = serde_json::json!({
                         "id": id,
                         "object": "chat.completion.chunk",
@@ -1898,7 +2218,7 @@ async fn stream_chat_completion(
                         s.last_generation_metrics = Some(metrics);
                     }
 
-                    let (stream_tool_calls, _) =
+                    let (stream_tool_calls, cleaned_text) =
                         crate::normalize::tool_extract::extract_tool_calls_for_profile(
                             &stripped,
                             &profile,
@@ -1917,8 +2237,9 @@ async fn stream_chat_completion(
                         );
                     }
                     if !api_stream_tool_calls.is_empty() {
-                        append_live_stream_delta(
+                        append_live_stream_delta_for_request(
                             &state_for_stream,
+                            &request_id,
                             "tool_call",
                             &serde_json::to_string_pretty(&api_stream_tool_calls)
                                 .unwrap_or_default(),
@@ -1937,7 +2258,59 @@ async fn stream_chat_completion(
                         yield Ok::<Event, std::convert::Infallible>(
                             Event::default().data(tool_calls_chunk.to_string()),
                         );
+                    } else if buffer_tool_content && !cleaned_text.trim().is_empty() {
+                        append_live_stream_delta_for_request(&state_for_stream, &request_id, "content", &cleaned_text).await;
+                        let chunk_json = serde_json::json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": { "content": cleaned_text },
+                                "finish_reason": serde_json::Value::Null
+                            }]
+                        });
+                        yield Ok::<Event, std::convert::Infallible>(
+                            Event::default().data(chunk_json.to_string()),
+                        );
                     }
+                    let stream_response = CompletionResponse {
+                        content: full_text.clone(),
+                        stop: true,
+                        tokens_predicted: Some(tokens_predicted),
+                        tokens_evaluated: Some(tokens_evaluated),
+                        timings: Some(Timings {
+                            predicted_per_second: Some(decode_tokens_per_second),
+                            prompt_per_second: prompt_tokens_per_second,
+                        }),
+                    };
+                    let end_to_end_tps = end_to_end_tokens_per_second(
+                        Some(tokens_predicted),
+                        elapsed_ms,
+                    );
+                    let canonical = crate::replay::build_canonical_response(
+                        &profile,
+                        &request_id,
+                        client_request_id.clone(),
+                        "chat-completions-api-stream",
+                        &model_name,
+                        &full_text,
+                        &cleaned_text,
+                        api_stream_tool_calls.clone(),
+                        &stream_response,
+                        elapsed_ms,
+                        end_to_end_tps,
+                        llama_port,
+                        context_limit,
+                    );
+                    crate::replay::append_api_replay_record(
+                        "/v1/chat/completions",
+                        original_request_body.clone(),
+                        &request,
+                        canonical,
+                    )
+                    .await;
                     let finish_reason = if api_stream_tool_calls.is_empty() {
                         "stop"
                     } else {
@@ -1962,12 +2335,12 @@ async fn stream_chat_completion(
                     });
                     yield Ok(Event::default().data(final_chunk.to_string()));
                     yield Ok(Event::default().data("[DONE]"));
-                    finish_api_generation(&state_for_stream, "completed").await;
+                    finish_api_generation_for_request(&state_for_stream, &request_id, "completed").await;
                     return;
                 }
                 StreamEvent::Error(error) => {
-                    append_live_stream_delta(&state_for_stream, "error", &error).await;
-                    finish_api_generation(&state_for_stream, "error").await;
+                    append_live_stream_delta_for_request(&state_for_stream, &request_id, "error", &error).await;
+                    finish_api_generation_for_request(&state_for_stream, &request_id, "error").await;
                     let error_chunk = serde_json::json!({
                         "error": {
                             "message": error,
@@ -1986,7 +2359,7 @@ async fn stream_chat_completion(
             let mut s = state_for_stream.write().await;
             s.last_parse_trace = Some(build_parse_trace(&profile, &raw_full_text, &stripped));
         }
-        finish_api_generation(&state_for_stream, "completed").await;
+        finish_api_generation_for_request(&state_for_stream, &request_id, "completed").await;
         yield Ok(Event::default().data("[DONE]"));
     };
 
@@ -2182,10 +2555,13 @@ pub async fn text_completions(
 #[cfg(test)]
 mod tests {
     use super::{
-        api_tool_call_value, context_size_for_reload, loaded_model_matches_request,
-        normalize_api_messages, ApiMessage, ChatCompletionRequest,
+        api_tool_call_value, build_tool_argument_repair_request, compact_messages_to_fit,
+        context_request_matches_preview, context_size_for_reload, loaded_model_matches_request,
+        normalize_api_messages, validate_tool_arguments, ApiMessage, ChatCompletionRequest,
     };
+    use crate::engine::process::LaunchPreview;
     use crate::models::profiles::ModelProfile;
+    use crate::templates::engine::ChatMessage;
 
     #[test]
     fn deserializes_string_message_content() {
@@ -2215,6 +2591,55 @@ mod tests {
             context_size_for_reload(Some(16384), None, Some(32768)),
             Some(16384)
         );
+    }
+
+    #[test]
+    fn loaded_context_satisfies_lower_context_request() {
+        let preview = test_launch_preview(Some(32768));
+
+        assert!(context_request_matches_preview(Some(24576), Some(&preview)));
+        assert!(context_request_matches_preview(Some(32768), Some(&preview)));
+        assert!(!context_request_matches_preview(
+            Some(65536),
+            Some(&preview)
+        ));
+    }
+
+    #[test]
+    fn context_request_requires_known_loaded_context_when_explicit() {
+        let preview = test_launch_preview(None);
+
+        assert!(context_request_matches_preview(None, Some(&preview)));
+        assert!(!context_request_matches_preview(
+            Some(24576),
+            Some(&preview)
+        ));
+        assert!(!context_request_matches_preview(Some(24576), None));
+    }
+
+    fn test_launch_preview(context_size: Option<u32>) -> LaunchPreview {
+        LaunchPreview {
+            server_path: String::new(),
+            model_path: String::new(),
+            hf_repo: None,
+            hf_file: None,
+            mmproj_path: None,
+            backend_preference: String::new(),
+            context_size,
+            port: 0,
+            parallel_slots: 1,
+            fit_mode: None,
+            cache_ram_mb: None,
+            ctxcp: None,
+            use_jinja: false,
+            reasoning_mode: None,
+            template_mode: String::new(),
+            template_source: None,
+            template_path: None,
+            template_name: None,
+            chat_template_kwargs_json: None,
+            args: Vec::new(),
+        }
     }
 
     #[tokio::test]
@@ -2333,6 +2758,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn detects_vendor_thinking_disabled_flags() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "enable_thinking": false,
+                "messages": [
+                    { "role": "user", "content": "hello" }
+                ]
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        assert!(request.requested_thinking_disabled());
+    }
+
+    #[test]
+    fn detects_reasoning_effort_none_as_thinking_disabled() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "reasoning_effort": "none",
+                "messages": [
+                    { "role": "user", "content": "hello" }
+                ]
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        assert!(request.requested_thinking_disabled());
+    }
+
     #[tokio::test]
     async fn coerces_tool_arguments_to_declared_schema_types() {
         let tools = vec![serde_json::json!({
@@ -2371,6 +2826,128 @@ mod tests {
         assert_eq!(args["timeout_seconds"], serde_json::json!(60));
         assert_eq!(args["enabled"], serde_json::json!(true));
         assert_eq!(args["score"], serde_json::json!(0.95));
+    }
+
+    #[tokio::test]
+    async fn schema_torture_coerces_typed_tool_arguments() {
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "researcher",
+                "parameters": {
+                    "type": "object",
+                    "required": ["task", "max_tool_calls", "timeout_seconds", "online"],
+                    "properties": {
+                        "task": { "type": "string" },
+                        "max_tool_calls": { "type": "integer" },
+                        "timeout_seconds": { "type": "integer" },
+                        "online": { "type": "boolean" },
+                        "mode": { "type": "string", "enum": ["offline", "online"] },
+                        "domains": { "type": "array", "items": { "type": "string" } },
+                        "options": { "type": "object" }
+                    }
+                }
+            }
+        })];
+        let tool_call = crate::normalize::tool_extract::ToolCall {
+            id: "call_1".to_string(),
+            name: "researcher".to_string(),
+            arguments: serde_json::json!({
+                "task": "find traffic data",
+                "max_tool_calls": "8",
+                "timeout_seconds": "180",
+                "online": "true",
+                "mode": "online",
+                "domains": "[\"similarweb.com\",\"semrush.com\"]",
+                "options": "{\"fetch\":true,\"depth\":2}"
+            }),
+            raw_text: None,
+        };
+
+        let profile = ModelProfile::detect("Qwen3.6-27B-Q4_K_M.gguf");
+        let api_value = api_tool_call_value(None, &profile, &tool_call, Some(&tools), None).await;
+        let args: serde_json::Value = serde_json::from_str(
+            api_value["function"]["arguments"]
+                .as_str()
+                .expect("arguments should be stringified JSON"),
+        )
+        .expect("arguments should parse");
+
+        assert!(validate_tool_arguments("researcher", &args, Some(&tools)).is_empty());
+        assert_eq!(args["max_tool_calls"], serde_json::json!(8));
+        assert_eq!(args["timeout_seconds"], serde_json::json!(180));
+        assert_eq!(args["online"], serde_json::json!(true));
+        assert_eq!(
+            args["domains"],
+            serde_json::json!(["similarweb.com", "semrush.com"])
+        );
+        assert_eq!(args["options"]["depth"], serde_json::json!(2));
+    }
+
+    #[test]
+    fn schema_torture_flags_enum_and_required_errors() {
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "researcher",
+                "parameters": {
+                    "type": "object",
+                    "required": ["task", "max_tool_calls"],
+                    "properties": {
+                        "task": { "type": "string" },
+                        "max_tool_calls": { "type": "integer" },
+                        "mode": { "type": "string", "enum": ["offline", "online"] }
+                    }
+                }
+            }
+        })];
+        let arguments = serde_json::json!({
+            "mode": "webby"
+        });
+
+        let errors = validate_tool_arguments("researcher", &arguments, Some(&tools));
+
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("missing required field `task`")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("missing required field `max_tool_calls`")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("field `mode` must be one of")));
+    }
+
+    #[test]
+    fn repair_formatter_is_strict_and_deterministic() {
+        let profile = ModelProfile::detect("Qwen3.6-27B-Q4_K_M.gguf");
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["max_tool_calls"],
+            "properties": {
+                "max_tool_calls": { "type": "integer" }
+            }
+        });
+        let arguments = serde_json::json!({ "max_tool_calls": "8" });
+        let errors =
+            vec!["field `max_tool_calls` has wrong type for schema `\"integer\"`".to_string()];
+
+        let request = build_tool_argument_repair_request(
+            &profile,
+            "researcher",
+            &schema,
+            &arguments,
+            &errors,
+        );
+
+        assert_eq!(request.temperature, Some(0.0));
+        assert_eq!(request.stream, false);
+        assert!(request
+            .prompt
+            .contains("Return exactly one valid JSON object"));
+        assert!(request.prompt.contains("Do not call tools"));
+        assert!(request.prompt.contains("Validation errors"));
+        assert!(request.prompt.contains("max_tool_calls"));
     }
 
     #[test]
@@ -2496,6 +3073,29 @@ mod tests {
             "unsloth/Qwen3.5-27B-Instruct-Q4_K_M.gguf",
             "qwen3.5-reasoning"
         ));
+    }
+
+    #[test]
+    fn compacts_messages_before_context_overflow() {
+        let profile = ModelProfile::detect("gemma-4-26B-A4B-it-QAT-Q4_0.gguf");
+        let mut messages = vec![ChatMessage {
+            role: "system".to_string(),
+            content: "Always be concise.".to_string(),
+        }];
+        for i in 0..16 {
+            messages.push(ChatMessage {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                content: "x".repeat(1200),
+            });
+        }
+
+        compact_messages_to_fit(&mut messages, &profile, Some(2048), Some(256));
+        let prompt = crate::templates::engine::render_prompt(&messages, &profile);
+
+        assert!(crate::normalize::think_strip::estimate_token_count(&prompt) <= 2048);
+        assert!(messages
+            .iter()
+            .any(|message| message.content.contains("[Earlier conversation summary]")));
     }
 
     #[tokio::test]

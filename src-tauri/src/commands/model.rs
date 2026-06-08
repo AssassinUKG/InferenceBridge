@@ -228,10 +228,11 @@ async fn resolve_template_selection(
     ))
 }
 
-fn qwen_profile_needs_jinja(profile: &crate::models::profiles::ModelProfile) -> bool {
+fn profile_needs_jinja(profile: &crate::models::profiles::ModelProfile) -> bool {
     matches!(
         profile.tool_call_format,
         crate::models::profiles::ToolCallFormat::QwenXml
+            | crate::models::profiles::ToolCallFormat::Gemma4Native
     )
 }
 
@@ -292,9 +293,18 @@ fn preview_matches_effective_launch(
             == extra_args
 }
 
+fn loaded_context_satisfies_request(
+    requested_context_size: Option<u32>,
+    loaded_context_size: Option<u32>,
+) -> bool {
+    requested_context_size.map_or(true, |requested| {
+        loaded_context_size.map_or(false, |loaded| loaded >= requested)
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::resolve_launch_context_size;
+    use super::{loaded_context_satisfies_request, resolve_launch_context_size};
 
     #[test]
     fn passes_through_requested_context() {
@@ -309,6 +319,20 @@ mod tests {
     #[test]
     fn ignores_zero() {
         assert_eq!(resolve_launch_context_size(Some(0)), None);
+    }
+
+    #[test]
+    fn loaded_context_satisfies_equal_or_lower_request() {
+        assert!(loaded_context_satisfies_request(None, Some(32768)));
+        assert!(loaded_context_satisfies_request(Some(24576), Some(32768)));
+        assert!(loaded_context_satisfies_request(Some(32768), Some(32768)));
+        assert!(!loaded_context_satisfies_request(Some(32768), Some(24576)));
+        assert!(!loaded_context_satisfies_request(Some(24576), None));
+    }
+
+    #[test]
+    fn loaded_context_does_not_satisfy_higher_request() {
+        assert!(!loaded_context_satisfies_request(Some(65536), Some(32768)));
     }
 }
 
@@ -625,10 +649,10 @@ pub async fn backend_load_model_with_overrides(
         }
 
         let effective_profile = detect_effective_profile(&model.filename);
-        if qwen_profile_needs_jinja(&effective_profile) && !process_config.use_jinja {
+        if profile_needs_jinja(&effective_profile) && !process_config.use_jinja {
             tracing::warn!(
                 model = %model.filename,
-                "Qwen tool-call profile requires llama.cpp Jinja chat-template mode; enabling --jinja for this launch"
+                "Model tool-call profile requires llama.cpp Jinja chat-template mode; enabling --jinja for this launch"
             );
             process_config.use_jinja = true;
         }
@@ -636,17 +660,6 @@ pub async fn backend_load_model_with_overrides(
         let (template_mode, template_source, template_file, template_name, use_jinja) =
             resolve_template_selection(&process_config, &model.filename, hf_metadata.as_ref())
                 .await?;
-
-        // If ctx is None (no one specified), use 0 as placeholder — will be
-        // updated from /slots or /props after health check succeeds.
-        let provisional_ctx = ctx.unwrap_or(0);
-        s.last_context_status = Some(empty_context_status(provisional_ctx));
-        s.model_stats = Some(crate::state::ModelStats {
-            model: model.filename.clone(),
-            context_size: provisional_ctx,
-            tokens_per_sec: 0.0,
-            memory_mb: 0,
-        });
 
         let config = LaunchConfig {
             model_path: model.path.clone(),
@@ -733,29 +746,41 @@ pub async fn backend_load_model_with_overrides(
         let reuse_existing = if let (Some(loaded), Some(last_preview)) =
             (s.loaded_model.clone(), s.last_launch_preview.as_ref())
         {
-            if names_match(&loaded, &model.filename)
-                && preview_matches_effective_launch(
-                    last_preview,
-                    &model.filename,
-                    ctx,
-                    &template_mode,
-                    template_source.as_deref(),
-                    template_name.as_deref(),
-                    template_file.as_deref(),
-                    config.chat_template_kwargs_json.as_deref(),
-                    config.fit_mode.as_deref(),
-                    config.cache_ram_mb,
-                    config.ctxcp,
-                    config.use_jinja,
-                    config.reasoning_mode.as_deref(),
-                    &config.extra_args,
-                )
-            {
+            let model_matches = names_match(&loaded, &model.filename);
+            let loaded_context = s.model_stats.as_ref().map(|stats| stats.context_size);
+            let exact_launch_matches = preview_matches_effective_launch(
+                last_preview,
+                &model.filename,
+                ctx,
+                &template_mode,
+                template_source.as_deref(),
+                template_name.as_deref(),
+                template_file.as_deref(),
+                config.chat_template_kwargs_json.as_deref(),
+                config.fit_mode.as_deref(),
+                config.cache_ram_mb,
+                config.ctxcp,
+                config.use_jinja,
+                config.reasoning_mode.as_deref(),
+                &config.extra_args,
+            );
+            let lower_or_equal_context_request =
+                ctx.is_some() && loaded_context_satisfies_request(ctx, loaded_context);
+
+            if model_matches && exact_launch_matches {
                 tracing::info!(
                     model = %model.filename,
                     context_size = ?ctx,
                     template_mode = %template_mode,
                     "Model already loaded with matching effective launch config"
+                );
+                Some((loaded, last_preview.clone()))
+            } else if model_matches && lower_or_equal_context_request {
+                tracing::info!(
+                    model = %model.filename,
+                    requested_context_size = ?ctx,
+                    loaded_context_size = ?loaded_context,
+                    "Model already loaded with equal or larger context; skipping lower-context reload"
                 );
                 Some((loaded, last_preview.clone()))
             } else {
@@ -768,6 +793,17 @@ pub async fn backend_load_model_with_overrides(
         if let Some((loaded, preview)) = reuse_existing {
             (config, loaded, s.loading_generation, preview, true)
         } else {
+            // If ctx is None (no one specified), use 0 as placeholder; it will be
+            // updated from /slots or /props after health check succeeds.
+            let provisional_ctx = ctx.unwrap_or(0);
+            s.last_context_status = Some(empty_context_status(provisional_ctx));
+            s.model_stats = Some(crate::state::ModelStats {
+                model: model.filename.clone(),
+                context_size: provisional_ctx,
+                tokens_per_sec: 0.0,
+                memory_mb: 0,
+            });
+
             // Bump generation so older in-flight loads won't overwrite us
             s.loading_generation += 1;
             let gen = s.loading_generation;
@@ -1404,6 +1440,8 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
                 &mut s,
                 Some("llama-server exited unexpectedly.".to_string()),
             );
+        } else if s.process.mark_idle_if_no_child() {
+            clear_runtime_after_backend_exit(&mut s, None);
         }
     }
 
