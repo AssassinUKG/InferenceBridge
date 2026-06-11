@@ -129,8 +129,13 @@ pub struct ProcessConfig {
     /// e.g. [3.0, 2.0] for a 60/40 split across two GPUs. Empty = single GPU.
     pub tensor_split: Vec<f32>,
     /// Path to a GGUF draft model for speculative decoding (-md). Empty = disabled.
-    /// Use a small model from the same family (e.g. Qwen3-0.6B for Qwen3-27B).
+    /// Use a matching draft or assistant model from the same family.
     pub draft_model_path: String,
+    /// llama.cpp MTP speculative decoding mode (--spec-type). Empty = disabled.
+    /// Common value for Gemma/Qwen MTP draft models: "draft-mtp".
+    pub spec_type: String,
+    /// Draft tokens per MTP step (--spec-draft-n-max). 0 = server default.
+    pub spec_draft_n_max: u32,
     /// Max draft tokens per speculative step (--draft-max). 0 = server default (16).
     pub draft_max_tokens: u32,
     /// Min draft tokens before verification (--draft-min). 0 = server default (5).
@@ -247,6 +252,8 @@ impl Default for ProcessConfig {
             ctx_shift: false,
             tensor_split: vec![],
             draft_model_path: String::new(),
+            spec_type: String::new(),
+            spec_draft_n_max: 0,
             draft_max_tokens: 0,
             draft_min_tokens: 0,
             draft_p_min: 0.0,

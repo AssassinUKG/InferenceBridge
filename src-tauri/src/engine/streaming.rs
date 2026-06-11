@@ -9,6 +9,10 @@ struct SseChunkData {
     #[serde(default)]
     stop: bool,
     #[serde(default)]
+    stopped_limit: Option<bool>,
+    #[serde(default)]
+    stop_type: Option<String>,
+    #[serde(default)]
     tokens_predicted: Option<u64>,
     #[serde(default)]
     tokens_evaluated: Option<u64>,
@@ -35,6 +39,8 @@ pub enum StreamEvent {
         tokens_evaluated: u32,
         decode_tokens_per_second: f64,
         prompt_tokens_per_second: Option<f64>,
+        stopped_limit: Option<bool>,
+        stop_type: Option<String>,
     },
     Error(String),
 }
@@ -274,6 +280,11 @@ pub async fn consume_sse_stream_with_timeouts(
     let inter_token_timeout = std::time::Duration::from_secs(inter_token_timeout_secs);
 
     loop {
+        if tx.is_closed() {
+            cancel.cancel();
+            return Ok(full_text);
+        }
+
         if cancel.is_cancelled() {
             let _ = tx
                 .send(StreamEvent::Done {
@@ -282,6 +293,8 @@ pub async fn consume_sse_stream_with_timeouts(
                     tokens_evaluated,
                     decode_tokens_per_second,
                     prompt_tokens_per_second,
+                    stopped_limit: None,
+                    stop_type: None,
                 })
                 .await;
             return Ok(full_text);
@@ -317,6 +330,8 @@ pub async fn consume_sse_stream_with_timeouts(
                             tokens_evaluated,
                             decode_tokens_per_second,
                             prompt_tokens_per_second,
+                            stopped_limit: None,
+                            stop_type: None,
                         })
                         .await;
                 }
@@ -359,6 +374,8 @@ pub async fn consume_sse_stream_with_timeouts(
                             tokens_evaluated,
                             decode_tokens_per_second,
                             prompt_tokens_per_second,
+                            stopped_limit: None,
+                            stop_type: None,
                         })
                         .await;
                     return Ok(full_text);
@@ -419,6 +436,8 @@ pub async fn consume_sse_stream_with_timeouts(
                                     tokens_evaluated,
                                     decode_tokens_per_second,
                                     prompt_tokens_per_second,
+                                    stopped_limit: json.stopped_limit,
+                                    stop_type: json.stop_type.clone(),
                                 })
                                 .await;
                             return Ok(full_text);
@@ -457,6 +476,8 @@ pub async fn consume_sse_stream_with_timeouts(
                 tokens_evaluated,
                 decode_tokens_per_second,
                 prompt_tokens_per_second,
+                stopped_limit: None,
+                stop_type: None,
             })
             .await;
     }

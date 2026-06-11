@@ -24,10 +24,33 @@ pub fn start_managed(state: SharedState, host: String, port: u16, source: &'stat
         Err(poisoned) => poisoned.into_inner(),
     };
 
-    if let Some(existing) = guard.as_ref() {
+    if let Some(existing) = guard.as_mut() {
         if !existing.handle.inner().is_finished() {
-            tracing::info!(host = %host, port, source, "Managed API server already running");
-            return false;
+            let stale = state
+                .try_read()
+                .map(|app_state| {
+                    matches!(
+                        app_state.api_server_state,
+                        ApiServerState::Idle | ApiServerState::Starting | ApiServerState::Error
+                    )
+                })
+                .unwrap_or(false);
+
+            if stale {
+                tracing::warn!(
+                    host = %host,
+                    port,
+                    source,
+                    "Aborting stale managed API server task before restart"
+                );
+                if let Some(stop_tx) = existing.stop_tx.take() {
+                    let _ = stop_tx.send(());
+                }
+                existing.handle.abort();
+            } else {
+                tracing::info!(host = %host, port, source, "Managed API server already running");
+                return false;
+            }
         }
     }
 

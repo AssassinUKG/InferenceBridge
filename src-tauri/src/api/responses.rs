@@ -13,13 +13,14 @@ use crate::api::completions::{
 };
 use crate::api::errors::ApiErrorResponse;
 use crate::engine::client::{CompletionResponse, LlamaClient, Timings};
+use crate::engine::scheduler::RequestPermit;
 use crate::engine::streaming::{self, StreamEvent};
 use crate::normalize::think_strip::{
     estimate_token_count, extract_reasoning_content_with_style, strip_think_tags_with_style,
 };
 use crate::state::{
     append_live_stream_delta_for_request, begin_api_generation, finish_api_generation_for_request,
-    summarize_reasoning_tokens, SharedState,
+    summarize_reasoning_tokens, GenerationDropGuard, SharedState,
 };
 
 #[derive(Debug, Deserialize, Clone)]
@@ -340,7 +341,7 @@ pub async fn responses(
         let s = state.read().await;
         s.request_scheduler.clone()
     };
-    let _permit = scheduler.acquire().await;
+    let permit = scheduler.acquire().await;
 
     let client = LlamaClient::new(llama_port);
     let generation_started_at = chrono::Utc::now().to_rfc3339();
@@ -354,6 +355,7 @@ pub async fn responses(
 
         let gen = begin_api_generation(&state, model_name.clone()).await;
         let request_id = gen.request_id.clone();
+        let stream_cancel = gen.cancel.clone();
         let (tx, mut rx) = tokio::sync::mpsc::channel(64);
         tokio::spawn(async move {
             let _ = streaming::consume_sse_stream(response, tx, gen.cancel).await;
@@ -365,6 +367,12 @@ pub async fn responses(
         let state_for_stream = state.clone();
 
         let stream = async_stream::stream! {
+            let _permit: RequestPermit = permit;
+            let guard = GenerationDropGuard::new(
+                state_for_stream.clone(),
+                request_id.clone(),
+                stream_cancel,
+            );
             let mut full_text = String::new();
             let opening = serde_json::json!({
                 "type": "response.created",
@@ -411,6 +419,8 @@ pub async fn responses(
                         tokens_evaluated,
                         decode_tokens_per_second,
                         prompt_tokens_per_second,
+                        stopped_limit,
+                        stop_type,
                     } => {
                         let visible = strip_think_tags_with_style(&text, profile.think_tag_style);
                         let reasoning = extract_reasoning_content_with_style(&text, profile.think_tag_style);
@@ -444,6 +454,8 @@ pub async fn responses(
                         let stream_response = CompletionResponse {
                             content: text.clone(),
                             stop: true,
+                            stopped_limit,
+                            stop_type,
                             tokens_predicted: Some(tokens_predicted),
                             tokens_evaluated: Some(tokens_evaluated),
                             timings: Some(Timings {
@@ -495,6 +507,7 @@ pub async fn responses(
                         });
                         yield Ok(Event::default().data(completed.to_string()));
                         yield Ok(Event::default().data("[DONE]"));
+                        guard.mark_completed();
                         finish_api_generation_for_request(&state_for_stream, &request_id, "completed").await;
                         return;
                     }
@@ -510,6 +523,7 @@ pub async fn responses(
                         });
                         yield Ok(Event::default().data(error_chunk.to_string()));
                         yield Ok(Event::default().data("[DONE]"));
+                        guard.mark_completed();
                         return;
                     }
                 }

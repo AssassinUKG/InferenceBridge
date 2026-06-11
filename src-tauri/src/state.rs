@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -133,6 +134,7 @@ pub struct AppState {
     pub loading_generation: u64,
     pub previous_model: Option<String>,
     pub generation_cancel: CancellationToken,
+    pub generation_cancels: HashMap<String, CancellationToken>,
     pub model_load_cancel: CancellationToken,
     pub active_generation: Option<GenerationRequest>,
     pub last_prompt: Option<String>,
@@ -171,6 +173,7 @@ impl AppState {
             loading_generation: 0,
             previous_model: None,
             generation_cancel: CancellationToken::new(),
+            generation_cancels: HashMap::new(),
             model_load_cancel: CancellationToken::new(),
             active_generation: None,
             last_prompt: None,
@@ -201,12 +204,50 @@ pub struct GenerationHandle {
     pub request_id: String,
 }
 
+pub struct GenerationDropGuard {
+    state: SharedState,
+    request_id: String,
+    cancel: CancellationToken,
+    completed: Arc<AtomicBool>,
+}
+
+impl GenerationDropGuard {
+    pub fn new(state: SharedState, request_id: String, cancel: CancellationToken) -> Self {
+        Self {
+            state,
+            request_id,
+            cancel,
+            completed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn mark_completed(&self) {
+        self.completed.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Drop for GenerationDropGuard {
+    fn drop(&mut self) {
+        if self.completed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.cancel.cancel();
+        let state = self.state.clone();
+        let request_id = self.request_id.clone();
+        tokio::spawn(async move {
+            finish_api_generation_for_request(&state, &request_id, "disconnected").await;
+        });
+    }
+}
+
 pub async fn begin_api_generation(state: &SharedState, model: String) -> GenerationHandle {
     let mut s = state.write().await;
-    s.generation_cancel.cancel();
-    s.generation_cancel = CancellationToken::new();
+    let cancel = CancellationToken::new();
+    s.generation_cancel = cancel.clone();
     s.cumulative_metrics.total_requests += 1;
     let request_id = uuid::Uuid::new_v4().to_string();
+    s.generation_cancels
+        .insert(request_id.clone(), cancel.clone());
     let started_at = chrono::Utc::now().to_rfc3339();
     s.active_generation = Some(GenerationRequest {
         id: request_id.clone(),
@@ -236,10 +277,7 @@ pub async fn begin_api_generation(state: &SharedState, model: String) -> Generat
     if let Some(handle) = s.app_handle.clone() {
         let _ = handle.emit("llm-stream-start", snapshot);
     }
-    GenerationHandle {
-        cancel: s.generation_cancel.clone(),
-        request_id,
-    }
+    GenerationHandle { cancel, request_id }
 }
 
 pub async fn finish_api_generation(state: &SharedState, status: &str) {
@@ -265,6 +303,7 @@ pub async fn finish_api_generation_for_request(
     status: &str,
 ) {
     let mut s = state.write().await;
+    s.generation_cancels.remove(request_id);
     if let Some(active) = s
         .active_generation
         .as_mut()
@@ -294,10 +333,12 @@ pub async fn begin_live_generation(
     model: String,
 ) -> GenerationHandle {
     let mut s = state.write().await;
-    s.generation_cancel.cancel();
-    s.generation_cancel = CancellationToken::new();
+    let cancel = CancellationToken::new();
+    s.generation_cancel = cancel.clone();
     s.cumulative_metrics.total_requests += 1;
     let request_id = uuid::Uuid::new_v4().to_string();
+    s.generation_cancels
+        .insert(request_id.clone(), cancel.clone());
     let started_at = chrono::Utc::now().to_rfc3339();
     s.active_generation = Some(GenerationRequest {
         id: request_id.clone(),
@@ -322,10 +363,23 @@ pub async fn begin_live_generation(
     if let Some(handle) = s.app_handle.clone() {
         let _ = handle.emit("llm-stream-start", snapshot);
     }
-    GenerationHandle {
-        cancel: s.generation_cancel.clone(),
-        request_id,
+    GenerationHandle { cancel, request_id }
+}
+
+pub async fn cancel_all_generations(state: &SharedState) -> usize {
+    let mut s = state.write().await;
+    let count = s.generation_cancels.len();
+    for cancel in s.generation_cancels.values() {
+        cancel.cancel();
     }
+    s.generation_cancel.cancel();
+    if count > 0 {
+        s.cumulative_metrics.total_cancellations += count as u64;
+    }
+    if let Some(gen) = s.active_generation.as_mut() {
+        gen.status = "cancelled".to_string();
+    }
+    count
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -472,4 +526,31 @@ pub fn summarize_reasoning_tokens(
     }
 
     crate::normalize::think_strip::estimate_token_count(reasoning_text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{begin_api_generation, cancel_all_generations, AppState};
+    use crate::config::AppConfig;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn starting_second_api_generation_does_not_cancel_first() {
+        let state = Arc::new(RwLock::new(
+            AppState::new(AppConfig::default()).expect("state should initialize"),
+        ));
+
+        let first = begin_api_generation(&state, "model-a".to_string()).await;
+        let second = begin_api_generation(&state, "model-b".to_string()).await;
+
+        assert!(!first.cancel.is_cancelled());
+        assert!(!second.cancel.is_cancelled());
+
+        let cancelled = cancel_all_generations(&state).await;
+
+        assert_eq!(cancelled, 2);
+        assert!(first.cancel.is_cancelled());
+        assert!(second.cancel.is_cancelled());
+    }
 }

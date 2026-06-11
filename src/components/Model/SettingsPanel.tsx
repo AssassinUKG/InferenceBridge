@@ -1066,6 +1066,69 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
                 />
               </FieldRow>
               <Divider />
+              <FieldRow label="Draft Model Path" hint="-md: GGUF draft model for speculative decoding">
+                <FlatInput
+                  value={settings.draft_model_path}
+                  onChange={(v) => setSettings({ ...settings, draft_model_path: v })}
+                  placeholder="C:\\path\\to\\draft-model.gguf"
+                />
+              </FieldRow>
+              <Divider />
+              <FieldRow label="Spec Type" hint="--spec-type: use draft-mtp for Gemma/Qwen MTP">
+                <FlatInput
+                  value={settings.spec_type}
+                  onChange={(v) => setSettings({ ...settings, spec_type: v })}
+                  placeholder="draft-mtp"
+                />
+              </FieldRow>
+              <Divider />
+              <FieldRow label="Spec Draft N Max" hint="--spec-draft-n-max: 3 for the Gemma 4 draft model">
+                <FlatInput
+                  type="number"
+                  value={settings.spec_draft_n_max}
+                  onChange={(v) =>
+                    setSettings({
+                      ...settings,
+                      spec_draft_n_max: Math.max(0, Number(v) || 0),
+                    })
+                  }
+                  min={0}
+                  placeholder="3"
+                />
+              </FieldRow>
+              <Divider />
+              <FieldRow label="Draft Legacy Args" hint="Optional --draft-max / --draft-min / --draft-p-min">
+                <div className="grid grid-cols-3 gap-2">
+                  <FlatInput
+                    type="number"
+                    value={settings.draft_max_tokens}
+                    onChange={(v) =>
+                      setSettings({ ...settings, draft_max_tokens: Math.max(0, Number(v) || 0) })
+                    }
+                    min={0}
+                    placeholder="16"
+                  />
+                  <FlatInput
+                    type="number"
+                    value={settings.draft_min_tokens}
+                    onChange={(v) =>
+                      setSettings({ ...settings, draft_min_tokens: Math.max(0, Number(v) || 0) })
+                    }
+                    min={0}
+                    placeholder="5"
+                  />
+                  <FlatInput
+                    type="number"
+                    value={settings.draft_p_min}
+                    onChange={(v) =>
+                      setSettings({ ...settings, draft_p_min: Math.max(0, Number(v) || 0) })
+                    }
+                    min={0}
+                    placeholder="0.0"
+                  />
+                </div>
+              </FieldRow>
+              <Divider />
               <FieldRow label="Extra Args" hint="Raw llama-server args appended last">
                 <FlatInput
                   value={formatCliArgs(settings.extra_args)}

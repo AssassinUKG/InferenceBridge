@@ -94,6 +94,8 @@ pub async fn test_model(
             ctx_shift: state.config.process.ctx_shift,
             tensor_split: state.config.process.tensor_split.clone(),
             draft_model_path: state.config.process.draft_model_path.clone(),
+            spec_type: state.config.process.spec_type.clone(),
+            spec_draft_n_max: state.config.process.spec_draft_n_max,
             draft_max_tokens: state.config.process.draft_max_tokens,
             draft_min_tokens: state.config.process.draft_min_tokens,
             draft_p_min: state.config.process.draft_p_min,

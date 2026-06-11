@@ -254,6 +254,9 @@ curl -X POST http://127.0.0.1:8800/v1/models/load \
 |-------|------|----------|-------------|
 | `model` | string | yes | Model filename or path-style name (e.g. `"qwen/qwen3.5-4b"`) |
 | `context_size` | u32 | no | Context window size passed to `--ctx-size`. Omit to use the model's GGUF metadata default. |
+| `draft_model_path` | string | no | GGUF draft model path passed to llama.cpp as `-md`. Aliases include `draftModelPath`, `draft_model`, and `spec_draft_model`. |
+| `spec_type` | string | no | Speculative decoding type passed as `--spec-type`, for example `"draft-mtp"`. |
+| `spec_draft_n_max` | u32 | no | Draft tokens per MTP step passed as `--spec-draft-n-max`; Gemma 4 draft models commonly use `3`. |
 | `echo_load_config` | bool | no | If `true`, response includes `load_config` with the effective context. |
 
 **Context size aliases** — all of these map to the same field:

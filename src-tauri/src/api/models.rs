@@ -59,6 +59,41 @@ pub struct LoadModelRequest {
         alias = "chat_template_kwargs_json"
     )]
     pub chat_template_kwargs_json: Option<String>,
+    #[serde(
+        default,
+        alias = "draftModelPath",
+        alias = "draft_model",
+        alias = "draftModel",
+        alias = "spec_draft_model",
+        alias = "specDraftModel"
+    )]
+    pub draft_model_path: Option<String>,
+    #[serde(default, alias = "specType", alias = "spec_type")]
+    pub spec_type: Option<String>,
+    #[serde(
+        default,
+        alias = "specDraftNMax",
+        alias = "spec_draft_n_max",
+        alias = "spec_draft_tokens",
+        alias = "draftNMax"
+    )]
+    pub spec_draft_n_max: Option<u32>,
+    #[serde(
+        default,
+        alias = "draftMaxTokens",
+        alias = "draft_max",
+        alias = "draftMax"
+    )]
+    pub draft_max_tokens: Option<u32>,
+    #[serde(
+        default,
+        alias = "draftMinTokens",
+        alias = "draft_min",
+        alias = "draftMin"
+    )]
+    pub draft_min_tokens: Option<u32>,
+    #[serde(default, alias = "draftPMin", alias = "draft_p_min")]
+    pub draft_p_min: Option<f32>,
     #[serde(default, alias = "extraArgs", alias = "extra_args")]
     pub extra_args: Option<Vec<String>>,
     #[serde(default)]
@@ -71,6 +106,12 @@ impl LoadModelRequest {
     fn requested_context_size(&self) -> Option<u32> {
         self.context_size
             .filter(|value| *value > 0)
+            .or_else(|| {
+                self.extra
+                    .get("load_config")
+                    .or_else(|| self.extra.get("loadConfig"))
+                    .and_then(crate::api::completions::extract_context_size_from_value)
+            })
             .or_else(|| crate::api::completions::extract_context_size_from_hash_map(&self.extra))
     }
 }
@@ -133,6 +174,12 @@ pub async fn load_model(
             template_name: req.template_name.clone(),
             custom_template_path: req.custom_template_path.clone(),
             chat_template_kwargs_json: req.chat_template_kwargs_json.clone(),
+            draft_model_path: req.draft_model_path.clone(),
+            spec_type: req.spec_type.clone(),
+            spec_draft_n_max: req.spec_draft_n_max,
+            draft_max_tokens: req.draft_max_tokens,
+            draft_min_tokens: req.draft_min_tokens,
+            draft_p_min: req.draft_p_min,
             extra_args: req.extra_args.clone(),
         },
     )
@@ -209,6 +256,27 @@ mod tests {
             !request.extra.contains_key("context_length"),
             "context_length should NOT end up in extra (flatten)"
         );
+    }
+
+    #[test]
+    fn deserializes_draft_mtp_load_options() {
+        let request: LoadModelRequest = serde_json::from_str(
+            r#"{
+                "model": "gemma-4-26B-A4B-it-QAT-Q4_0.gguf",
+                "context_size": 49152,
+                "draft_model_path": "C:\\models\\gemma-draft.gguf",
+                "spec_type": "draft-mtp",
+                "spec_draft_n_max": 3
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        assert_eq!(
+            request.draft_model_path.as_deref(),
+            Some("C:\\models\\gemma-draft.gguf")
+        );
+        assert_eq!(request.spec_type.as_deref(), Some("draft-mtp"));
+        assert_eq!(request.spec_draft_n_max, Some(3));
     }
 
     #[test]

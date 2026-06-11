@@ -250,6 +250,12 @@ fn preview_matches_effective_launch(
     ctxcp: Option<u32>,
     use_jinja: bool,
     reasoning_mode: Option<&str>,
+    draft_model_path: &str,
+    spec_type: &str,
+    spec_draft_n_max: u32,
+    draft_max_tokens: u32,
+    draft_min_tokens: u32,
+    draft_p_min: f32,
     extra_args: &[String],
 ) -> bool {
     let model_ok = names_match(&preview.model_path, model_filename)
@@ -280,6 +286,12 @@ fn preview_matches_effective_launch(
         && preview.ctxcp == ctxcp
         && preview.use_jinja == use_jinja
         && preview.reasoning_mode.as_deref() == reasoning_mode
+        && preview.draft_model_path == draft_model_path
+        && preview.spec_type == spec_type
+        && preview.spec_draft_n_max == spec_draft_n_max
+        && preview.draft_max_tokens == draft_max_tokens
+        && preview.draft_min_tokens == draft_min_tokens
+        && (preview.draft_p_min - draft_p_min).abs() < f32::EPSILON
         && preview
             .args
             .iter()
@@ -467,6 +479,12 @@ pub struct RuntimeLoadOverrides {
     pub template_name: Option<String>,
     pub custom_template_path: Option<String>,
     pub chat_template_kwargs_json: Option<String>,
+    pub draft_model_path: Option<String>,
+    pub spec_type: Option<String>,
+    pub spec_draft_n_max: Option<u32>,
+    pub draft_max_tokens: Option<u32>,
+    pub draft_min_tokens: Option<u32>,
+    pub draft_p_min: Option<f32>,
     pub extra_args: Option<Vec<String>>,
 }
 
@@ -498,6 +516,18 @@ pub struct RuntimeLoadRequest {
     #[serde(default)]
     pub chat_template_kwargs_json: Option<String>,
     #[serde(default)]
+    pub draft_model_path: Option<String>,
+    #[serde(default)]
+    pub spec_type: Option<String>,
+    #[serde(default)]
+    pub spec_draft_n_max: Option<u32>,
+    #[serde(default)]
+    pub draft_max_tokens: Option<u32>,
+    #[serde(default)]
+    pub draft_min_tokens: Option<u32>,
+    #[serde(default)]
+    pub draft_p_min: Option<f32>,
+    #[serde(default)]
     pub extra_args: Option<Vec<String>>,
 }
 
@@ -519,6 +549,12 @@ impl RuntimeLoadRequest {
             template_name: self.template_name,
             custom_template_path: self.custom_template_path,
             chat_template_kwargs_json: self.chat_template_kwargs_json,
+            draft_model_path: self.draft_model_path,
+            spec_type: self.spec_type,
+            spec_draft_n_max: self.spec_draft_n_max,
+            draft_max_tokens: self.draft_max_tokens,
+            draft_min_tokens: self.draft_min_tokens,
+            draft_p_min: self.draft_p_min,
             extra_args: self.extra_args,
         }
     }
@@ -539,8 +575,12 @@ pub async fn backend_load_model_with_overrides(
     {
         let mut s = state.write().await;
         if s.active_generation.is_some() {
+            let count = s.generation_cancels.len().max(1);
+            for cancel in s.generation_cancels.values() {
+                cancel.cancel();
+            }
             s.generation_cancel.cancel();
-            s.cumulative_metrics.total_cancellations += 1;
+            s.cumulative_metrics.total_cancellations += count as u64;
             tracing::info!("Cancelled active inference for new model load");
         }
         s.cumulative_metrics.total_model_loads += 1;
@@ -644,6 +684,24 @@ pub async fn backend_load_model_with_overrides(
         if let Some(chat_template_kwargs_json) = overrides.chat_template_kwargs_json.as_ref() {
             process_config.chat_template_kwargs_json = Some(chat_template_kwargs_json.clone());
         }
+        if let Some(draft_model_path) = overrides.draft_model_path.as_ref() {
+            process_config.draft_model_path = draft_model_path.clone();
+        }
+        if let Some(spec_type) = overrides.spec_type.as_ref() {
+            process_config.spec_type = spec_type.clone();
+        }
+        if let Some(spec_draft_n_max) = overrides.spec_draft_n_max {
+            process_config.spec_draft_n_max = spec_draft_n_max;
+        }
+        if let Some(draft_max_tokens) = overrides.draft_max_tokens {
+            process_config.draft_max_tokens = draft_max_tokens;
+        }
+        if let Some(draft_min_tokens) = overrides.draft_min_tokens {
+            process_config.draft_min_tokens = draft_min_tokens;
+        }
+        if let Some(draft_p_min) = overrides.draft_p_min {
+            process_config.draft_p_min = draft_p_min;
+        }
         if let Some(extra_args) = overrides.extra_args.as_ref() {
             process_config.extra_args = extra_args.clone();
         }
@@ -711,10 +769,12 @@ pub async fn backend_load_model_with_overrides(
             no_warmup: s.config.process.no_warmup,
             ctx_shift: s.config.process.ctx_shift,
             tensor_split: s.config.process.tensor_split.clone(),
-            draft_model_path: s.config.process.draft_model_path.clone(),
-            draft_max_tokens: s.config.process.draft_max_tokens,
-            draft_min_tokens: s.config.process.draft_min_tokens,
-            draft_p_min: s.config.process.draft_p_min,
+            draft_model_path: process_config.draft_model_path.clone(),
+            spec_type: process_config.spec_type.clone(),
+            spec_draft_n_max: process_config.spec_draft_n_max,
+            draft_max_tokens: process_config.draft_max_tokens,
+            draft_min_tokens: process_config.draft_min_tokens,
+            draft_p_min: process_config.draft_p_min,
         };
 
         LlamaProcess::validate_launch_config(&config).map_err(|e| {
@@ -762,6 +822,12 @@ pub async fn backend_load_model_with_overrides(
                 config.ctxcp,
                 config.use_jinja,
                 config.reasoning_mode.as_deref(),
+                &config.draft_model_path,
+                &config.spec_type,
+                config.spec_draft_n_max,
+                config.draft_max_tokens,
+                config.draft_min_tokens,
+                config.draft_p_min,
                 &config.extra_args,
             );
             let lower_or_equal_context_request =
@@ -1358,8 +1424,13 @@ pub async fn backend_unload_model(state: SharedState) -> Result<String, String> 
     {
         let mut s = state.write().await;
         if s.active_generation.is_some() {
+            let count = s.generation_cancels.len().max(1);
+            for cancel in s.generation_cancels.values() {
+                cancel.cancel();
+            }
             s.generation_cancel.cancel();
-            tracing::info!("Cancelled active inference for model unload");
+            s.cumulative_metrics.total_cancellations += count as u64;
+            tracing::info!(count, "Cancelled active inference for model unload");
         }
         s.cumulative_metrics.total_model_unloads += 1;
     }
@@ -1390,6 +1461,10 @@ pub async fn backend_unload_model(state: SharedState) -> Result<String, String> 
 
     {
         let mut s = state.write().await;
+        for cancel in s.generation_cancels.values() {
+            cancel.cancel();
+        }
+        s.generation_cancels.clear();
         s.generation_cancel.cancel();
         s.active_generation = None;
         s.process.shutdown().await.map_err(|error| {
@@ -1813,15 +1888,23 @@ pub struct ExternalProcess {
 
 #[tauri::command]
 pub async fn list_llama_processes() -> Result<Vec<ExternalProcess>, String> {
-    // Use WMIC to list all llama-server processes
-    let output = command_no_window("wmic")
+    #[derive(serde::Deserialize)]
+    struct CimProcess {
+        #[serde(rename = "ProcessId")]
+        process_id: Option<u32>,
+        #[serde(rename = "Name")]
+        name: Option<String>,
+        #[serde(rename = "CommandLine")]
+        command_line: Option<String>,
+        #[serde(rename = "WorkingSetSize")]
+        working_set_size: Option<u64>,
+    }
+
+    let output = command_no_window("powershell")
         .args([
-            "process",
-            "where",
-            "name like '%llama%server%'",
-            "get",
-            "ProcessId,Name,CommandLine,WorkingSetSize",
-            "/FORMAT:CSV",
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process | Where-Object { $_.Name -like '*llama*server*' -or $_.CommandLine -like '*llama-server*' } | Select-Object ProcessId,Name,CommandLine,WorkingSetSize | ConvertTo-Json -Compress",
         ])
         .output()
         .map_err(|e| format!("Failed to query processes: {e}"))?;
@@ -1832,28 +1915,34 @@ pub async fn list_llama_processes() -> Result<Vec<ExternalProcess>, String> {
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("Failed to parse process list: {e}"))?;
+    let rows: Vec<CimProcess> = if value.is_array() {
+        serde_json::from_value(value).map_err(|e| format!("Failed to parse process list: {e}"))?
+    } else {
+        vec![serde_json::from_value(value)
+            .map_err(|e| format!("Failed to parse process list: {e}"))?]
+    };
+
     let mut processes = Vec::new();
-    for line in text.lines().skip(1) {
-        // CSV: Node,CommandLine,Name,ProcessId,WorkingSetSize
-        // CommandLine can itself contain commas, so split from the RIGHT to safely
-        // extract the fixed-position trailing fields.
-        let parts_rev: Vec<&str> = line.rsplitn(5, ',').collect();
-        // rsplitn gives: [WorkingSetSize, ProcessId, Name, CommandLine..., Node] (rev order)
-        if parts_rev.len() >= 5 {
-            let mem_bytes: f64 = parts_rev[0].trim().parse().unwrap_or(0.0);
-            let pid: u32 = parts_rev[1].trim().parse().unwrap_or(0);
-            let name = parts_rev[2].trim().to_string();
-            let cmd = parts_rev[3].trim().to_string(); // may include commas from original
-            if pid > 0
-                && (name.to_lowercase().contains("llama") || cmd.to_lowercase().contains("llama"))
-            {
-                processes.push(ExternalProcess {
-                    pid,
-                    name,
-                    command_line: cmd,
-                    memory_mb: mem_bytes / (1024.0 * 1024.0),
-                });
-            }
+    for row in rows {
+        let pid = row.process_id.unwrap_or(0);
+        let name = row.name.unwrap_or_default();
+        let cmd = row.command_line.unwrap_or_default();
+        if pid > 0
+            && (name.to_lowercase().contains("llama") || cmd.to_lowercase().contains("llama"))
+        {
+            processes.push(ExternalProcess {
+                pid,
+                name,
+                command_line: cmd,
+                memory_mb: row.working_set_size.unwrap_or(0) as f64 / (1024.0 * 1024.0),
+            });
         }
     }
     Ok(processes)
@@ -1945,17 +2034,17 @@ pub struct GpuStats {
 }
 
 fn get_system_ram_mb() -> u64 {
-    let output = command_no_window("wmic")
-        .args(["OS", "get", "TotalVisibleMemorySize", "/VALUE"])
+    let output = command_no_window("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory",
+        ])
         .output();
     if let Ok(out) = output {
         let text = String::from_utf8_lossy(&out.stdout);
-        for line in text.lines() {
-            if let Some(val) = line.strip_prefix("TotalVisibleMemorySize=") {
-                if let Ok(kb) = val.trim().parse::<u64>() {
-                    return kb / 1024;
-                }
-            }
+        if let Ok(bytes) = text.trim().parse::<u64>() {
+            return bytes / 1024 / 1024;
         }
     }
     0

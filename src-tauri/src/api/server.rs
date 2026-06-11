@@ -159,9 +159,9 @@ async fn serve_api_server(
 ///   2. Find the LISTENING PID from netstat.
 ///   3. Resolve its process name via tasklist (best-effort).
 ///   4. If it's our own PID, log a bug warning and bail — we can't kill ourselves.
-///   5. Attempt `taskkill /PID <n> /F` regardless of whether the name was
-///      resolved.  Ghost PIDs (process exited but socket leaked) also get a
-///      kill attempt; taskkill is a no-op if the PID is truly gone.
+///   5. Attempt `taskkill /PID <n> /F` only for recognized own processes
+///      (`llama-server` or `inference-bridge`). Unknown processes are never
+///      killed.
 ///   6. Poll for up to 1.5 s for the port to actually free up.
 ///   7. Log the final outcome so every path is visible in logs.
 async fn evict_port_blocker(host: &str, port: u16, current_pid: u32) {
@@ -204,6 +204,18 @@ async fn evict_port_blocker(host: &str, port: u16, current_pid: u32) {
                 current_pid,
                 "evict_port_blocker: port is owned by OUR OWN PROCESS — \
                  double-start bug, ApiServerGuard should have caught this"
+            );
+            return;
+        }
+
+        if !port_owner_is_killable(owner_pid, owner_name.as_deref(), current_pid) {
+            tracing::warn!(
+                port,
+                owner_pid,
+                owner_name = owner_name
+                    .as_deref()
+                    .unwrap_or("<unknown — tasklist returned nothing>"),
+                "evict_port_blocker: port is owned by an unrecognized process; refusing to kill it"
             );
             return;
         }
@@ -259,6 +271,14 @@ async fn evict_port_blocker(host: &str, port: u16, current_pid: u32) {
 
     #[cfg(not(windows))]
     let _ = (host, port, current_pid);
+}
+
+fn port_owner_is_killable(owner_pid: u32, owner_name: Option<&str>, current_pid: u32) -> bool {
+    if owner_pid == current_pid {
+        return false;
+    }
+    let lower = owner_name.unwrap_or_default().to_ascii_lowercase();
+    lower.contains("llama-server") || lower.contains("inference-bridge")
 }
 
 /// Parse `netstat -ano -p tcp` output and return the PID of the process
@@ -566,14 +586,7 @@ async fn require_api_key(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let path = req.uri().path();
-    // Bypass auth for health endpoints and llama-server native endpoints.
-    // The /v1/* prefix routes always require auth; root-level paths (e.g.
-    // /props, /slots, /tokenize) are transparently proxied to llama-server
-    // and should be open (matching native llama-server behavior).
-    if path.ends_with("/health")
-        || !path.starts_with("/v1")
-        || req.method() == axum::http::Method::OPTIONS
-    {
+    if is_api_auth_exempt(req.method(), path) {
         return next.run(req).await;
     }
 
@@ -592,7 +605,7 @@ async fn require_api_key(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if auth.strip_prefix("Bearer ").unwrap_or("") == api_key {
+    if constant_time_eq(auth.strip_prefix("Bearer ").unwrap_or(""), &api_key) {
         return next.run(req).await;
     }
 
@@ -604,6 +617,23 @@ async fn require_api_key(
             r#"{"error":{"message":"Invalid API key. Provide your key as: Authorization: Bearer <key>","type":"invalid_request_error","code":"invalid_api_key"}}"#,
         ))
         .unwrap_or_default()
+}
+
+fn is_api_auth_exempt(method: &axum::http::Method, path: &str) -> bool {
+    *method == axum::http::Method::OPTIONS || matches!(path, "/v1/health" | "/api/v1/health")
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for index in 0..max_len {
+        let a = left.get(index).copied().unwrap_or(0);
+        let b = right.get(index).copied().unwrap_or(0);
+        diff |= usize::from(a ^ b);
+    }
+    diff == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -808,5 +838,45 @@ impl ApiServerGuard {
 impl Drop for ApiServerGuard {
     fn drop(&mut self) {
         API_SERVER_ACTIVE.store(false, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{constant_time_eq, is_api_auth_exempt, port_owner_is_killable};
+    use axum::http::Method;
+
+    #[test]
+    fn auth_exempts_only_exact_health_and_options() {
+        assert!(is_api_auth_exempt(&Method::GET, "/v1/health"));
+        assert!(is_api_auth_exempt(&Method::GET, "/api/v1/health"));
+        assert!(is_api_auth_exempt(&Method::OPTIONS, "/v1/chat/completions"));
+
+        assert!(!is_api_auth_exempt(&Method::GET, "/v1/models"));
+        assert!(!is_api_auth_exempt(&Method::POST, "/api/v1/models/load"));
+        assert!(!is_api_auth_exempt(&Method::POST, "/completion"));
+        assert!(!is_api_auth_exempt(&Method::GET, "/v1/anything/health"));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_string_equality() {
+        assert!(constant_time_eq("secret", "secret"));
+        assert!(!constant_time_eq("secret", "Secret"));
+        assert!(!constant_time_eq("secret", "secret-extra"));
+        assert!(!constant_time_eq("", "secret"));
+    }
+
+    #[test]
+    fn port_eviction_only_kills_owned_processes() {
+        assert!(port_owner_is_killable(100, Some("llama-server.exe"), 200));
+        assert!(port_owner_is_killable(
+            100,
+            Some("inference-bridge.exe"),
+            200
+        ));
+
+        assert!(!port_owner_is_killable(100, Some("node.exe"), 200));
+        assert!(!port_owner_is_killable(100, None, 200));
+        assert!(!port_owner_is_killable(100, Some("llama-server.exe"), 100));
     }
 }

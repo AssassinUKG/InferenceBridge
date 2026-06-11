@@ -1,4 +1,4 @@
-use crate::state::SharedState;
+use crate::state::{cancel_all_generations, SharedState};
 use axum::extract::State;
 use axum::response::Json;
 
@@ -54,18 +54,13 @@ pub struct CancelResponse {
 }
 
 pub async fn cancel_inference(State(state): State<SharedState>) -> Json<CancelResponse> {
-    let mut s = state.write().await;
+    let count = cancel_all_generations(&state).await;
 
-    if s.active_generation.is_some() {
-        s.generation_cancel.cancel();
-        s.cumulative_metrics.total_cancellations += 1;
-        if let Some(gen) = s.active_generation.as_mut() {
-            gen.status = "cancelled".to_string();
-        }
-        tracing::info!("Active inference cancelled via API");
+    if count > 0 {
+        tracing::info!(count, "Active inference cancelled via API");
         Json(CancelResponse {
             cancelled: true,
-            message: "Active inference request cancelled".to_string(),
+            message: format!("Cancelled {count} active inference request(s)"),
         })
     } else {
         Json(CancelResponse {

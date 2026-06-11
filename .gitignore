@@ -43,6 +43,8 @@ Thumbs.db
 # Common local secrets and credentials
 .envrc
 .npmrc
+.netrc
+.pypirc
 *.pem
 *.key
 *.p12
@@ -52,8 +54,26 @@ Thumbs.db
 *.der
 *.jks
 *.keystore
+*.kubeconfig
+*.ovpn
+*.secret
+*.secrets
+*.token
+*.credentials
 secrets.*
+.secrets
 .secrets/
+/secrets/
+/certs/
+/private/
+/credentials/
+/creds/
+
+# Root-level cloud/tool credential stores
+/.aws/
+/.azure/
+/.config/gcloud/
+/.kube/
 
 # Runtime app-support directories (used as config fallback in dev)
 /.inference-bridge/

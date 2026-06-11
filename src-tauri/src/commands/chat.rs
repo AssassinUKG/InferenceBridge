@@ -5,7 +5,9 @@ use crate::engine::client::{CompletionRequest, ImageData, LlamaClient};
 use crate::engine::streaming::{self, StreamEvent};
 use crate::models::profiles::{ModelFamily, ModelProfile};
 use crate::normalize::images::normalize_inline_image_payload;
-use crate::state::{append_live_stream_delta, begin_live_generation, SharedState};
+use crate::state::{
+    append_live_stream_delta, begin_live_generation, cancel_all_generations, SharedState,
+};
 use crate::templates::engine::{render_prompt, ChatMessage};
 use serde_json::json;
 
@@ -651,6 +653,7 @@ pub async fn send_message(
                 tokens_evaluated: evaluated,
                 decode_tokens_per_second: decode_tps,
                 prompt_tokens_per_second: prompt_tps,
+                ..
             } => {
                 full_text = text;
                 tokens_predicted = Some(predicted);
@@ -757,12 +760,8 @@ pub async fn send_message(
 
 #[tauri::command]
 pub async fn stop_generation(state: tauri::State<'_, SharedState>) -> Result<(), String> {
-    let cancel = {
-        let s = state.read().await;
-        s.generation_cancel.clone()
-    };
-    cancel.cancel();
+    let count = cancel_all_generations(state.inner()).await;
     finish_generation(state.inner(), "cancelled").await;
-    tracing::info!("stop_generation: cancellation token fired");
+    tracing::info!(count, "stop_generation: cancellation token fired");
     Ok(())
 }

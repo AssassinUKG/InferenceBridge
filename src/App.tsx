@@ -248,7 +248,7 @@ function LiveStreamFeed({ snapshot }: { snapshot: LiveStreamSnapshot | null }) {
           </div>
           <div className="truncate text-xs" style={{ color: "var(--text-1)" }}>
             {stream
-              ? `${stream.source} · ${stream.model} · ${stream.status} · ${stream.request_id}`
+              ? `${stream.source} - ${stream.model} - ${stream.status} - ${stream.request_id}`
               : "Waiting for the next generation."}
           </div>
         </div>
@@ -289,8 +289,8 @@ void LiveStreamFeed;
 
 function LiveStreamFeedV2({ snapshot }: { snapshot: LiveStreamSnapshot | null }) {
   const [streams, setStreams] = useState<LiveStreamSnapshot[]>(() => (snapshot ? [snapshot] : []));
-  const [mode, setMode] = useState<"full" | "visible" | "reasoning" | "events" | "json">("visible");
-  const [showHistory, setShowHistory] = useState(false);
+  const [mode, setMode] = useState<"full" | "visible" | "reasoning" | "events" | "json">("full");
+  const [showHistory, setShowHistory] = useState(true);
   const outputRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -905,7 +905,7 @@ function App() {
 
       {/* Main content */}
       <main className="flex min-h-0 flex-1 overflow-hidden">
-        {/* Sidebar — chat only */}
+        {/* Sidebar - chat only */}
         <div className={activeTab === "chat" ? "min-h-0 shrink-0" : "hidden"}>
           <Sidebar
             sessions={session.sessions}

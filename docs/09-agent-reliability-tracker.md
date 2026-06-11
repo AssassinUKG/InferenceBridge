@@ -32,6 +32,16 @@ model text.
 | IB-018 | Context pressure regression | Planned | Inject huge tool outputs before the next model turn and assert deterministic compaction or clear preflight failure. |
 | IB-019 | Browser benchmark verification | Planned | Verify DOM load, console cleanliness, search, type filter, duplicate team blocking, and max-team rejection for benchmark apps. |
 | IB-020 | Stop/unload lifecycle hardening | Planned | Stop model requests should settle UI/API state even when llama-server exits slowly or disappears mid-stop. |
+| IB-021 | Audit #3 context/override sniffing | Done | Unknown numeric/nested fields no longer trigger context-size or load overrides; explicit top-level/options fields still work. |
+| IB-022 | Audit #4 API auth bypass | Done | API key middleware now covers `/api/v1/*` and proxy fallback; only exact health routes and OPTIONS are exempt. |
+| IB-023 | Audit #5 safe port eviction | Done | Startup eviction only kills recognized `llama-server` / `inference-bridge` owners and refuses unknown/self PIDs. |
+| IB-024 | Audit #1/#2/#22 request cancellation lifecycle | Done First Pass | Added per-request cancellation tokens, stream-lifetime scheduler permits, disconnect drop guards, and receiver-closed stream shutdown. Follow-up: request-scoped UI/API cancel controls and multi-active UI state. |
+| IB-025 | Audit #6 Windows process/RAM queries | Done First Pass | Replaced WMIC calls with PowerShell `Get-CimInstance` for managed process cleanup, llama-server process listing, and system RAM detection; process listing keeps its `tasklist` fallback. |
+| IB-026 | Audit #7 `/v1/completions` streaming flag | Done First Pass | `/v1/completions` now rejects `stream: true` with a clear 400 instead of returning non-stream JSON to streaming clients. Full SSE support remains a follow-up. |
+| IB-027 | Audit #8 non-stream request timeout | Done First Pass | Added a 600s overall timeout around non-stream llama `/completion` and `/v1/chat/completions` calls while leaving streaming on its dedicated timeout path. |
+| IB-028 | Audit #9 finish reason length mapping | Done First Pass | Propagates llama.cpp `stopped_limit` / limit-like `stop_type` through non-stream and streaming paths and maps it to OpenAI `finish_reason: "length"` unless tool calls take precedence. |
+| IB-029 | Audit #14 stream usage semantics | Done First Pass | `stream_options.include_usage` now defaults false and, when true, emits a separate usage chunk with `choices: []` before `[DONE]`. |
+| IB-030 | Audit #27 unknown model status | Done First Pass | Unknown plain cloud/API model names now return OpenAI-style 404 `model_not_found`; active-model aliases still reuse the loaded model and plausible local GGUF/path requests may still attempt JIT load. |
 
 ## Done This Pass
 
@@ -83,9 +93,10 @@ Response:
 
 ## Next Implementation Order
 
-1. IB-016 follow-up: assert UI/live log visible text exports for leaked native markers and doubled tool blobs.
-2. IB-018: context pressure regression around huge tool outputs.
-3. IB-020: stop/unload lifecycle hardening.
-4. IB-012: add `/v1/health/models` and `/v1/health/backend` aliases with structured detail.
-5. IB-007: backend fallback routing.
-6. IB-017 follow-up: add one integration-style replay fixture for malformed tool args.
+1. Audit #10: strict model matching and safer implicit swap policy.
+2. Audit #11: configurable API compaction with explicit surfacing.
+3. Audit #12: stream parser profile gating / replay trace cleanup.
+4. IB-024 follow-up: request-scoped cancel controls and multi-active UI state.
+5. IB-016 follow-up: assert UI/live log visible text exports for leaked native markers and doubled tool blobs.
+6. IB-018: context pressure regression around huge tool outputs.
+7. IB-020: stop/unload lifecycle hardening.

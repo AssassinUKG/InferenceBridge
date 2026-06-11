@@ -53,9 +53,29 @@ function fmtNum(v: number | null | undefined) {
   return v.toLocaleString();
 }
 
+function safeDefaultContext(model: ModelInfo) {
+  const detected = model.context_window ?? 8192;
+  const name = `${model.filename} ${model.family ?? ""}`.toLowerCase();
+  const largeLocalModel =
+    model.provider_managed &&
+    ((model.size_gb ?? 0) >= 12 ||
+      name.includes("qwen") ||
+      name.includes("gemma") ||
+      name.includes("27b") ||
+      name.includes("26b"));
+  return largeLocalModel ? Math.min(detected, 16384) : detected;
+}
+
 function fmtSamplingValue(v: number | null | undefined) {
   if (v == null) return "n/a";
   return Number.isInteger(v) ? v.toString() : v.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function parseEditableNumber(value: string) {
+  const trimmed = value.trim().toLowerCase();
+  if (!trimmed || trimmed === "n/a" || trimmed === "-") return null;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function profileDefaultSummary(model: ModelInfo) {
@@ -209,7 +229,7 @@ function savedConfigKey(modelName: string) {
   return `inference-bridge:model-configs:${modelName}`;
 }
 
-// â”€â”€â”€ Panel wrapper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Panel wrapper
 
 function Panel({ children, className = "" }: { children: ReactNode; className?: string }) {
   return (
@@ -231,7 +251,7 @@ function Divider() {
   return <div style={{ height: "1px", background: "var(--border)" }} />;
 }
 
-// â”€â”€â”€ VRAM bar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// VRAM bar
 // Full bar = dedicated VRAM + system RAM (spill zone).
 // Green fill = used dedicated VRAM. Amber zone = system RAM overflow area.
 // Divider marks the boundary between dedicated (fast) and spill (slow) memory.
@@ -275,7 +295,7 @@ function VramBar({
         style={{ width: "110px", height: "6px", background: "var(--surface-3)" }}
         title={title}
       >
-        {/* Spill zone (right portion = system RAM) â€” always amber tint */}
+        {/* Spill zone (right portion = system RAM), always amber tint */}
         {showSpill && (
           <div
             style={{
@@ -321,7 +341,7 @@ function VramBar({
   );
 }
 
-// â”€â”€â”€ Main component â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Main component
 
 export function ModelSelector({
   models,
@@ -341,6 +361,11 @@ export function ModelSelector({
 }: Props) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<FilterKey>("all");
+  const [archFilter, setArchFilter] = useState("");
+  const [paramsFilter, setParamsFilter] = useState("");
+  const [llmFilter, setLlmFilter] = useState("");
+  const [providerFilter, setProviderFilter] = useState("");
+  const [quantFilter, setQuantFilter] = useState("");
   const [copied, setCopied] = useState(false);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const serverUrl = buildServerUrl(settings);
@@ -358,8 +383,15 @@ export function ModelSelector({
       !q ||
       m.filename.toLowerCase().includes(q) ||
       m.family.toLowerCase().includes(q) ||
-      (m.quant ?? "").toLowerCase().includes(q);
+      (m.quant ?? "").toLowerCase().includes(q) ||
+      (m.hf_repo ?? "").toLowerCase().includes(q) ||
+      m.provider_name.toLowerCase().includes(q);
     if (!matchQ) return false;
+    if (archFilter && !(m.family || m.gguf_architecture || "").toLowerCase().includes(archFilter.toLowerCase())) return false;
+    if (paramsFilter && !modelParamsLabel(m).toLowerCase().includes(paramsFilter.toLowerCase())) return false;
+    if (llmFilter && !shortModelName(m).toLowerCase().includes(llmFilter.toLowerCase())) return false;
+    if (providerFilter && !modelPublisher(m).toLowerCase().includes(providerFilter.toLowerCase())) return false;
+    if (quantFilter && !(m.quant ?? "").toLowerCase().includes(quantFilter.toLowerCase())) return false;
     if (filter === "reasoning") return m.supports_reasoning;
     if (filter === "tools") return m.supports_tools;
     if (filter === "vision") return m.supports_vision;
@@ -511,6 +543,27 @@ export function ModelSelector({
           <span>Quant</span>
           <span className="text-right">Actions</span>
         </div>
+        <div className="grid h-10 shrink-0 grid-cols-[120px_110px_minmax(220px,1fr)_130px_88px_116px] items-center gap-2 border-b px-5" style={{ borderColor: "var(--border)", background: "var(--surface-1)" }}>
+          <ColumnFilter value={archFilter} onChange={setArchFilter} placeholder="Arch" />
+          <ColumnFilter value={paramsFilter} onChange={setParamsFilter} placeholder="Params" />
+          <ColumnFilter value={llmFilter} onChange={setLlmFilter} placeholder="LLM" />
+          <ColumnFilter value={providerFilter} onChange={setProviderFilter} placeholder="Provider" />
+          <ColumnFilter value={quantFilter} onChange={setQuantFilter} placeholder="Quant" />
+          <button
+            onClick={() => {
+              setQuery("");
+              setArchFilter("");
+              setParamsFilter("");
+              setLlmFilter("");
+              setProviderFilter("");
+              setQuantFilter("");
+            }}
+            className="justify-self-end rounded px-2 py-1 text-[11px]"
+            style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)", cursor: "pointer" }}
+          >
+            Clear
+          </button>
+        </div>
 
         <div className="min-h-0 flex-1 overflow-y-auto">
           {models.length === 0 ? (
@@ -580,7 +633,7 @@ export function ModelSelector({
 
 }
 
-// â”€â”€â”€ Status pill â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Status pill
 
 function modelParamsLabel(model: ModelInfo) {
   const text = `${model.filename} ${model.hf_repo ?? ""}`.toLowerCase();
@@ -655,8 +708,6 @@ function DenseModelRow({
       <span className="truncate font-mono text-[11px]" title={modelPublisher(model)}>{modelPublisher(model)}</span>
       <span className="font-mono text-[11px]" style={{ color: selected ? "#fff" : "#fbbf24" }}>{model.quant ?? "-"}</span>
       <div className="flex justify-end gap-1.5">
-        {model.supports_tools && <IconPill title="Tool capable">âŒ˜</IconPill>}
-        {model.supports_vision && <IconPill title="Vision capable">â—‰</IconPill>}
         <button
           onClick={(e) => { e.stopPropagation(); showSwap ? onSwap() : onLoad(); }}
           disabled={isLoading || !model.provider_managed || loaded}
@@ -686,11 +737,48 @@ function ModelInspector({
   previousModel: string | null;
   processStatus: ProcessStatusInfo | null;
   isLoading: boolean;
-  onLoad: (modelName: string) => void;
-  onSwap: (modelName: string) => void;
+  onLoad: (modelName: string, options?: LoadModelOptions) => void;
+  onSwap: (modelName: string, options?: LoadModelOptions) => void;
   onUnload: () => void;
   onSwapBack: () => void;
 }) {
+  const [activeInspectorTab, setActiveInspectorTab] = useState<"info" | "load" | "inference">("info");
+  const defaultContext = model?.context_window ?? model?.max_context_window ?? 8192;
+  const [contextSize, setContextSize] = useState(defaultContext);
+  const [fitMode, setFitMode] = useState("on");
+  const [useJinja, setUseJinja] = useState(model?.template_mode === "repo");
+  const [reasoningMode, setReasoningMode] = useState(model?.supports_reasoning ? "auto" : "off");
+  const [templateMode, setTemplateMode] = useState(model?.template_mode ?? "repo");
+  const [chatTemplateKwargsJson, setChatTemplateKwargsJson] = useState("");
+  const [draftModelPath, setDraftModelPath] = useState("");
+  const [specType, setSpecType] = useState("");
+  const [specDraftNMax, setSpecDraftNMax] = useState(0);
+  const [extraArgs, setExtraArgs] = useState("");
+  const [temperature, setTemperature] = useState(fmtSamplingValue(model?.default_temperature));
+  const [topP, setTopP] = useState(fmtSamplingValue(model?.default_top_p));
+  const [topK, setTopK] = useState(fmtSamplingValue(model?.default_top_k));
+  const [minP, setMinP] = useState(fmtSamplingValue(model?.default_min_p));
+  const [presencePenalty, setPresencePenalty] = useState(fmtSamplingValue(model?.default_presence_penalty));
+
+  useEffect(() => {
+    const nextContext = model?.context_window ?? model?.max_context_window ?? 8192;
+    setContextSize(nextContext);
+    setFitMode("on");
+    setUseJinja(model?.template_mode === "repo");
+    setReasoningMode(model?.supports_reasoning ? "auto" : "off");
+    setTemplateMode(model?.template_mode ?? "repo");
+    setChatTemplateKwargsJson("");
+    setDraftModelPath("");
+    setSpecType("");
+    setSpecDraftNMax(0);
+    setExtraArgs("");
+    setTemperature(fmtSamplingValue(model?.default_temperature));
+    setTopP(fmtSamplingValue(model?.default_top_p));
+    setTopK(fmtSamplingValue(model?.default_top_k));
+    setMinP(fmtSamplingValue(model?.default_min_p));
+    setPresencePenalty(fmtSamplingValue(model?.default_presence_penalty));
+  }, [model?.filename, model?.context_window, model?.max_context_window, model?.template_mode, model?.supports_reasoning, model?.default_temperature, model?.default_top_p, model?.default_top_k, model?.default_min_p, model?.default_presence_penalty]);
+
   if (!model) {
     return <EmptyMsg title="No model selected" body="Select a model to inspect details and launch controls." />;
   }
@@ -698,6 +786,29 @@ function ModelInspector({
   const loaded = model.filename === loadedModel;
   const liveContext =
     processStatus?.model === model.filename ? processStatus.last_launch_preview?.context_size ?? null : null;
+  const launchPreview =
+    processStatus?.model === model.filename ? processStatus.last_launch_preview ?? null : null;
+  const lastMetrics = processStatus?.last_generation_metrics ?? null;
+  const samplingExtraArgs = buildArgs({
+    temp: parseEditableNumber(temperature),
+    topP: parseEditableNumber(topP),
+    topK: parseEditableNumber(topK),
+    minP: parseEditableNumber(minP),
+    presencePenalty: parseEditableNumber(presencePenalty),
+  });
+  const mergedExtraArgs = [...parseCliArgs(samplingExtraArgs), ...parseCliArgs(extraArgs)];
+  const loadOptions: LoadModelOptions = {
+    contextSize,
+    fitMode,
+    useJinja,
+    reasoningMode,
+    templateMode,
+    chatTemplateKwargsJson: chatTemplateKwargsJson.trim() || null,
+    draftModelPath: draftModelPath.trim() || null,
+    specType: specType.trim() || null,
+    specDraftNMax,
+    extraArgs: mergedExtraArgs,
+  };
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
@@ -710,8 +821,8 @@ function ModelInspector({
           {loaded && <span className="rounded px-2 py-0.5 text-[10px] font-bold uppercase" style={{ background: "rgba(52,211,153,0.14)", color: "#6ee7b7", border: "1px solid rgba(52,211,153,0.28)" }}>Loaded</span>}
         </div>
         <div className="mt-3 grid grid-cols-2 gap-2">
-          <ActionBtn label={loaded ? "Unload Model" : "Load Model"} disabled={isLoading || !model.provider_managed} variant={loaded ? "ghost" : "primary"} onClick={() => loaded ? onUnload() : onLoad(model.filename)} />
-          <ActionBtn label="Swap In" disabled={isLoading || loaded || !loadedModel || !model.provider_managed} variant="indigo" onClick={() => onSwap(model.filename)} />
+          <ActionBtn label={loaded ? "Unload Model" : "Load Model"} disabled={isLoading || !model.provider_managed} variant={loaded ? "ghost" : "primary"} onClick={() => loaded ? onUnload() : onLoad(model.filename, loadOptions)} />
+          <ActionBtn label="Swap In" disabled={isLoading || loaded || !loadedModel || !model.provider_managed} variant="indigo" onClick={() => onSwap(model.filename, loadOptions)} />
           {previousModel && previousModel !== model.filename && (
             <button
               onClick={onSwapBack}
@@ -727,29 +838,129 @@ function ModelInspector({
 
       <div className="border-b px-4 py-3" style={{ borderColor: "var(--border)" }}>
         <div className="flex rounded-md p-0.5" style={{ background: "var(--surface-2)" }}>
-          {["Info", "Load", "Inference"].map((tab) => (
-            <button key={tab} className="flex-1 rounded px-2 py-1.5 text-xs font-semibold" style={{ background: tab === "Info" ? "var(--surface-3)" : "transparent", color: tab === "Info" ? "var(--text-0)" : "var(--text-1)", border: "none" }}>{tab}</button>
+          {([
+            ["info", "Info"],
+            ["load", "Load"],
+            ["inference", "Inference"],
+          ] as const).map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setActiveInspectorTab(key)}
+              className="flex-1 rounded px-2 py-1.5 text-xs font-semibold"
+              style={{
+                background: activeInspectorTab === key ? "var(--surface-3)" : "transparent",
+                color: activeInspectorTab === key ? "var(--text-0)" : "var(--text-1)",
+                border: "none",
+                cursor: "pointer",
+              }}
+            >
+              {label}
+            </button>
           ))}
         </div>
       </div>
 
-      <section className="px-4 py-4">
-        <h4 className="mb-3 text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--text-0)" }}>Model Information</h4>
-        <InfoRow label="Model" value={shortModelName(model)} />
-        <InfoRow label="File" value={model.filename} />
-        <InfoRow label="Format" value={model.provider_managed ? "GGUF" : "OpenAI-compatible"} />
-        <InfoRow label="Quantization" value={model.quant ?? "-"} />
-        <InfoRow label="Arch" value={model.family || model.gguf_architecture || "-"} />
-        <InfoRow label="Params" value={modelParamsLabel(model)} />
-        <InfoRow label="Capabilities" value={[
-          model.supports_vision ? "Vision" : null,
-          model.supports_tools ? "Tool use" : null,
-          model.supports_reasoning ? "Reasoning" : null,
-        ].filter(Boolean).join(", ") || "Chat"} />
-        <InfoRow label="Context" value={liveContext ? `${fmtNum(liveContext)} live` : model.max_context_window ? `${fmtNum(model.max_context_window)} tokens` : "-"} />
-        <InfoRow label="Size on disk" value={model.size_gb ? `${model.size_gb.toFixed(2)} GB` : "-"} />
-        <InfoRow label="Provider" value={model.provider_name} />
-      </section>
+      {activeInspectorTab === "info" && (
+        <section className="px-4 py-4">
+          <h4 className="mb-3 text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--text-0)" }}>Model Information</h4>
+          <InfoRow label="Model" value={shortModelName(model)} />
+          <InfoRow label="File" value={model.filename} />
+          <InfoRow label="Format" value={model.provider_managed ? "GGUF" : "OpenAI-compatible"} />
+          <InfoRow label="Quantization" value={model.quant ?? "-"} />
+          <InfoRow label="Arch" value={model.family || model.gguf_architecture || "-"} />
+          <InfoRow label="Params" value={modelParamsLabel(model)} />
+          <InfoRow label="Capabilities" value={[
+            model.supports_vision ? "Vision" : null,
+            model.supports_tools ? "Tool use" : null,
+            model.supports_reasoning ? "Reasoning" : null,
+          ].filter(Boolean).join(", ") || "Chat"} />
+          <InfoRow label="Context" value={liveContext ? `${fmtNum(liveContext)} live` : model.max_context_window ? `${fmtNum(model.max_context_window)} tokens` : "-"} />
+          <InfoRow label="Size on disk" value={model.size_gb ? `${model.size_gb.toFixed(2)} GB` : "-"} />
+          <InfoRow label="Provider" value={model.provider_name} />
+        </section>
+      )}
+
+      {activeInspectorTab === "load" && (
+        <section className="px-4 py-4">
+          <h4 className="mb-3 text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--text-0)" }}>Load Configuration</h4>
+          <InfoRow label="State" value={loaded ? "Loaded" : "Not loaded"} />
+          <InfoRow label="Context" value={launchPreview?.context_size ? `${fmtNum(launchPreview.context_size)} tokens` : model.max_context_window ? `${fmtNum(model.max_context_window)} max` : "Model default"} />
+          <InfoRow label="Template" value={launchPreview?.template_source ?? model.template_source ?? model.template_mode ?? "-"} />
+          <InfoRow label="MMProj" value={launchPreview?.mmproj_path ? "Attached" : model.supports_vision ? "Not attached" : "Not required"} />
+          <InfoRow label="Draft" value={launchPreview?.draft_model_path ? "Enabled" : "Disabled"} />
+          {launchPreview?.draft_model_path && (
+            <>
+              <InfoRow label="Spec Type" value={launchPreview.spec_type || "-"} />
+              <InfoRow label="Draft N" value={launchPreview.spec_draft_n_max ? String(launchPreview.spec_draft_n_max) : "-"} />
+              <InfoRow label="Draft File" value={launchPreview.draft_model_path} />
+            </>
+          )}
+          <div className="mt-4 space-y-2">
+            <EditableRow label="Context">
+              <input type="number" min={512} step={512} value={contextSize} onChange={(e) => setContextSize(Math.max(512, Number(e.target.value) || 512))} style={editInputStyle()} />
+            </EditableRow>
+            <EditableRow label="Fit">
+              <input value={fitMode} onChange={(e) => setFitMode(e.target.value)} style={editInputStyle()} placeholder="on / off / auto" />
+            </EditableRow>
+            <EditableRow label="Jinja">
+              <input type="checkbox" checked={useJinja} onChange={(e) => setUseJinja(e.target.checked)} />
+            </EditableRow>
+            <EditableRow label="Reasoning">
+              <select value={reasoningMode} onChange={(e) => setReasoningMode(e.target.value)} style={editInputStyle()}>
+                <option value="auto">auto</option>
+                <option value="on">on</option>
+                <option value="off">off</option>
+              </select>
+            </EditableRow>
+            <EditableRow label="Template">
+              <select value={templateMode} onChange={(e) => setTemplateMode(e.target.value)} style={editInputStyle()}>
+                <option value="repo">repo</option>
+                <option value="builtin">builtin</option>
+                <option value="custom">custom</option>
+              </select>
+            </EditableRow>
+            <EditableRow label="Kwargs JSON">
+              <input value={chatTemplateKwargsJson} onChange={(e) => setChatTemplateKwargsJson(e.target.value)} style={editInputStyle()} placeholder='{"enable_thinking": true}' />
+            </EditableRow>
+            <EditableRow label="Draft GGUF">
+              <input value={draftModelPath} onChange={(e) => setDraftModelPath(e.target.value)} style={editInputStyle()} placeholder="Only for matching draft-capable models" />
+            </EditableRow>
+            <EditableRow label="Spec Type">
+              <input value={specType} onChange={(e) => setSpecType(e.target.value)} style={editInputStyle()} placeholder="draft-mtp" />
+            </EditableRow>
+            <EditableRow label="Draft N">
+              <input type="number" min={0} max={16} value={specDraftNMax} onChange={(e) => setSpecDraftNMax(Math.max(0, Number(e.target.value) || 0))} style={editInputStyle()} />
+            </EditableRow>
+          </div>
+          <div className="mt-4 grid grid-cols-2 gap-2">
+            <ActionBtn label={loaded ? "Reload Options" : "Load Model"} disabled={isLoading || !model.provider_managed} variant="primary" onClick={() => onLoad(model.filename, loadOptions)} />
+            <ActionBtn label="Swap In" disabled={isLoading || loaded || !loadedModel || !model.provider_managed} variant="indigo" onClick={() => onSwap(model.filename, loadOptions)} />
+          </div>
+        </section>
+      )}
+
+      {activeInspectorTab === "inference" && (
+        <section className="px-4 py-4">
+          <h4 className="mb-3 text-xs font-semibold uppercase tracking-wider" style={{ color: "var(--text-0)" }}>Inference</h4>
+          <div className="space-y-2">
+            <EditableRow label="Temperature"><input value={temperature} onChange={(e) => setTemperature(e.target.value)} style={editInputStyle()} /></EditableRow>
+            <EditableRow label="Top P"><input value={topP} onChange={(e) => setTopP(e.target.value)} style={editInputStyle()} /></EditableRow>
+            <EditableRow label="Top K"><input value={topK} onChange={(e) => setTopK(e.target.value)} style={editInputStyle()} /></EditableRow>
+            <EditableRow label="Min P"><input value={minP} onChange={(e) => setMinP(e.target.value)} style={editInputStyle()} /></EditableRow>
+            <EditableRow label="Presence"><input value={presencePenalty} onChange={(e) => setPresencePenalty(e.target.value)} style={editInputStyle()} /></EditableRow>
+            <EditableRow label="Extra Args"><input value={extraArgs} onChange={(e) => setExtraArgs(e.target.value)} style={editInputStyle()} placeholder="Raw llama-server args" /></EditableRow>
+          </div>
+          <div className="mt-4 grid grid-cols-2 gap-2">
+            <ActionBtn label={loaded ? "Reload Options" : "Load Model"} disabled={isLoading || !model.provider_managed} variant="primary" onClick={() => onLoad(model.filename, loadOptions)} />
+            <ActionBtn label="Swap In" disabled={isLoading || loaded || !loadedModel || !model.provider_managed} variant="indigo" onClick={() => onSwap(model.filename, loadOptions)} />
+          </div>
+          <div className="mt-4">
+            <InfoRow label="Launch Args" value={mergedExtraArgs.join(" ") || "-"} />
+          </div>
+          <InfoRow label="Last TPS" value={lastMetrics?.decode_tokens_per_second != null ? `${lastMetrics.decode_tokens_per_second.toFixed(2)} tok/s` : "-"} />
+          <InfoRow label="Last Tokens" value={lastMetrics?.total_tokens != null ? `${lastMetrics.total_tokens}` : "-"} />
+        </section>
+      )}
     </div>
   );
 }
@@ -763,12 +974,54 @@ function InfoRow({ label, value }: { label: string; value: string }) {
   );
 }
 
-function MiniCap({ label, tone }: { label: string; tone: string }) {
-  return <span className="rounded px-1.5 py-0.5 text-[9px] font-semibold" style={{ color: tone, border: `1px solid ${tone}55`, background: `${tone}18` }}>{label}</span>;
+function EditableRow({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <label className="flex items-center gap-3 text-xs">
+      <span className="w-24 shrink-0" style={{ color: "var(--text-0)" }}>{label}</span>
+      <span className="min-w-0 flex-1">{children}</span>
+    </label>
+  );
 }
 
-function IconPill({ title, children }: { title: string; children: ReactNode }) {
-  return <span title={title} className="flex h-6 w-6 items-center justify-center rounded-md text-[11px]" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}>{children}</span>;
+function editInputStyle() {
+  return {
+    width: "100%",
+    minWidth: 0,
+    borderRadius: 6,
+    border: "1px solid var(--border)",
+    background: "var(--surface-2)",
+    color: "var(--text-0)",
+    padding: "6px 8px",
+    outline: "none",
+  } as const;
+}
+
+function ColumnFilter({
+  value,
+  onChange,
+  placeholder,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  placeholder: string;
+}) {
+  return (
+    <input
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+      placeholder={placeholder}
+      className="min-w-0 rounded px-2 py-1 text-[11px] outline-none"
+      style={{
+        background: "var(--surface-2)",
+        border: "1px solid var(--border)",
+        color: "var(--text-0)",
+      }}
+    />
+  );
+}
+
+function MiniCap({ label, tone }: { label: string; tone: string }) {
+  return <span className="rounded px-1.5 py-0.5 text-[9px] font-semibold" style={{ color: tone, border: `1px solid ${tone}55`, background: `${tone}18` }}>{label}</span>;
 }
 
 function StatusPill({ state }: { state: string }) {
@@ -810,7 +1063,7 @@ function StatusPill({ state }: { state: string }) {
   );
 }
 
-// â”€â”€â”€ Tool button â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Tool button
 
 function ToolBtn({
   label,
@@ -847,7 +1100,7 @@ function ToolBtn({
   );
 }
 
-// â”€â”€â”€ Loading bar â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Loading bar
 
 function LoadingBar({ progress }: { progress: LoadProgress }) {
   const pct = Math.round(progress.progress * 100);
@@ -906,7 +1159,7 @@ function LoadingBar({ progress }: { progress: LoadProgress }) {
   );
 }
 
-// â”€â”€â”€ Loaded model row â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Loaded model row
 
 function LoadedModelRow({
   model,
@@ -1057,7 +1310,7 @@ function LoadedModelRow({
   );
 }
 
-// â”€â”€â”€ Model row â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Model row
 
 function ModelRow({
   model,
@@ -1076,7 +1329,8 @@ function ModelRow({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [hovered, setHovered] = useState(false);
-  const defaultCtx = model.context_window ?? 8192;
+  const defaultCtx = safeDefaultContext(model);
+  const detectedCtx = model.context_window ?? 8192;
   // Use the model's true training context ceiling from the profile, falling back to a conservative multiple
   const maxCtx = model.max_context_window ?? Math.max(defaultCtx * 4, 32768);
   const minCtx = 512;
@@ -1170,8 +1424,8 @@ function ModelRow({
   const gpuStats = useGpuStats();
 
   // KV-cache bytes per token using architecture metadata from GGUF.
-  // Default cache type is q8_0 (1 byte/element) â€” matches ProcessConfig default.
-  // Formula: n_layers Ã— 2 (K+V) Ã— n_kv_heads Ã— head_dim Ã— bytes_per_element
+  // Default cache type is q8_0 (1 byte/element), matching ProcessConfig default.
+  // Formula: n_layers x 2 (K+V) x n_kv_heads x head_dim x bytes_per_element
   const KV_BPE = 1.0; // q8_0
   const kvBytesPerToken: number | null =
     model.n_layers != null && model.n_kv_heads != null && model.head_dim != null
@@ -1359,9 +1613,14 @@ function ModelRow({
             />
             <div className="mt-1 flex justify-between text-[10px]" style={{ color: "var(--text-2)" }}>
               <span>{minCtx.toLocaleString()}</span>
-              <span>Default: {defaultCtx.toLocaleString()}</span>
+              <span>Safe default: {defaultCtx.toLocaleString()}</span>
               <span>{maxCtx.toLocaleString()}</span>
             </div>
+            {detectedCtx > defaultCtx && (
+              <div className="mt-1 text-[10px]" style={{ color: "#fbbf24" }}>
+                Model metadata advertises {detectedCtx.toLocaleString()} ctx; manual loads default lower to avoid oversized KV allocation.
+              </div>
+            )}
             {/* VRAM/overflow monitor as slider bar */}
             {gpuStats && (
               <div className="mt-2">
@@ -1379,8 +1638,8 @@ function ModelRow({
           <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
             <StatTile label="File Size" value={model.size_gb && model.size_gb > 0 ? `${model.size_gb.toFixed(2)} GB` : 'N/A'} />
             <StatTile label="Provider" value={model.provider_name} />
-            <StatTile label="Default Context" value={model.context_window ? `${fmtNum(model.context_window)} tokens` : 'â€”'} />
-            <StatTile label="Max Context" value={model.max_context_window ? `${fmtNum(model.max_context_window)} tokens` : 'â€”'} />
+            <StatTile label="Default Context" value={model.context_window ? `${fmtNum(model.context_window)} tokens` : "Unknown"} />
+            <StatTile label="Max Context" value={model.max_context_window ? `${fmtNum(model.max_context_window)} tokens` : "Unknown"} />
             <StatTile label="Tool Format" value={fmtToolFormat(model.tool_call_format)} />
           </div>
           {(!isExternalProvider && (!model.size_gb || model.size_gb === 0)) && (
@@ -1593,7 +1852,7 @@ function ModelRow({
   );
 }
 
-// â”€â”€â”€ Empty state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Empty state
 
 function EmptyMsg({ title, body }: { title: string; body: string }) {
   return (
@@ -1608,7 +1867,7 @@ function EmptyMsg({ title, body }: { title: string; body: string }) {
   );
 }
 
-// â”€â”€â”€ Stat tile â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Stat tile
 
 function StatTile({ label, value }: { label: string; value: string }) {
   return (
@@ -1629,7 +1888,7 @@ function StatTile({ label, value }: { label: string; value: string }) {
   );
 }
 
-// â”€â”€â”€ Capability badge â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Capability badge
 
 function CapBadge({ label, tone }: { label: string; tone: "amber" | "emerald" | "rose" | "cyan" | "violet" | "slate" }) {
   const colors: Record<string, [string, string]> = {
@@ -1659,7 +1918,7 @@ function CapBadge({ label, tone }: { label: string; tone: "amber" | "emerald" | 
   );
 }
 
-// â”€â”€â”€ Action button â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Action button
 
 function ProviderBadge({ providerName, managed }: { providerName: string; managed: boolean }) {
   return (
@@ -1733,7 +1992,7 @@ function ActionBtn({
   );
 }
 
-// â”€â”€â”€ Icons â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// Icons
 
 function GearIcon() {
   return (

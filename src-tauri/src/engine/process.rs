@@ -168,6 +168,8 @@ pub struct LaunchConfig {
     pub tensor_split: Vec<f32>,
     /// Draft model path for speculative decoding (-md). Empty = disabled.
     pub draft_model_path: String,
+    pub spec_type: String,
+    pub spec_draft_n_max: u32,
     pub draft_max_tokens: u32,
     pub draft_min_tokens: u32,
     pub draft_p_min: f32,
@@ -195,6 +197,12 @@ pub struct LaunchPreview {
     pub template_path: Option<String>,
     pub template_name: Option<String>,
     pub chat_template_kwargs_json: Option<String>,
+    pub draft_model_path: String,
+    pub spec_type: String,
+    pub spec_draft_n_max: u32,
+    pub draft_max_tokens: u32,
+    pub draft_min_tokens: u32,
+    pub draft_p_min: f32,
     pub args: Vec<String>,
 }
 
@@ -444,6 +452,14 @@ impl LlamaProcess {
         if !config.draft_model_path.is_empty() {
             args.push("-md".to_string());
             args.push(config.draft_model_path.clone());
+            if !config.spec_type.trim().is_empty() {
+                args.push("--spec-type".to_string());
+                args.push(config.spec_type.clone());
+            }
+            if config.spec_draft_n_max > 0 {
+                args.push("--spec-draft-n-max".to_string());
+                args.push(config.spec_draft_n_max.to_string());
+            }
             if config.draft_max_tokens > 0 {
                 args.push("--draft-max".to_string());
                 args.push(config.draft_max_tokens.to_string());
@@ -482,6 +498,12 @@ impl LlamaProcess {
                 .map(|path| path.to_string_lossy().to_string()),
             template_name: config.template_name.clone(),
             chat_template_kwargs_json: config.chat_template_kwargs_json.clone(),
+            draft_model_path: config.draft_model_path.clone(),
+            spec_type: config.spec_type.clone(),
+            spec_draft_n_max: config.spec_draft_n_max,
+            draft_max_tokens: config.draft_max_tokens,
+            draft_min_tokens: config.draft_min_tokens,
+            draft_p_min: config.draft_p_min,
             args,
         })
     }
@@ -704,9 +726,9 @@ impl LlamaProcess {
 
     /// Kill any stale managed llama-server processes before launching a new one.
     ///
-    /// **Call this BEFORE acquiring the state write lock.**  The underlying WMIC query
-    /// can take 1-3 seconds on Windows; running it while holding the write lock would
-    /// block every concurrent reader (including in-flight API requests) for that duration.
+    /// **Call this BEFORE acquiring the state write lock.**  The underlying Windows
+    /// process query can take 1-3 seconds; running it while holding the write lock
+    /// would block every concurrent reader (including in-flight API requests).
     #[cfg(windows)]
     pub fn clear_stale_managed_processes() {
         match Self::kill_all_managed_processes() {
@@ -726,14 +748,14 @@ impl LlamaProcess {
     /// Launch llama-server with the given configuration.
     ///
     /// When `config.port` is 0, an ephemeral port is auto-assigned by the OS.
-    /// Stale-process cleanup (WMIC scan) should be done **before** calling this
+    /// Stale-process cleanup should be done **before** calling this
     /// via [`LlamaProcess::clear_stale_managed_processes`] so the write lock is
     /// not held during a slow system scan.
     pub async fn launch(&mut self, mut config: LaunchConfig) -> anyhow::Result<()> {
         Self::validate_launch_config(&config)?;
         // Shutdown any existing process first
         self.shutdown().await?;
-        // NOTE: stale-process cleanup (kill_all_managed_processes / WMIC) was moved
+        // NOTE: stale-process cleanup (kill_all_managed_processes) was moved
         // to `clear_stale_managed_processes()` and must be called BEFORE the write lock.
 
         // Auto-assign a free ephemeral port when port is 0, and keep the
@@ -1074,20 +1096,25 @@ impl LlamaProcess {
 
     #[cfg(windows)]
     pub fn kill_all_managed_processes() -> anyhow::Result<u32> {
+        #[derive(serde::Deserialize)]
+        struct CimProcess {
+            #[serde(rename = "ProcessId")]
+            process_id: Option<u32>,
+            #[serde(rename = "ExecutablePath")]
+            executable_path: Option<String>,
+        }
+
         let managed_exe = Self::normalize_windows_path(
             &Self::managed_binary_dir()
                 .join("llama-server.exe")
                 .to_string_lossy(),
         );
 
-        let output = system_command("wmic")
+        let output = system_command("powershell")
             .args([
-                "process",
-                "where",
-                "name='llama-server.exe'",
-                "get",
-                "ProcessId,ExecutablePath",
-                "/FORMAT:CSV",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name = 'llama-server.exe'\" | Select-Object ProcessId,ExecutablePath | ConvertTo-Json -Compress",
             ])
             .output()?;
 
@@ -1099,21 +1126,27 @@ impl LlamaProcess {
         }
 
         let text = String::from_utf8_lossy(&output.stdout);
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(0);
+        }
+
+        let value: serde_json::Value = serde_json::from_str(text)?;
+        let rows: Vec<CimProcess> = if value.is_array() {
+            serde_json::from_value(value)?
+        } else {
+            vec![serde_json::from_value(value)?]
+        };
+
         let mut killed = 0u32;
-        for line in text.lines().skip(1) {
-            let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() < 3 {
+        for row in rows {
+            let Some(pid) = row.process_id else {
                 continue;
-            }
+            };
+            let executable_path =
+                Self::normalize_windows_path(row.executable_path.as_deref().unwrap_or_default());
 
-            let executable_path = Self::normalize_windows_path(parts[1]);
-            let pid = parts[2]
-                .trim_matches('"')
-                .trim()
-                .parse::<u32>()
-                .unwrap_or(0);
-
-            if pid == 0 || executable_path.is_empty() {
+            if executable_path.is_empty() {
                 continue;
             }
 

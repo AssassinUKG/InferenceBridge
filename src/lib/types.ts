@@ -54,6 +54,12 @@ export interface LaunchPreview {
   template_path: string | null;
   template_name: string | null;
   chat_template_kwargs_json: string | null;
+  draft_model_path: string;
+  spec_type: string;
+  spec_draft_n_max: number;
+  draft_max_tokens: number;
+  draft_min_tokens: number;
+  draft_p_min: number;
   args: string[];
 }
 
@@ -210,6 +216,12 @@ export interface AppSettings {
   template_name: string | null;
   custom_template_path: string | null;
   chat_template_kwargs_json: string | null;
+  draft_model_path: string;
+  spec_type: string;
+  spec_draft_n_max: number;
+  draft_max_tokens: number;
+  draft_min_tokens: number;
+  draft_p_min: number;
   extra_args: string[];
   api_key: string | null;
   active_provider: string;

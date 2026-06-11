@@ -56,6 +56,12 @@ export interface LoadModelOptions {
   templateName?: string | null;
   customTemplatePath?: string | null;
   chatTemplateKwargsJson?: string | null;
+  draftModelPath?: string | null;
+  specType?: string | null;
+  specDraftNMax?: number;
+  draftMaxTokens?: number;
+  draftMinTokens?: number;
+  draftPMin?: number;
   extraArgs?: string[];
 }
 
@@ -75,6 +81,12 @@ export const loadModel = (modelName: string, options?: LoadModelOptions) =>
       templateName: options?.templateName ?? null,
       customTemplatePath: options?.customTemplatePath ?? null,
       chatTemplateKwargsJson: options?.chatTemplateKwargsJson ?? null,
+      draftModelPath: options?.draftModelPath ?? null,
+      specType: options?.specType ?? null,
+      specDraftNMax: options?.specDraftNMax,
+      draftMaxTokens: options?.draftMaxTokens,
+      draftMinTokens: options?.draftMinTokens,
+      draftPMin: options?.draftPMin,
       extraArgs: options?.extraArgs,
     },
   });
@@ -97,6 +109,12 @@ export const swapModel = (modelName?: string, options?: LoadModelOptions) =>
       templateName: options?.templateName ?? null,
       customTemplatePath: options?.customTemplatePath ?? null,
       chatTemplateKwargsJson: options?.chatTemplateKwargsJson ?? null,
+      draftModelPath: options?.draftModelPath ?? null,
+      specType: options?.specType ?? null,
+      specDraftNMax: options?.specDraftNMax,
+      draftMaxTokens: options?.draftMaxTokens,
+      draftMinTokens: options?.draftMinTokens,
+      draftPMin: options?.draftPMin,
       extraArgs: options?.extraArgs,
     },
   });

@@ -40,6 +40,12 @@ pub struct AppSettings {
     pub template_name: Option<String>,
     pub custom_template_path: Option<String>,
     pub chat_template_kwargs_json: Option<String>,
+    pub draft_model_path: String,
+    pub spec_type: String,
+    pub spec_draft_n_max: u32,
+    pub draft_max_tokens: u32,
+    pub draft_min_tokens: u32,
+    pub draft_p_min: f32,
     pub extra_args: Vec<String>,
     /// API key for Bearer token auth. None / empty string = no auth required.
     pub api_key: Option<String>,
@@ -96,6 +102,12 @@ pub async fn get_settings(state: tauri::State<'_, SharedState>) -> Result<AppSet
         template_name: s.config.process.template_name.clone(),
         custom_template_path: s.config.process.custom_template_path.clone(),
         chat_template_kwargs_json: s.config.process.chat_template_kwargs_json.clone(),
+        draft_model_path: s.config.process.draft_model_path.clone(),
+        spec_type: s.config.process.spec_type.clone(),
+        spec_draft_n_max: s.config.process.spec_draft_n_max,
+        draft_max_tokens: s.config.process.draft_max_tokens,
+        draft_min_tokens: s.config.process.draft_min_tokens,
+        draft_p_min: s.config.process.draft_p_min,
         extra_args: s.config.process.extra_args.clone(),
         api_key: s.config.server.api_key.clone(),
         active_provider: s.config.providers.active.clone(),
@@ -208,6 +220,12 @@ pub async fn update_settings(
             .clone()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        s.config.process.draft_model_path = settings.draft_model_path.trim().to_string();
+        s.config.process.spec_type = settings.spec_type.trim().to_string();
+        s.config.process.spec_draft_n_max = settings.spec_draft_n_max;
+        s.config.process.draft_max_tokens = settings.draft_max_tokens;
+        s.config.process.draft_min_tokens = settings.draft_min_tokens;
+        s.config.process.draft_p_min = settings.draft_p_min.max(0.0);
         s.config.process.extra_args = settings
             .extra_args
             .iter()

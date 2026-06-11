@@ -588,6 +588,8 @@ async fn headless_load_model(state: &state::SharedState, model_name: &str, ctx_s
             ctx_shift: s.config.process.ctx_shift,
             tensor_split: s.config.process.tensor_split.clone(),
             draft_model_path: s.config.process.draft_model_path.clone(),
+            spec_type: s.config.process.spec_type.clone(),
+            spec_draft_n_max: s.config.process.spec_draft_n_max,
             draft_max_tokens: s.config.process.draft_max_tokens,
             draft_min_tokens: s.config.process.draft_min_tokens,
             draft_p_min: s.config.process.draft_p_min,

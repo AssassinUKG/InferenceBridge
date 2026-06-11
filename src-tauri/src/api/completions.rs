@@ -11,6 +11,7 @@ use crate::engine::client::{
     CompletionRequest, CompletionResponse, ImageData, LlamaClient, Timings,
 };
 use crate::engine::process::{LaunchPreview, ProcessState};
+use crate::engine::scheduler::RequestPermit;
 use crate::engine::streaming::{self, StreamEvent};
 use crate::models::profiles::{ModelProfile, ToolCallFormat};
 use crate::normalize::images::normalize_image_payload as normalize_image_payload_shared;
@@ -19,7 +20,7 @@ use crate::normalize::think_strip::{
 };
 use crate::state::{
     append_live_stream_delta_for_request, begin_api_generation, finish_api_generation_for_request,
-    summarize_reasoning_tokens, SharedState,
+    summarize_reasoning_tokens, GenerationDropGuard, SharedState,
 };
 
 #[derive(Debug, Deserialize)]
@@ -203,6 +204,34 @@ const TEMPLATE_KWARGS_KEYS: &[&str] = &[
     "chat_template_kwargs",
     "chatTemplateKwargs",
 ];
+const DRAFT_MODEL_KEYS: &[&str] = &[
+    "draft_model_path",
+    "draftModelPath",
+    "draft_model",
+    "draftModel",
+    "spec_draft_model",
+    "specDraftModel",
+];
+const SPEC_TYPE_KEYS: &[&str] = &["spec_type", "specType"];
+const SPEC_DRAFT_N_MAX_KEYS: &[&str] = &[
+    "spec_draft_n_max",
+    "specDraftNMax",
+    "spec_draft_tokens",
+    "draftNMax",
+];
+const DRAFT_MAX_KEYS: &[&str] = &[
+    "draft_max_tokens",
+    "draftMaxTokens",
+    "draft_max",
+    "draftMax",
+];
+const DRAFT_MIN_KEYS: &[&str] = &[
+    "draft_min_tokens",
+    "draftMinTokens",
+    "draft_min",
+    "draftMin",
+];
+const DRAFT_P_MIN_KEYS: &[&str] = &["draft_p_min", "draftPMin"];
 const EXTRA_ARGS_KEYS: &[&str] = &["extra_args", "extraArgs"];
 
 fn parse_context_size_string(text: &str) -> Option<u32> {
@@ -252,16 +281,8 @@ fn find_named_value_in_value(
                     return Some(value.clone());
                 }
             }
-            for value in map.values() {
-                if let Some(found) = find_named_value_in_value(value, keys) {
-                    return Some(found);
-                }
-            }
             None
         }
-        serde_json::Value::Array(values) => values
-            .iter()
-            .find_map(|value| find_named_value_in_value(value, keys)),
         _ => None,
     }
 }
@@ -273,11 +294,6 @@ fn find_named_value_in_hash_map(
     for key in keys {
         if let Some(value) = map.get(*key) {
             return Some(value.clone());
-        }
-    }
-    for value in map.values() {
-        if let Some(found) = find_named_value_in_value(value, keys) {
-            return Some(found);
         }
     }
     None
@@ -295,6 +311,14 @@ fn parse_string_value(value: &serde_json::Value) -> Option<String> {
 
 fn parse_u32_value(value: &serde_json::Value) -> Option<u32> {
     extract_context_size_from_value(value)
+}
+
+fn parse_f32_value(value: &serde_json::Value) -> Option<f32> {
+    match value {
+        serde_json::Value::Number(number) => number.as_f64().map(|value| value as f32),
+        serde_json::Value::String(text) => text.trim().parse::<f32>().ok(),
+        _ => None,
+    }
 }
 
 fn parse_bool_value(value: &serde_json::Value) -> Option<bool> {
@@ -367,6 +391,16 @@ pub(crate) fn extract_runtime_load_overrides(
                 value.to_string()
             }
         }),
+        draft_model_path: lookup(DRAFT_MODEL_KEYS)
+            .as_ref()
+            .and_then(parse_string_value),
+        spec_type: lookup(SPEC_TYPE_KEYS).as_ref().and_then(parse_string_value),
+        spec_draft_n_max: lookup(SPEC_DRAFT_N_MAX_KEYS)
+            .as_ref()
+            .and_then(parse_u32_value),
+        draft_max_tokens: lookup(DRAFT_MAX_KEYS).as_ref().and_then(parse_u32_value),
+        draft_min_tokens: lookup(DRAFT_MIN_KEYS).as_ref().and_then(parse_u32_value),
+        draft_p_min: lookup(DRAFT_P_MIN_KEYS).as_ref().and_then(parse_f32_value),
         extra_args: lookup(EXTRA_ARGS_KEYS)
             .as_ref()
             .and_then(parse_string_array),
@@ -385,6 +419,12 @@ fn has_runtime_load_overrides(overrides: &RuntimeLoadOverrides) -> bool {
         || overrides.template_name.is_some()
         || overrides.custom_template_path.is_some()
         || overrides.chat_template_kwargs_json.is_some()
+        || overrides.draft_model_path.is_some()
+        || overrides.spec_type.is_some()
+        || overrides.spec_draft_n_max.is_some()
+        || overrides.draft_max_tokens.is_some()
+        || overrides.draft_min_tokens.is_some()
+        || overrides.draft_p_min.is_some()
         || overrides
             .extra_args
             .as_ref()
@@ -400,7 +440,6 @@ pub(crate) fn extract_context_size_from_value(value: &serde_json::Value) -> Opti
             .filter(|value| *value > 0),
         serde_json::Value::String(text) => parse_context_size_string(text),
         serde_json::Value::Object(map) => extract_context_size_from_json_map(map),
-        serde_json::Value::Array(values) => values.iter().find_map(extract_context_size_from_value),
         _ => None,
     }
 }
@@ -414,12 +453,6 @@ pub(crate) fn extract_context_size_from_json_map(
         }
     }
 
-    for value in map.values() {
-        if let Some(value) = extract_context_size_from_value(value) {
-            return Some(value);
-        }
-    }
-
     None
 }
 
@@ -428,12 +461,6 @@ pub(crate) fn extract_context_size_from_hash_map(
 ) -> Option<u32> {
     for key in CONTEXT_SIZE_KEYS {
         if let Some(value) = map.get(*key).and_then(extract_context_size_from_value) {
-            return Some(value);
-        }
-    }
-
-    for value in map.values() {
-        if let Some(value) = extract_context_size_from_value(value) {
             return Some(value);
         }
     }
@@ -542,6 +569,25 @@ pub struct ResponseMessage {
     pub tool_calls: Vec<serde_json::Value>,
 }
 
+fn finish_reason_from_completion(response: &CompletionResponse, has_tool_calls: bool) -> String {
+    if has_tool_calls {
+        return "tool_calls".to_string();
+    }
+
+    let stopped_by_limit = response.stopped_limit.unwrap_or(false)
+        || response
+            .stop_type
+            .as_deref()
+            .map(|value| value.to_ascii_lowercase().contains("limit"))
+            .unwrap_or(false);
+
+    if stopped_by_limit {
+        "length".to_string()
+    } else {
+        "stop".to_string()
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
@@ -619,7 +665,6 @@ fn loaded_model_matches_request(loaded: &str, requested: &str) -> bool {
         || loaded.trim_end_matches(".gguf") == requested
         || loaded == requested.trim_end_matches(".gguf")
         || loaded.trim_end_matches(".gguf") == search
-        || (!search.is_empty() && loaded.contains(search))
         || model_tokens_match(&loaded, search)
 }
 
@@ -654,11 +699,58 @@ fn model_tokens_match(loaded: &str, requested: &str) -> bool {
     if requested_tokens.is_empty() {
         return false;
     }
+    if requested_tokens.len() == 1 && !is_distinctive_model_token(&requested_tokens[0]) {
+        return false;
+    }
 
     let loaded_tokens = model_match_tokens(loaded);
     requested_tokens
         .iter()
         .all(|requested| loaded_tokens.iter().any(|loaded| loaded == requested))
+}
+
+fn is_distinctive_model_token(token: &str) -> bool {
+    let has_alpha = token.chars().any(|ch| ch.is_ascii_alphabetic());
+    let has_digit = token.chars().any(|ch| ch.is_ascii_digit());
+    let is_size_only = token
+        .chars()
+        .all(|ch| ch.is_ascii_digit() || matches!(ch.to_ascii_lowercase(), 'b' | 'm'));
+
+    has_alpha && has_digit && !is_size_only
+}
+
+fn registry_model_matches_api_request(
+    model: &crate::models::scanner::ScannedModel,
+    requested_model: &str,
+) -> bool {
+    let requested = requested_model.trim();
+    if requested.is_empty() {
+        return false;
+    }
+
+    let requested_name = normalize_model_match_name(requested);
+    let filename = normalize_model_match_name(&model.filename);
+    if filename == requested_name || filename.trim_end_matches(".gguf") == requested_name {
+        return true;
+    }
+
+    let requested_path = requested.replace('\\', "/").to_ascii_lowercase();
+    let model_path = model
+        .path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    model_path == requested_path
+}
+
+fn requested_model_allows_api_jit_load(requested_model: &str) -> bool {
+    let requested = requested_model.trim();
+    if requested.is_empty() {
+        return false;
+    }
+
+    let lower = requested.to_ascii_lowercase();
+    lower.ends_with(".gguf") || requested.contains('/') || requested.contains('\\')
 }
 
 fn optional_override_matches<T: PartialEq>(requested: Option<T>, current: Option<T>) -> bool {
@@ -692,6 +784,18 @@ fn api_overrides_match_preview(overrides: &RuntimeLoadOverrides, preview: &Launc
             overrides.chat_template_kwargs_json.as_deref(),
             preview.chat_template_kwargs_json.as_deref(),
         )
+        && optional_override_matches(
+            overrides.draft_model_path.as_deref(),
+            Some(preview.draft_model_path.as_str()),
+        )
+        && optional_override_matches(
+            overrides.spec_type.as_deref(),
+            Some(preview.spec_type.as_str()),
+        )
+        && optional_override_matches(overrides.spec_draft_n_max, Some(preview.spec_draft_n_max))
+        && optional_override_matches(overrides.draft_max_tokens, Some(preview.draft_max_tokens))
+        && optional_override_matches(overrides.draft_min_tokens, Some(preview.draft_min_tokens))
+        && optional_override_matches(overrides.draft_p_min, Some(preview.draft_p_min))
         && overrides.extra_args.as_ref().map_or(true, |requested| {
             preview
                 .args
@@ -868,11 +972,24 @@ pub(crate) async fn resolve_loaded_model(
             s.loaded_model
                 .clone()
                 .ok_or_else(ApiErrorResponse::no_model)?
+        } else if let Some(model) = s
+            .model_registry
+            .list()
+            .iter()
+            .find(|model| registry_model_matches_api_request(model, requested_model.trim()))
+        {
+            model.filename.clone()
+        } else if s
+            .loaded_model
+            .as_deref()
+            .map(|loaded| loaded_model_matches_request(loaded, requested_model.trim()))
+            .unwrap_or(false)
+        {
+            s.loaded_model.clone().unwrap_or_default()
+        } else if requested_model_allows_api_jit_load(requested_model) {
+            requested_model.trim().to_string()
         } else {
-            s.model_registry
-                .find_by_name(requested_model.trim())
-                .map(|model| model.filename.clone())
-                .unwrap_or_else(|| requested_model.trim().to_string())
+            return Err(ApiErrorResponse::model_not_found(requested_model.trim()));
         };
 
         let needs_swap = match &s.loaded_model {
@@ -1824,11 +1941,12 @@ pub async fn chat_completions(
         crate::replay::preferred_client_correlation_id(&headers, &original_request_body);
     let req: ChatCompletionRequest = serde_json::from_value(body)
         .map_err(|error| ApiErrorResponse::bad_request(error.to_string()))?;
-    let include_usage_details = req
+    let include_stream_usage = req
         .stream_options
         .as_ref()
         .and_then(|options| options.include_usage)
-        .unwrap_or(true);
+        .unwrap_or(false);
+    let include_usage_details = false;
     let requested_context_size = req.requested_context_size();
     let requested_model = req.model.clone().unwrap_or_default();
     let requested_overrides = extract_runtime_load_overrides(req.options.as_ref(), &req.extra);
@@ -1885,7 +2003,7 @@ pub async fn chat_completions(
         !request.image_data.is_empty(),
     )
     .await?;
-    let _permit = scheduler.acquire().await;
+    let permit = scheduler.acquire().await;
     {
         let mut s = state.write().await;
         s.last_prompt = Some(request.prompt.clone());
@@ -1908,12 +2026,13 @@ pub async fn chat_completions(
             generation_started,
             request_id,
             gen.cancel,
-            include_usage_details,
+            include_stream_usage,
             requested_tools,
             client_request_id,
             original_request_body,
             llama_port,
             context_limit,
+            permit,
         )
         .await;
     }
@@ -2046,11 +2165,7 @@ pub async fn chat_completions(
                 reasoning: (!reasoning_text.is_empty()).then_some(reasoning_text),
                 tool_calls: api_tool_calls.clone(),
             },
-            finish_reason: if api_tool_calls.is_empty() {
-                "stop".to_string()
-            } else {
-                "tool_calls".to_string()
-            },
+            finish_reason: finish_reason_from_completion(&response, !api_tool_calls.is_empty()),
         }],
         usage: build_usage(
             response.tokens_evaluated.unwrap_or(0),
@@ -2072,12 +2187,13 @@ async fn stream_chat_completion(
     generation_started: std::time::Instant,
     request_id: String,
     cancel: tokio_util::sync::CancellationToken,
-    include_usage_details: bool,
+    include_stream_usage: bool,
     requested_tools: Option<Vec<serde_json::Value>>,
     client_request_id: Option<String>,
     original_request_body: serde_json::Value,
     llama_port: u16,
     context_limit: Option<u32>,
+    permit: RequestPermit,
 ) -> Result<Response, ApiErrorResponse> {
     let response = match client.complete_stream(&request).await {
         Ok(response) => response,
@@ -2089,6 +2205,7 @@ async fn stream_chat_completion(
         }
     };
 
+    let stream_cancel = cancel.clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move {
         let _ = streaming::consume_sse_stream(response, tx, cancel).await;
@@ -2103,6 +2220,12 @@ async fn stream_chat_completion(
         .unwrap_or(false);
 
     let stream = async_stream::stream! {
+        let _permit = permit;
+        let guard = GenerationDropGuard::new(
+            state_for_stream.clone(),
+            request_id.clone(),
+            stream_cancel,
+        );
         let mut raw_full_text = String::new();
         let mut first_token_at: Option<std::time::Instant> = None;
         let mut visible_tokens: u32 = 0;
@@ -2183,6 +2306,8 @@ async fn stream_chat_completion(
                     tokens_evaluated,
                     decode_tokens_per_second,
                     prompt_tokens_per_second,
+                    stopped_limit,
+                    stop_type,
                 } => {
                     let reasoning_text =
                         extract_reasoning_content_with_style(&full_text, profile.think_tag_style);
@@ -2278,6 +2403,8 @@ async fn stream_chat_completion(
                     let stream_response = CompletionResponse {
                         content: full_text.clone(),
                         stop: true,
+                        stopped_limit,
+                        stop_type,
                         tokens_predicted: Some(tokens_predicted),
                         tokens_evaluated: Some(tokens_evaluated),
                         timings: Some(Timings {
@@ -2311,11 +2438,10 @@ async fn stream_chat_completion(
                         canonical,
                     )
                     .await;
-                    let finish_reason = if api_stream_tool_calls.is_empty() {
-                        "stop"
-                    } else {
-                        "tool_calls"
-                    };
+                    let finish_reason = finish_reason_from_completion(
+                        &stream_response,
+                        !api_stream_tool_calls.is_empty(),
+                    );
                     let final_chunk = serde_json::json!({
                         "id": id,
                         "object": "chat.completion.chunk",
@@ -2325,16 +2451,27 @@ async fn stream_chat_completion(
                             "index": 0,
                             "delta": {},
                             "finish_reason": finish_reason
-                        }],
-                        "usage": build_usage(
-                            tokens_evaluated,
-                            tokens_predicted,
-                            reasoning_tokens,
-                            include_usage_details,
-                        )
+                        }]
                     });
                     yield Ok(Event::default().data(final_chunk.to_string()));
+                    if include_stream_usage {
+                        let usage_chunk = serde_json::json!({
+                            "id": id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [],
+                            "usage": build_usage(
+                                tokens_evaluated,
+                                tokens_predicted,
+                                reasoning_tokens,
+                                false,
+                            )
+                        });
+                        yield Ok(Event::default().data(usage_chunk.to_string()));
+                    }
                     yield Ok(Event::default().data("[DONE]"));
+                    guard.mark_completed();
                     finish_api_generation_for_request(&state_for_stream, &request_id, "completed").await;
                     return;
                 }
@@ -2349,6 +2486,7 @@ async fn stream_chat_completion(
                     });
                     yield Ok(Event::default().data(error_chunk.to_string()));
                     yield Ok(Event::default().data("[DONE]"));
+                    guard.mark_completed();
                     return;
                 }
             }
@@ -2359,6 +2497,7 @@ async fn stream_chat_completion(
             let mut s = state_for_stream.write().await;
             s.last_parse_trace = Some(build_parse_trace(&profile, &raw_full_text, &stripped));
         }
+        guard.mark_completed();
         finish_api_generation_for_request(&state_for_stream, &request_id, "completed").await;
         yield Ok(Event::default().data("[DONE]"));
     };
@@ -2444,6 +2583,12 @@ pub async fn text_completions(
 
     let req: TextCompletionRequest = serde_json::from_value(body)
         .map_err(|error| ApiErrorResponse::bad_request(error.to_string()))?;
+    if req.stream {
+        return Err(ApiErrorResponse::bad_request(
+            "`stream: true` is not supported by `/v1/completions` yet. Use `/v1/chat/completions` for streaming, or send `stream: false`.",
+        ));
+    }
+
     let requested_context_size = req.requested_context_size();
     let requested_model = req.model.clone().unwrap_or_default();
     let requested_overrides = extract_runtime_load_overrides(req.options.as_ref(), &req.extra);
@@ -2540,7 +2685,7 @@ pub async fn text_completions(
         choices: vec![TextChoice {
             index: 0,
             text: text.clone(),
-            finish_reason: "stop".to_string(),
+            finish_reason: finish_reason_from_completion(&response, false),
         }],
         usage: build_usage(
             response.tokens_evaluated.unwrap_or(0),
@@ -2556,8 +2701,9 @@ pub async fn text_completions(
 mod tests {
     use super::{
         api_tool_call_value, build_tool_argument_repair_request, compact_messages_to_fit,
-        context_request_matches_preview, context_size_for_reload, loaded_model_matches_request,
-        normalize_api_messages, validate_tool_arguments, ApiMessage, ChatCompletionRequest,
+        context_request_matches_preview, context_size_for_reload, extract_runtime_load_overrides,
+        loaded_model_matches_request, normalize_api_messages, validate_tool_arguments, ApiMessage,
+        ChatCompletionRequest,
     };
     use crate::engine::process::LaunchPreview;
     use crate::models::profiles::ModelProfile;
@@ -2638,6 +2784,12 @@ mod tests {
             template_path: None,
             template_name: None,
             chat_template_kwargs_json: None,
+            draft_model_path: String::new(),
+            spec_type: String::new(),
+            spec_draft_n_max: 0,
+            draft_max_tokens: 0,
+            draft_min_tokens: 0,
+            draft_p_min: 0.0,
             args: Vec::new(),
         }
     }
@@ -2970,13 +3122,13 @@ mod tests {
     }
 
     #[test]
-    fn deserializes_nested_context_length_aliases() {
+    fn deserializes_options_context_length_aliases() {
         let request: ChatCompletionRequest = serde_json::from_str(
             r#"{
                 "messages": [
                     { "role": "user", "content": "hello" }
                 ],
-                "loadConfig": {
+                "options": {
                     "context_length": 32768
                 }
             }"#,
@@ -2987,7 +3139,7 @@ mod tests {
     }
 
     #[test]
-    fn finds_context_size_in_arbitrary_nested_objects() {
+    fn ignores_context_size_in_arbitrary_nested_objects() {
         let request: ChatCompletionRequest = serde_json::from_str(
             r#"{
                 "messages": [
@@ -3004,7 +3156,23 @@ mod tests {
         )
         .expect("request should deserialize");
 
-        assert_eq!(request.requested_context_size(), Some(32768));
+        assert_eq!(request.requested_context_size(), None);
+    }
+
+    #[test]
+    fn ignores_unrelated_numeric_extra_fields_as_context_size() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "timeout": 600000,
+                "top_logprobs": 5,
+                "messages": [
+                    { "role": "user", "content": "hello" }
+                ]
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        assert_eq!(request.requested_context_size(), None);
     }
 
     #[test]
@@ -3014,7 +3182,7 @@ mod tests {
                 "messages": [
                     { "role": "user", "content": "hello" }
                 ],
-                "loadConfig": {
+                "options": {
                     "contextWindow": "32k"
                 }
             }"#,
@@ -3022,6 +3190,50 @@ mod tests {
         .expect("request should deserialize");
 
         assert_eq!(request.requested_context_size(), Some(32768));
+    }
+
+    #[test]
+    fn ignores_nested_runtime_load_overrides_in_unknown_objects() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "messages": [
+                    { "role": "user", "content": "hello" }
+                ],
+                "client_metadata": {
+                    "file": "surprise.gguf",
+                    "fit": "aggressive",
+                    "cache_ram_mb": 12345
+                }
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        let overrides = extract_runtime_load_overrides(request.options.as_ref(), &request.extra);
+
+        assert!(overrides.hf_file.is_none());
+        assert!(overrides.fit_mode.is_none());
+        assert!(overrides.cache_ram_mb.is_none());
+    }
+
+    #[test]
+    fn accepts_top_level_and_options_runtime_load_overrides() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "extra_args": ["--flash-attn"],
+                "options": {
+                    "cache_ram_mb": 4096
+                },
+                "messages": [
+                    { "role": "user", "content": "hello" }
+                ]
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        let overrides = extract_runtime_load_overrides(request.options.as_ref(), &request.extra);
+
+        assert_eq!(overrides.cache_ram_mb, Some(4096));
+        assert_eq!(overrides.extra_args, Some(vec!["--flash-attn".to_string()]));
     }
 
     #[test]
@@ -3072,6 +3284,36 @@ mod tests {
         assert!(loaded_model_matches_request(
             "unsloth/Qwen3.5-27B-Instruct-Q4_K_M.gguf",
             "qwen3.5-reasoning"
+        ));
+    }
+
+    #[test]
+    fn rejects_overly_broad_loaded_model_aliases() {
+        assert!(!loaded_model_matches_request(
+            "Qwen3.6-27B-Q4_K_M.gguf",
+            "qwen"
+        ));
+        assert!(!loaded_model_matches_request(
+            "Qwen3.6-27B-Q4_K_M.gguf",
+            "27b"
+        ));
+        assert!(loaded_model_matches_request(
+            "Qwen3.6-27B-Q4_K_M.gguf",
+            "qwen3.6"
+        ));
+    }
+
+    #[test]
+    fn cloud_model_names_do_not_trigger_api_jit_load() {
+        assert!(!super::requested_model_allows_api_jit_load("gpt-4o"));
+        assert!(!super::requested_model_allows_api_jit_load(
+            "claude-sonnet-4-6"
+        ));
+        assert!(super::requested_model_allows_api_jit_load(
+            "Qwen3.6-27B-Q4_K_M.gguf"
+        ));
+        assert!(super::requested_model_allows_api_jit_load(
+            "C:\\models\\Qwen3.6-27B-Q4_K_M.gguf"
         ));
     }
 

@@ -55,6 +55,10 @@ pub struct CompletionRequest {
 pub struct CompletionResponse {
     pub content: String,
     pub stop: bool,
+    #[serde(default)]
+    pub stopped_limit: Option<bool>,
+    #[serde(default)]
+    pub stop_type: Option<String>,
     pub tokens_predicted: Option<u32>,
     pub tokens_evaluated: Option<u32>,
     pub timings: Option<Timings>,
@@ -133,6 +137,7 @@ pub struct GenerationSettings {
 }
 
 static SHARED_HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+const NON_STREAM_HTTP_TIMEOUT_SECS: u64 = 600;
 
 fn shared_http_client() -> reqwest::Client {
     SHARED_HTTP_CLIENT
@@ -166,14 +171,26 @@ impl LlamaClient {
 
     /// Send a non-streaming completion request.
     pub async fn complete(&self, request: &CompletionRequest) -> Result<CompletionResponse> {
-        let url = format!("{}/completion", self.base_url);
-        let resp = self.client.post(&url).json(request).send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("llama-server returned {status}: {body}");
-        }
-        Ok(resp.json().await?)
+        tokio::time::timeout(
+            std::time::Duration::from_secs(NON_STREAM_HTTP_TIMEOUT_SECS),
+            async {
+                let url = format!("{}/completion", self.base_url);
+                let resp = self.client.post(&url).json(request).send().await?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("llama-server returned {status}: {body}");
+                }
+                Ok(resp.json().await?)
+            },
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "llama-server non-streaming completion timed out after {} seconds",
+                NON_STREAM_HTTP_TIMEOUT_SECS
+            )
+        })?
     }
 
     /// Send a streaming completion request, returning an SSE stream.
@@ -195,14 +212,26 @@ impl LlamaClient {
     /// the legacy `/completion` image_data path can leave literal `[img-N]`
     /// markers in the prompt on newer libmtmd builds.
     pub async fn chat_completion(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
-        let url = format!("{}/v1/chat/completions", self.base_url);
-        let resp = self.client.post(&url).json(request).send().await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("llama-server returned {status}: {body}");
-        }
-        Ok(resp.json().await?)
+        tokio::time::timeout(
+            std::time::Duration::from_secs(NON_STREAM_HTTP_TIMEOUT_SECS),
+            async {
+                let url = format!("{}/v1/chat/completions", self.base_url);
+                let resp = self.client.post(&url).json(request).send().await?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("llama-server returned {status}: {body}");
+                }
+                Ok(resp.json().await?)
+            },
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "llama-server non-streaming chat completion timed out after {} seconds",
+                NON_STREAM_HTTP_TIMEOUT_SECS
+            )
+        })?
     }
 
     /// Query slot information for context/KV monitoring.
