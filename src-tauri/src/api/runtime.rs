@@ -59,7 +59,7 @@ pub fn start_managed(state: SharedState, host: String, port: u16, source: &'stat
         let (effective_host, effective_port) = if should_try_startup_port_fallback(
             source, &host, port,
         ) {
-            match reserve_startup_api_port(state.clone(), &host, port).await {
+            match reserve_startup_api_port(&host, port).await {
                 Ok((fallback_host, fallback_port)) => (fallback_host, fallback_port),
                 Err(error) => {
                     tracing::warn!(
@@ -139,11 +139,7 @@ fn should_try_startup_port_fallback(source: &'static str, host: &str, port: u16)
     source == "gui" && host == "127.0.0.1" && port == 8800
 }
 
-async fn reserve_startup_api_port(
-    state: SharedState,
-    host: &str,
-    port: u16,
-) -> Result<(String, u16), String> {
+async fn reserve_startup_api_port(host: &str, port: u16) -> Result<(String, u16), String> {
     if tokio::net::TcpListener::bind(format!("{host}:{port}"))
         .await
         .is_ok()
@@ -156,20 +152,11 @@ async fn reserve_startup_api_port(
             .await
             .is_ok()
         {
-            {
-                let mut app_state = state.write().await;
-                app_state.config.server.port = candidate;
-                app_state
-                    .config
-                    .save()
-                    .map_err(|e| format!("Failed to persist fallback API port {candidate}: {e}"))?;
-            }
-
             tracing::warn!(
                 requested_port = port,
                 fallback_port = candidate,
                 host = %host,
-                "Default public API port was unavailable on startup; switched to fallback port"
+                "Default public API port was unavailable on startup; using session-only fallback port"
             );
 
             return Ok((host.to_string(), candidate));

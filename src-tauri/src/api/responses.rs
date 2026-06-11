@@ -6,10 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 use crate::api::completions::{
-    build_chat_request, build_parse_trace, end_to_end_tokens_per_second,
-    ensure_runtime_vision_ready, extract_context_size_from_hash_map,
-    extract_runtime_load_overrides, resolve_loaded_model, ApiMessage, ChatCompletionRequest,
-    StopParam, TopParam,
+    build_chat_request, end_to_end_tokens_per_second, ensure_runtime_vision_ready,
+    extract_context_size_from_hash_map, extract_runtime_load_overrides, resolve_loaded_model,
+    ApiMessage, ChatCompletionRequest, StopParam, TopParam,
 };
 use crate::api::errors::ApiErrorResponse;
 use crate::engine::client::{CompletionResponse, LlamaClient, Timings};
@@ -311,7 +310,7 @@ pub async fn responses(
         )
     };
 
-    let request = build_chat_request(
+    let (request, _compaction) = build_chat_request(
         &profile,
         chat_request,
         (
@@ -434,7 +433,12 @@ pub async fn responses(
                             elapsed_ms,
                         );
                         let mut s = state_for_stream.write().await;
-                        s.last_parse_trace = Some(build_parse_trace(&profile, &text, &replay_visible));
+                        s.last_parse_trace = Some(crate::normalize::parse_trace::build_parse_trace(
+                            &profile,
+                            &text,
+                            &replay_visible,
+                            None,
+                        ));
                         s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
                             source: "responses-api".to_string(),
                             model: model_name.clone(),
@@ -571,10 +575,11 @@ pub async fn responses(
     let end_to_end_tps = end_to_end_tokens_per_second(response.tokens_predicted, elapsed_ms);
     {
         let mut s = state.write().await;
-        s.last_parse_trace = Some(build_parse_trace(
+        s.last_parse_trace = Some(crate::normalize::parse_trace::build_parse_trace(
             &profile,
             &response.content,
             &visible_text,
+            None,
         ));
         s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
             source: "responses-api".to_string(),

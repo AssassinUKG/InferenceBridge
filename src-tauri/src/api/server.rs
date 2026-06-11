@@ -2,6 +2,7 @@
 
 use axum::Router;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tower_http::cors::CorsLayer;
@@ -12,6 +13,35 @@ use crate::state::SharedState;
 
 static API_SERVER_ACTIVE: AtomicBool = AtomicBool::new(false);
 static API_SERVER_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+static PROXY_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn proxy_http_client() -> reqwest::Client {
+    PROXY_HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(300))
+                .connect_timeout(Duration::from_secs(5))
+                .pool_max_idle_per_host(8)
+                .build()
+                .unwrap_or_default()
+        })
+        .clone()
+}
+
+fn is_hop_by_hop_header(name: &axum::http::HeaderName) -> bool {
+    matches!(
+        name.as_str().to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+            | "host"
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -479,12 +509,13 @@ async fn backend_proxy_fallback(
         s.process.port()
     };
 
-    let method = req.method().clone();
-    let path = req
-        .uri()
+    let (parts, body) = req.into_parts();
+    let method = parts.method.clone();
+    let path = parts
+        .uri
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| req.uri().path().to_string());
+        .unwrap_or_else(|| parts.uri.path().to_string());
 
     // Short-circuit: port 0 means no model has been loaded yet — skip the
     // network call entirely and return a clean error immediately.
@@ -512,14 +543,10 @@ async fn backend_proxy_fallback(
         "backend_proxy_fallback: forwarding unmatched request to llama-server"
     );
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .connect_timeout(Duration::from_secs(5))
-        .build()
-        .unwrap_or_default();
+    let client = proxy_http_client();
 
     // Read the request body (if any)
-    let body_bytes = match axum::body::to_bytes(req.into_body(), 10 * 1024 * 1024).await {
+    let body_bytes = match axum::body::to_bytes(body, 128 * 1024 * 1024).await {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "backend_proxy_fallback: failed to read request body");
@@ -527,34 +554,37 @@ async fn backend_proxy_fallback(
         }
     };
 
-    let backend_req = client
-        .request(method.clone(), &url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(body_bytes);
+    let mut backend_req = client.request(method.clone(), &url).body(body_bytes);
+    for (name, value) in parts.headers.iter() {
+        if is_hop_by_hop_header(name) {
+            continue;
+        }
+        if let Ok(header_name) = reqwest::header::HeaderName::from_bytes(name.as_str().as_bytes()) {
+            backend_req = backend_req.header(header_name, value.as_bytes());
+        }
+    }
 
     match backend_req.send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();
             let headers = resp.headers().clone();
-            match resp.bytes().await {
-                Ok(body) => {
-                    let mut builder = axum::http::Response::builder().status(status);
-                    // Forward content-type from backend
-                    if let Some(ct) = headers.get(reqwest::header::CONTENT_TYPE) {
-                        builder = builder.header(axum::http::header::CONTENT_TYPE, ct.as_bytes());
-                    } else {
-                        builder =
-                            builder.header(axum::http::header::CONTENT_TYPE, "application/json");
+            let mut builder = axum::http::Response::builder().status(status);
+            for (name, value) in headers.iter() {
+                if let Ok(header_name) =
+                    axum::http::HeaderName::from_bytes(name.as_str().as_bytes())
+                {
+                    if is_hop_by_hop_header(&header_name) {
+                        continue;
                     }
-                    builder
-                        .body(axum::body::Body::from(body))
-                        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
-                }
-                Err(e) => {
-                    tracing::warn!(%path, error = %e, "backend_proxy_fallback: failed to read backend response");
-                    StatusCode::BAD_GATEWAY.into_response()
+                    if let Ok(header_value) = axum::http::HeaderValue::from_bytes(value.as_bytes())
+                    {
+                        builder = builder.header(header_name, header_value);
+                    }
                 }
             }
+            builder
+                .body(axum::body::Body::from_stream(resp.bytes_stream()))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
         }
         Err(e) => {
             tracing::debug!(

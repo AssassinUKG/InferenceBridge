@@ -29,6 +29,8 @@ pub struct ServerConfig {
     pub default_max_tokens: Option<u32>,
     /// Server-level default context size for model loading (0 = use model profile default).
     pub default_ctx_size: Option<u32>,
+    /// Allow one bounded local LLM repair pass when tool-call arguments fail schema validation.
+    pub tool_argument_repair_enabled: bool,
     /// Optional API key required on all public API requests (Bearer token).
     /// Empty string or None = no authentication required.
     pub api_key: Option<String>,
@@ -183,6 +185,7 @@ impl Default for ServerConfig {
             default_top_k: None,
             default_max_tokens: None,
             default_ctx_size: None,
+            tool_argument_repair_enabled: true,
             api_key: None,
         }
     }

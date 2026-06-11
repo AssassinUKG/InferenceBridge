@@ -4,7 +4,7 @@ import type { ModelInfo, ProcessStatusInfo, LoadProgress } from "../lib/types";
 import * as api from "../lib/tauri";
 import type { LoadModelOptions } from "../lib/tauri";
 
-const STATUS_POLL_MS = 1000;
+const STATUS_POLL_MS = 5000;
 
 interface ModelState {
   models: ModelInfo[];
@@ -141,7 +141,9 @@ export function useModel() {
     };
   }, [refresh]);
 
-  // Poll status and registry so API-driven loads appear in the GUI too.
+  // Slow background poll so API-driven loads still appear if an event is missed.
+  // Load/API events trigger immediate refreshes; keep this cadence gentle because
+  // get_process_status may probe the backend and inspect port owners.
   useEffect(() => {
     const interval = setInterval(async () => {
       try {

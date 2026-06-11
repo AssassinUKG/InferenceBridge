@@ -515,6 +515,42 @@ pub fn run_headless(
 
 /// Load a model by name in headless mode (no Tauri app handle for events).
 async fn headless_load_model(state: &state::SharedState, model_name: &str, ctx_size: Option<u32>) {
+    tracing::info!(
+        model = %model_name,
+        ctx = ?ctx_size,
+        "Headless model load requested"
+    );
+
+    match crate::commands::model::backend_load_model_with_overrides(
+        state.clone(),
+        model_name.to_string(),
+        ctx_size,
+        crate::commands::model::RuntimeLoadOverrides::default(),
+    )
+    .await
+    {
+        Ok(model) => tracing::info!(model = %model, "Model loaded and ready"),
+        Err(error) => {
+            tracing::error!(model = %model_name, error = %error, "Headless model load failed");
+            let s = state.read().await;
+            tracing::error!("Available models:");
+            for model in s.model_registry.list() {
+                tracing::info!(
+                    "  - {} ({:.1} GB)",
+                    model.filename,
+                    model.size_bytes as f64 / 1e9
+                );
+            }
+        }
+    }
+}
+
+#[allow(dead_code)]
+async fn legacy_headless_load_model(
+    state: &state::SharedState,
+    model_name: &str,
+    ctx_size: Option<u32>,
+) {
     use engine::process::LaunchConfig;
 
     // Resolve model

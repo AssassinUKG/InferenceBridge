@@ -68,8 +68,22 @@ fn shared_token_score(model_path: &Path, candidate: &Path) -> usize {
         .count()
 }
 
+fn model_family_token(path: &Path) -> Option<&'static str> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    [
+        "gemma", "qwen", "llava", "mistral", "phi", "internvl", "minicpm",
+    ]
+    .into_iter()
+    .find(|family| name.contains(family))
+}
+
 fn find_mmproj_for_model(model_path: &Path) -> Option<PathBuf> {
     let parent = model_path.parent()?;
+    let model_family = model_family_token(model_path);
     let mut candidates = std::fs::read_dir(parent)
         .ok()?
         .flatten()
@@ -83,7 +97,18 @@ fn find_mmproj_for_model(model_path: &Path) -> Option<PathBuf> {
 
     candidates
         .sort_by_key(|candidate| std::cmp::Reverse(shared_token_score(model_path, candidate)));
-    candidates.into_iter().next()
+    candidates.into_iter().find(|candidate| {
+        let score = shared_token_score(model_path, candidate);
+        if score == 0 {
+            return false;
+        }
+        model_family.map_or(true, |family| {
+            candidate
+                .file_name()
+                .map(|name| name.to_string_lossy().to_lowercase().contains(family))
+                .unwrap_or(false)
+        })
+    })
 }
 
 #[cfg(test)]
@@ -111,6 +136,23 @@ mod tests {
 
         let found = find_mmproj_for_model(&model).expect("mmproj should be found");
         assert_eq!(found.file_name(), mmproj.file_name());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ignores_unrelated_mmproj_sidecar() {
+        let dir = std::env::temp_dir().join(format!(
+            "inference-bridge-mmproj-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp model dir");
+        let model = dir.join("gemma-4-12B-it-Q4_K_M.gguf");
+        let mmproj = dir.join("mmproj-qwen2-vl-7B-BF16.gguf");
+        std::fs::write(&model, b"").expect("write model placeholder");
+        std::fs::write(&mmproj, b"").expect("write mmproj placeholder");
+
+        assert!(find_mmproj_for_model(&model).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -892,12 +934,17 @@ impl LlamaProcess {
     }
 
     /// Wait for the server to become healthy (responds to /health).
-    pub async fn wait_for_healthy(&self, timeout: Duration) -> anyhow::Result<()> {
+    pub async fn wait_for_healthy(&mut self, timeout: Duration) -> anyhow::Result<()> {
         let client = reqwest::Client::new();
         let url = format!("http://127.0.0.1:{}/health", self.current_port);
         let start = std::time::Instant::now();
 
         loop {
+            if self.poll_exited() {
+                return Err(anyhow::anyhow!(
+                    "llama-server exited before becoming healthy"
+                ));
+            }
             if start.elapsed() > timeout {
                 return Err(anyhow::anyhow!(
                     "llama-server did not become healthy within {:?}",

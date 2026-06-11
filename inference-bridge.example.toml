@@ -7,6 +7,8 @@ port = 8800
 host = "127.0.0.1"
 # Safe startup/load default. API clients can request a larger context explicitly.
 default_ctx_size = 16384
+# Enables one bounded local repair pass if a model emits malformed tool-call arguments.
+tool_argument_repair_enabled = true
 
 [models]
 # Point at your LM Studio models cache and any additional model directories

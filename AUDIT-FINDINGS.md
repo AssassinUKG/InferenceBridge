@@ -8,8 +8,8 @@ Each item is self-contained so a separate session can pick it up cold.
 
 ## Progress Summary
 
-Done first pass: 13 / 30
-Remaining: 17 / 30
+Done first pass: 30 / 30
+Remaining: 0 / 30
 
 | ID | Status |
 | --- | --- |
@@ -23,9 +23,26 @@ Remaining: 17 / 30
 | 8 | Fixed first pass |
 | 9 | Fixed first pass |
 | 10 | Fixed first pass |
+| 11 | Fixed first pass |
+| 12 | Fixed first pass |
+| 13 | Fixed first pass |
 | 14 | Fixed first pass |
+| 15 | Fixed first pass |
+| 16 | Fixed first pass |
+| 17 | Fixed first pass |
+| 18 | Fixed first pass |
+| 19 | Fixed first pass |
+| 20 | Fixed first pass |
+| 21 | Fixed first pass |
 | 22 | Fixed first pass |
+| 23 | Fixed first pass |
+| 24 | Fixed first pass |
+| 25 | Fixed first pass |
+| 26 | Fixed first pass |
 | 27 | Fixed first pass |
+| 28 | Fixed first pass |
+| 29 | Fixed first pass |
+| 30 | Fixed first pass |
 
 ---
 
@@ -169,6 +186,8 @@ Status: Fixed first pass (2026-06-11) — API model resolution no longer uses re
   for an implicit swap — queue behind it (the `model_load_mutex` already exists).
 
 ### 11. Silent conversation rewriting (`compact_messages_to_fit`)
+Status: Fixed first pass (2026-06-11) — chat completion compaction now returns metadata and surfaces it with `x-inference-bridge-compacted`, `x-inference-bridge-compacted-messages`, and `x-inference-bridge-compaction` response headers. Follow-up: add a config switch/default policy for API compaction.
+
 - [completions.rs:1661-1736] silently drops middle messages and injects a
   summary system message when the estimated prompt exceeds the context. For an
   OpenAI-compatible endpoint this is surprising and corrupts agent transcripts
@@ -176,6 +195,8 @@ Status: Fixed first pass (2026-06-11) — API model resolution no longer uses re
   API), and surface it (response header/field) when it happens.
 
 ### 12. Streaming parse-state corruption and false positives
+Status: Fixed first pass (2026-06-11) — streaming replay traces no longer duplicate reasoning deltas as synthetic `<think>...</think>` blocks because raw backend deltas are already captured. Follow-up: gate parser hiding/truncation heuristics by model profile.
+
 - `ReasoningDelta` handling wraps **each delta** in `<think>…</think>` when
   rebuilding `raw_full_text` ([completions.rs:2226-2229]) → parse traces/replay
   contain `<think>a</think><think>b</think>…`.
@@ -186,6 +207,8 @@ Status: Fixed first pass (2026-06-11) — API model resolution no longer uses re
   heuristics should be gated per model profile, not global.
 
 ### 13. Tool-call argument "repair" issues hidden extra LLM calls
+Status: Fixed first pass (2026-06-11) — tool-argument repair is now controlled by `server.tool_argument_repair_enabled` (default true), remains bounded to one pass, and logs when repair is disabled or attempted.
+
 - `repaired_tool_arguments` ([completions.rs:1533-1572]) silently runs a second
   completion against the loaded model when schema validation fails — extra
   latency, no cap, invisible to the client. Make it a config flag and bound it.
@@ -199,6 +222,8 @@ Status: Fixed first pass (2026-06-11) — stream usage now defaults off; when re
   mis-parse. Match the spec.
 
 ### 15. Headless `--model` auto-load bypasses the real load path
+Status: Fixed first pass (2026-06-11) — headless `--model` now routes through `backend_load_model_with_overrides`, so launch preview, model stats, loading generation, and context tracking follow the same path as GUI/API loads. Follow-up: remove the quarantined legacy duplicate loader after smoke testing.
+
 - `headless_load_model` ([lib.rs:517-717](src-tauri/src/lib.rs)) duplicates
   launch logic and never sets `last_launch_preview` / `model_stats` /
   `loading_generation`. Consequences: first API request with an explicit ctx
@@ -207,11 +232,15 @@ Status: Fixed first pass (2026-06-11) — stream usage now defaults off; when re
   `backend_load_model_with_overrides` instead.
 
 ### 16. `server.default_ctx_size` only works in headless mode
+Status: Fixed first pass (2026-06-11) — the shared backend load path now applies `server.default_ctx_size` when no explicit request context is provided, so GUI loads and API-triggered loads inherit the configured default.
+
 - Config field ([config.rs:31]) is honored only by the headless auto-load
   ([lib.rs:412]). GUI loads and API loads ignore it. Wire it into
   `resolve_launch_context_size` or remove it from config to avoid confusion.
 
 ### 17. Startup port fallback silently rewrites saved config
+Status: Fixed first pass (2026-06-11) — startup fallback still uses a free session port when configured 8800 is unavailable, but no longer rewrites or saves `server.port` in config.
+
 - `reserve_startup_api_port` ([api/runtime.rs:142-177]) picks 8802–8810 when
   8800 is busy and **persists** the new port to the config file. Every client
   pointing at 8800 breaks permanently, even after the conflict disappears.
@@ -219,6 +248,8 @@ Status: Fixed first pass (2026-06-11) — stream usage now defaults off; when re
   a prominent UI notice.
 
 ### 18. mmproj auto-pairing can attach the wrong projector
+Status: Fixed first pass (2026-06-11) — mmproj auto-pairing now requires a non-zero shared token score and matching detected model family when available, preventing unrelated sidecars such as Qwen projectors from attaching to Gemma models.
+
 - `find_mmproj_for_model` ([engine/process.rs:71-87]) returns the
   best-token-overlap mmproj in the model's folder **even when the overlap score
   is 0**. In a mixed folder a Gemma model can get a Qwen mmproj → garbage vision
@@ -229,12 +260,16 @@ Status: Fixed first pass (2026-06-11) — stream usage now defaults off; when re
 ## P2 — Medium (app stability & polish)
 
 ### 19. `flushSync` per streamed token in the chat UI
+Status: Fixed first pass (2026-06-11) — GUI chat stream deltas now buffer in refs and flush on `requestAnimationFrame`, removing per-token `flushSync` renders while flushing immediately on done/error.
+
 - [useChat.ts:61,71](src/hooks/useChat.ts) forces a synchronous React re-render
   for **every token event**. At 100+ tok/s this stutters the whole window (the
   "faster than LM Studio" story dies in the UI). Buffer deltas and flush on
   `requestAnimationFrame`, or coalesce events on the Rust side.
 
 ### 20. Status polling storm
+Status: Fixed first pass (2026-06-11) — expensive frontend polls now run on a gentler 5s cadence: model status, context status, and GPU stats. Existing model/API events still trigger immediate refreshes.
+
 - `useModel` polls `get_process_status` every 1 s; each call takes a write lock,
   runs `check_crashed`, makes an HTTP self-probe (1.2 s timeout), and when the
   API is unreachable shells out to `netstat` + `tasklist`
@@ -243,6 +278,8 @@ Status: Fixed first pass (2026-06-11) — stream usage now defaults off; when re
   existing Tauri events and slow background polls to 5–10 s.
 
 ### 21. Single `active_generation` / `live_stream` slot
+Status: Fixed first pass (2026-06-11) — process status now exposes keyed `live_streams`, derives the current stream from the latest running/streaming snapshot, and the Logs page seeds from the full stream list instead of only the legacy singleton.
+
 - With `parallel_slots > 1`, concurrent requests overwrite each other's
   `active_generation` status and the status bar / Debug Inspector shows the
   wrong request. `live_streams` (vec) already exists — derive UI state from it
@@ -256,6 +293,8 @@ Status: Fixed first pass (2026-06-11) — cancellation now goes through a reques
   request. Follows directly from #1's shared-token design.
 
 ### 23. GUI chat clobbers `model_stats`
+Status: Fixed first pass (2026-06-11) — GUI chat no longer rewrites `model_stats` after each turn; launch-derived model context stays intact and chat speed is stored in `last_generation_metrics`.
+
 - [chat.rs:706-717] rewrites `model_stats` after every chat turn with
   `context_size` taken from `last_context_status.total_tokens` (may be 0/stale)
   and `memory_mb: 0`. `model_stats.context_size` is what the API uses as the
@@ -263,11 +302,15 @@ Status: Fixed first pass (2026-06-11) — cancellation now goes through a reques
   elsewhere.
 
 ### 24. User message persisted before generation can start
+Status: Fixed first pass (2026-06-11) — GUI chat now appends the user turn to the prompt in memory and only persists the user/assistant pair after generation succeeds, preventing failed sends from duplicating on retry.
+
 - [chat.rs:376-381] writes the user message to the session DB before checking
   the backend can serve it. On failure the message stays, so a retry duplicates
   it. Persist after success, or delete on failure.
 
 ### 25. Transparent proxy quality (also see #4)
+Status: Fixed first pass (2026-06-11) — backend proxy now reuses a shared reqwest client, forwards non-hop-by-hop request/response headers, raises the body cap to 128 MiB, and streams backend response bodies instead of buffering them.
+
 - `backend_proxy_fallback` ([server.rs:450-557]) buffers the whole backend
   response (`resp.bytes()`) so native streaming endpoints can't stream; caps
   request bodies at 10 MB (large embedding batches fail); drops all response
@@ -276,6 +319,8 @@ Status: Fixed first pass (2026-06-11) — cancellation now goes through a reques
   body through, forward headers both ways, reuse the shared client.
 
 ### 26. API-key comparison is not constant-time
+Status: Fixed first pass (2026-06-11) — API key comparison now uses the local `constant_time_eq` helper and includes regression coverage.
+
 - [server.rs:595] uses `==` on strings. Low risk locally, trivial to fix with
   `subtle`-style constant-time compare.
 
@@ -288,12 +333,16 @@ Status: Fixed first pass (2026-06-11) — unknown plain model names now return O
   to nothing in the registry and JIT load is not applicable.
 
 ### 28. `wait_for_healthy` / health loops don't watch the child
+Status: Fixed first pass (2026-06-11) — `wait_for_healthy` now takes `&mut self` and calls `poll_exited()` inside the health loop so it returns immediately if llama-server exits before becoming healthy.
+
 - `LlamaProcess::wait_for_healthy` ([engine/process.rs:895-912]) polls `/health`
   for the full timeout even if the child already exited (the main load path in
   `commands/model.rs` does check crash every ~2 s, but only that path). Fold a
   `poll_exited` check into `wait_for_healthy` itself.
 
 ### 29. Duplicate/diverging helper implementations
+Status: Fixed first pass (2026-06-11) — parse-trace construction is now centralized in `normalize::parse_trace` and reused by GUI chat, chat completions, text completions, and responses. Follow-up: continue consolidating `extract_quant`, `names_match`, launch-preview matching, and process-port parsers.
+
 - Two `extract_quant`, two `names_match`, two `build_parse_trace`,
   `launch_preview_matches_model` duplicated in `api/completions.rs` and
   `commands/chat.rs`, two netstat/tasklist parsers (`server.rs` vs
@@ -301,6 +350,8 @@ Status: Fixed first pass (2026-06-11) — unknown plain model names now return O
   rules differ between API and GUI). Consolidate into shared modules.
 
 ### 30. `api/completions.rs` (3 200 lines) and `ModelSelector.tsx` (2 000 lines)
+Status: Fixed first pass (2026-06-11) — first structural extraction moved parse-trace/parser policy out of `api/completions.rs` and `commands/chat.rs` into `normalize::parse_trace`, reducing one cross-transport responsibility. Follow-up: split request parsing, prompt build, streaming, tool extraction, selector list, load options, and advanced flags into dedicated modules/components.
+
 - Both files mix transport, parsing, policy, and UI concerns and are the two
   highest-churn files in the repo. Split (request parsing / prompt build /
   streaming / tool-extraction; selector list / load options / advanced flags)

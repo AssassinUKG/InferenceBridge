@@ -1,5 +1,4 @@
-import { useState, useCallback, useEffect } from "react";
-import { flushSync } from "react-dom";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type { MessageInfo } from "../lib/types";
 import * as api from "../lib/tauri";
@@ -15,6 +14,9 @@ interface ChatState {
 }
 
 export function useChat(sessionId: string | null) {
+  const pendingTextRef = useRef("");
+  const pendingReasoningRef = useRef("");
+  const flushFrameRef = useRef<number | null>(null);
   const [state, setState] = useState<ChatState>({
     messages: [],
     isStreaming: false,
@@ -35,6 +37,37 @@ export function useChat(sessionId: string | null) {
       (error) => setState((current) => ({ ...current, error: String(error) }))
     );
   }, [sessionId]);
+
+  const flushStreamingBuffers = useCallback(() => {
+    flushFrameRef.current = null;
+    const text = pendingTextRef.current;
+    const reasoning = pendingReasoningRef.current;
+    if (!text && !reasoning) return;
+
+    pendingTextRef.current = "";
+    pendingReasoningRef.current = "";
+    setState((current) => ({
+      ...current,
+      streamingText: current.streamingText + text,
+      streamingReasoning: current.streamingReasoning + reasoning,
+    }));
+  }, []);
+
+  const scheduleStreamingFlush = useCallback(() => {
+    if (flushFrameRef.current !== null) return;
+    flushFrameRef.current = requestAnimationFrame(flushStreamingBuffers);
+  }, [flushStreamingBuffers]);
+
+  const cancelStreamingFlush = useCallback(() => {
+    if (flushFrameRef.current !== null) {
+      cancelAnimationFrame(flushFrameRef.current);
+      flushFrameRef.current = null;
+    }
+    pendingTextRef.current = "";
+    pendingReasoningRef.current = "";
+  }, []);
+
+  useEffect(() => cancelStreamingFlush, [cancelStreamingFlush]);
 
   const sendMessage = useCallback(
     async (
@@ -58,26 +91,19 @@ export function useChat(sessionId: string | null) {
 
       try {
         const tokenUnsub = await listen<string>("stream-token", (event) => {
-          flushSync(() => {
-            setState((current) => ({
-              ...current,
-              streamingText: current.streamingText + event.payload,
-            }));
-          });
+          pendingTextRef.current += event.payload;
+          scheduleStreamingFlush();
         });
         cleanups.push(tokenUnsub);
 
         const thinkingUnsub = await listen<string>("stream-thinking", (event) => {
-          flushSync(() => {
-            setState((current) => ({
-              ...current,
-              streamingReasoning: current.streamingReasoning + event.payload,
-            }));
-          });
+          pendingReasoningRef.current += event.payload;
+          scheduleStreamingFlush();
         });
         cleanups.push(thinkingUnsub);
 
         const doneUnsub = await listen<number>("stream-done", (event) => {
+          flushStreamingBuffers();
           setState((current) => ({
             ...current,
             tokensPerSecond: event.payload,
@@ -86,6 +112,7 @@ export function useChat(sessionId: string | null) {
         cleanups.push(doneUnsub);
 
         const errorUnsub = await listen<string>("stream-error", (event) => {
+          cancelStreamingFlush();
           setState((current) => ({
             ...current,
             isStreaming: false,
@@ -97,6 +124,7 @@ export function useChat(sessionId: string | null) {
         cleanups.push(errorUnsub);
 
         await api.sendMessage(sessionId, content, sampling, imageBase64, showThinking);
+        flushStreamingBuffers();
         const messages = await api.getSessionMessages(sessionId);
         setState((current) => ({
           ...current,
@@ -106,6 +134,7 @@ export function useChat(sessionId: string | null) {
           isStreaming: false,
         }));
       } catch (error) {
+        cancelStreamingFlush();
         setState((current) => ({
           ...current,
           isStreaming: false,
@@ -117,18 +146,25 @@ export function useChat(sessionId: string | null) {
         cleanups.forEach((cleanup) => cleanup());
       }
     },
-    [sessionId, state.isStreaming]
+    [
+      sessionId,
+      state.isStreaming,
+      scheduleStreamingFlush,
+      flushStreamingBuffers,
+      cancelStreamingFlush,
+    ]
   );
 
   const stopGeneration = useCallback(async () => {
     await api.stopGeneration();
+    cancelStreamingFlush();
     setState((current) => ({
       ...current,
       isStreaming: false,
       streamingText: "",
       streamingReasoning: "",
     }));
-  }, []);
+  }, [cancelStreamingFlush]);
 
   return { ...state, sendMessage, stopGeneration };
 }

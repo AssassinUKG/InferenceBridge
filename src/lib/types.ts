@@ -134,6 +134,7 @@ export interface ProcessStatusInfo {
   last_launch_preview: LaunchPreview | null;
   last_generation_metrics: RuntimePerformanceMetrics | null;
   live_stream: LiveStreamSnapshot | null;
+  live_streams: LiveStreamSnapshot[];
 }
 
 export interface ApiPortOwnerInfo {

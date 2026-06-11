@@ -25,7 +25,7 @@ function sameContextStatus(a: ContextStatus, b: ContextStatus) {
   );
 }
 
-export function useContext(pollInterval = 2000) {
+export function useContext(pollInterval = 5000) {
   const [status, setStatus] = useState<ContextStatus>(EMPTY_STATUS);
 
   useEffect(() => {

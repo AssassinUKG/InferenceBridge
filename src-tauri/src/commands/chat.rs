@@ -30,22 +30,6 @@ fn launch_preview_matches_model(model_name: &str, preview_model_path: &str) -> b
         || (!requested.is_empty() && preview_name.contains(&requested))
 }
 
-fn build_parse_trace(profile: &ModelProfile, raw: &str, stripped: &str, reasoning: &str) -> String {
-    let (tool_calls, visible_text) =
-        crate::normalize::tool_extract::extract_tool_calls_for_profile(stripped, profile);
-    serde_json::to_string_pretty(&serde_json::json!({
-        "parser_type": format!("{:?}", profile.parser_type),
-        "tool_call_format": format!("{:?}", profile.tool_call_format),
-        "think_tag_style": format!("{:?}", profile.think_tag_style),
-        "raw_response": raw,
-        "reasoning_text": reasoning,
-        "stripped_response": stripped,
-        "visible_text": visible_text,
-        "tool_calls": tool_calls,
-    }))
-    .unwrap_or_else(|_| "Failed to serialize parse trace".to_string())
-}
-
 fn apply_thinking_preference(
     mut messages: Vec<ChatMessage>,
     profile: &ModelProfile,
@@ -375,18 +359,21 @@ pub async fn send_message(
         ));
     }
 
-    {
-        let s = state.read().await;
-        let db = s.session_db.lock().map_err(|e| e.to_string())?;
-        db.add_message(&session_id, "user", &content, 0, image_base64.as_deref())
-            .map_err(|e| e.to_string())?;
-    }
-
-    let db_messages = {
+    let mut db_messages = {
         let s = state.read().await;
         let db = s.session_db.lock().map_err(|e| e.to_string())?;
         db.get_messages(&session_id).map_err(|e| e.to_string())?
     };
+    db_messages.push(crate::session::db::MessageInfo {
+        id: -1,
+        role: "user".to_string(),
+        content: Some(content.clone()),
+        image_base64: image_base64.clone(),
+        token_count: Some(0),
+        tokens_evaluated: None,
+        tokens_predicted: None,
+        created_at: now_rfc3339(),
+    });
 
     let mut image_data = Vec::new();
     let mut next_image_id = 1u32;
@@ -512,7 +499,12 @@ pub async fn send_message(
         let completion_tokens = openai_usage_tokens(&response, "completion_tokens");
         {
             let mut s = state.write().await;
-            s.last_parse_trace = Some(build_parse_trace(&profile, &raw_text, &stripped, ""));
+            s.last_parse_trace = Some(crate::normalize::parse_trace::build_parse_trace(
+                &profile,
+                &raw_text,
+                &stripped,
+                Some(""),
+            ));
             s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
                 source: "gui-vision".to_string(),
                 model: s
@@ -546,6 +538,8 @@ pub async fn send_message(
         let assistant_message_id = {
             let s = state.read().await;
             let db = s.session_db.lock().map_err(|e| e.to_string())?;
+            db.add_message(&session_id, "user", &content, 0, image_base64.as_deref())
+                .map_err(|e| e.to_string())?;
             db.add_message(&session_id, "assistant", &stripped, 0, None)
                 .map_err(|e| e.to_string())?
         };
@@ -680,7 +674,12 @@ pub async fn send_message(
             profile.think_tag_style,
         )
     };
-    let parse_trace = build_parse_trace(&profile, &full_text, &stripped, &reasoning_text);
+    let parse_trace = crate::normalize::parse_trace::build_parse_trace(
+        &profile,
+        &full_text,
+        &stripped,
+        Some(&reasoning_text),
+    );
     {
         let mut s = state.write().await;
         s.last_parse_trace = Some(parse_trace);
@@ -689,6 +688,8 @@ pub async fn send_message(
     let assistant_message_id = {
         let s = state.read().await;
         let db = s.session_db.lock().map_err(|e| e.to_string())?;
+        db.add_message(&session_id, "user", &content, 0, image_base64.as_deref())
+            .map_err(|e| e.to_string())?;
         db.add_message(&session_id, "assistant", &stripped, 0, None)
             .map_err(|e| e.to_string())?
     };
@@ -708,16 +709,6 @@ pub async fn send_message(
 
     {
         let mut s = state.write().await;
-        s.model_stats = Some(crate::state::ModelStats {
-            model: model_name,
-            context_size: s
-                .last_context_status
-                .as_ref()
-                .map(|status| status.total_tokens)
-                .unwrap_or(0),
-            tokens_per_sec: decode_tokens_per_second.unwrap_or(0.0) as f32,
-            memory_mb: 0,
-        });
         s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
             source: "gui".to_string(),
             model: s

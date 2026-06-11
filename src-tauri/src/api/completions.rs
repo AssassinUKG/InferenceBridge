@@ -1,5 +1,5 @@
 use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,45 @@ use crate::state::{
     append_live_stream_delta_for_request, begin_api_generation, finish_api_generation_for_request,
     summarize_reasoning_tokens, GenerationDropGuard, SharedState,
 };
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CompactionInfo {
+    removed_messages: usize,
+    remaining_messages: usize,
+    context_limit: u32,
+    budget: u32,
+}
+
+impl CompactionInfo {
+    fn removed_messages_header(&self) -> HeaderValue {
+        HeaderValue::from_str(&self.removed_messages.to_string())
+            .unwrap_or_else(|_| HeaderValue::from_static("0"))
+    }
+
+    fn summary_header(&self) -> HeaderValue {
+        HeaderValue::from_str(&format!(
+            "removed_messages={}, remaining_messages={}, context_limit={}, budget={}",
+            self.removed_messages, self.remaining_messages, self.context_limit, self.budget
+        ))
+        .unwrap_or_else(|_| HeaderValue::from_static("compacted"))
+    }
+}
+
+fn apply_compaction_headers(response: &mut Response, compaction: Option<&CompactionInfo>) {
+    let Some(compaction) = compaction else {
+        return;
+    };
+    let headers = response.headers_mut();
+    headers.insert(
+        "x-inference-bridge-compacted",
+        HeaderValue::from_static("true"),
+    );
+    headers.insert(
+        "x-inference-bridge-compacted-messages",
+        compaction.removed_messages_header(),
+    );
+    headers.insert("x-inference-bridge-compaction", compaction.summary_header());
+}
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -625,23 +664,6 @@ pub(crate) fn end_to_end_tokens_per_second(
     }
 
     completion_tokens.map(|tokens| tokens as f64 / (elapsed_ms as f64 / 1000.0))
-}
-
-pub(crate) fn build_parse_trace(profile: &ModelProfile, raw: &str, stripped: &str) -> String {
-    let (tool_calls, visible_text) =
-        crate::normalize::tool_extract::extract_tool_calls_for_profile(stripped, profile);
-    let reasoning_text = extract_reasoning_content_with_style(raw, profile.think_tag_style);
-    serde_json::to_string_pretty(&serde_json::json!({
-        "parser_type": format!("{:?}", profile.parser_type),
-        "tool_call_format": format!("{:?}", profile.tool_call_format),
-        "think_tag_style": format!("{:?}", profile.think_tag_style),
-        "raw_response": raw,
-        "reasoning_text": reasoning_text,
-        "stripped_response": stripped,
-        "visible_text": visible_text,
-        "tool_calls": tool_calls,
-    }))
-    .unwrap_or_else(|_| "Failed to serialize parse trace".to_string())
 }
 
 /// Public test helper — exposes model name matching logic.
@@ -1588,10 +1610,20 @@ async fn repaired_tool_arguments(
     profile: &ModelProfile,
     tool_call: &crate::normalize::tool_extract::ToolCall,
     tools: Option<&Vec<serde_json::Value>>,
+    repair_enabled: bool,
 ) -> serde_json::Value {
     let coerced = coerce_tool_arguments_for_schema(&tool_call.name, &tool_call.arguments, tools);
     let errors = validate_tool_arguments(&tool_call.name, &coerced, tools);
     if errors.is_empty() {
+        return coerced;
+    }
+
+    if !repair_enabled {
+        tracing::warn!(
+            tool = %tool_call.name,
+            errors = ?errors,
+            "Tool arguments failed schema validation after coercion; repair disabled by config"
+        );
         return coerced;
     }
 
@@ -1604,6 +1636,11 @@ async fn repaired_tool_arguments(
         return coerced;
     };
 
+    tracing::info!(
+        tool = %tool_call.name,
+        errors = ?errors,
+        "Attempting one bounded tool argument repair pass"
+    );
     if let Some(repaired) =
         repair_tool_arguments_once(client, profile, &tool_call.name, &coerced, tools, &errors).await
     {
@@ -1649,8 +1686,10 @@ async fn api_tool_call_value(
     tool_call: &crate::normalize::tool_extract::ToolCall,
     tools: Option<&Vec<serde_json::Value>>,
     index: Option<usize>,
+    repair_enabled: bool,
 ) -> serde_json::Value {
-    let arguments = repaired_tool_arguments(client, profile, tool_call, tools).await;
+    let arguments =
+        repaired_tool_arguments(client, profile, tool_call, tools, repair_enabled).await;
     api_tool_call_value_from_arguments(tool_call, arguments, index)
 }
 
@@ -1659,7 +1698,7 @@ pub(crate) async fn build_chat_request(
     req: ChatCompletionRequest,
     server_defaults: (&Option<f32>, &Option<f32>, &Option<i32>, &Option<u32>),
     context_limit: Option<u32>,
-) -> Result<CompletionRequest, ApiErrorResponse> {
+) -> Result<(CompletionRequest, Option<CompactionInfo>), ApiErrorResponse> {
     let requested_top_p = req.requested_top_p();
     let requested_top_k = req.requested_top_k();
     let thinking_disabled = req.requested_thinking_disabled();
@@ -1678,37 +1717,40 @@ pub(crate) async fn build_chat_request(
         .or(profile.default_max_output_tokens)
         .or(*server_defaults.3)
         .map(|value| value as i32);
-    compact_messages_to_fit(&mut messages, profile, context_limit, n_predict);
+    let compaction = compact_messages_to_fit(&mut messages, profile, context_limit, n_predict);
 
     let mut stop = profile.stop_markers.clone();
     if let Some(user_stop) = req.stop {
         stop.extend(user_stop.into_vec());
     }
 
-    Ok(CompletionRequest {
-        prompt: crate::templates::engine::render_prompt(&messages, profile),
-        n_predict,
-        temperature: req
-            .temperature
-            .or(profile.default_temperature)
-            .or(*server_defaults.0),
-        top_p: requested_top_p
-            .or(profile.default_top_p)
-            .or(*server_defaults.1),
-        top_k: requested_top_k
-            .or(profile.default_top_k)
-            .or(*server_defaults.2),
-        min_p: req.min_p.or(profile.default_min_p),
-        presence_penalty: req.presence_penalty.or(profile.default_presence_penalty),
-        frequency_penalty: req.frequency_penalty,
-        repeat_penalty: req.repetition_penalty,
-        seed: req.seed,
-        stream: req.stream,
-        stop,
-        special: true,
-        image_data,
-        grammar: None,
-    })
+    Ok((
+        CompletionRequest {
+            prompt: crate::templates::engine::render_prompt(&messages, profile),
+            n_predict,
+            temperature: req
+                .temperature
+                .or(profile.default_temperature)
+                .or(*server_defaults.0),
+            top_p: requested_top_p
+                .or(profile.default_top_p)
+                .or(*server_defaults.1),
+            top_k: requested_top_k
+                .or(profile.default_top_k)
+                .or(*server_defaults.2),
+            min_p: req.min_p.or(profile.default_min_p),
+            presence_penalty: req.presence_penalty.or(profile.default_presence_penalty),
+            frequency_penalty: req.frequency_penalty,
+            repeat_penalty: req.repetition_penalty,
+            seed: req.seed,
+            stream: req.stream,
+            stop,
+            special: true,
+            image_data,
+            grammar: None,
+        },
+        compaction,
+    ))
 }
 
 fn compact_messages_to_fit(
@@ -1716,12 +1758,12 @@ fn compact_messages_to_fit(
     profile: &ModelProfile,
     context_limit: Option<u32>,
     n_predict: Option<i32>,
-) {
+) -> Option<CompactionInfo> {
     let Some(context_limit) = context_limit.filter(|value| *value > 0) else {
-        return;
+        return None;
     };
     if messages.len() <= 2 {
-        return;
+        return None;
     }
 
     let output_reserve = n_predict
@@ -1733,6 +1775,7 @@ fn compact_messages_to_fit(
         .saturating_sub(output_reserve)
         .max(context_limit / 2);
     let mut removed = Vec::new();
+    let mut extra_removed = 0usize;
 
     while crate::normalize::think_strip::estimate_token_count(
         &crate::templates::engine::render_prompt(messages, profile),
@@ -1785,7 +1828,16 @@ fn compact_messages_to_fit(
             0
         };
         messages.remove(remove_index);
+        extra_removed += 1;
     }
+
+    let removed_messages = removed.len() + extra_removed;
+    (removed_messages > 0).then_some(CompactionInfo {
+        removed_messages,
+        remaining_messages: messages.len(),
+        context_limit,
+        budget,
+    })
 }
 
 fn launch_preview_matches_model(model_name: &str, preview_model_path: &str) -> bool {
@@ -1960,7 +2012,7 @@ pub async fn chat_completions(
     .await?;
     let profile = crate::models::overrides::detect_effective_profile(&model_name);
 
-    let (server_defaults, scheduler, llama_port, context_limit) = {
+    let (server_defaults, scheduler, llama_port, context_limit, tool_argument_repair_enabled) = {
         let s = state.read().await;
         (
             (
@@ -1980,10 +2032,11 @@ pub async fn chat_completions(
                         .and_then(|preview| preview.context_size)
                 })
                 .or(requested_context_size),
+            s.config.server.tool_argument_repair_enabled,
         )
     };
 
-    let request = build_chat_request(
+    let (request, compaction) = build_chat_request(
         &profile,
         req,
         (
@@ -2033,6 +2086,8 @@ pub async fn chat_completions(
             llama_port,
             context_limit,
             permit,
+            compaction,
+            tool_argument_repair_enabled,
         )
         .await;
     }
@@ -2066,6 +2121,7 @@ pub async fn chat_completions(
                 tool_call,
                 requested_tools.as_ref(),
                 None,
+                tool_argument_repair_enabled,
             )
             .await,
         );
@@ -2098,10 +2154,11 @@ pub async fn chat_completions(
     let end_to_end_tps = end_to_end_tokens_per_second(response.tokens_predicted, elapsed_ms);
     {
         let mut s = state.write().await;
-        s.last_parse_trace = Some(build_parse_trace(
+        s.last_parse_trace = Some(crate::normalize::parse_trace::build_parse_trace(
             &profile,
             &response.content,
             content.as_deref().unwrap_or(""),
+            None,
         ));
         s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
             source: "api".to_string(),
@@ -2152,7 +2209,7 @@ pub async fn chat_completions(
     .await;
     finish_api_generation_for_request(&state, &request_id, "completed").await;
 
-    Ok(Json(ChatCompletionResponse {
+    let mut response = Json(ChatCompletionResponse {
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
         object: "chat.completion".to_string(),
         created: now_unix_secs(),
@@ -2174,7 +2231,9 @@ pub async fn chat_completions(
             include_usage_details,
         ),
     })
-    .into_response())
+    .into_response();
+    apply_compaction_headers(&mut response, compaction.as_ref());
+    Ok(response)
 }
 
 async fn stream_chat_completion(
@@ -2194,6 +2253,8 @@ async fn stream_chat_completion(
     llama_port: u16,
     context_limit: Option<u32>,
     permit: RequestPermit,
+    compaction: Option<CompactionInfo>,
+    tool_argument_repair_enabled: bool,
 ) -> Result<Response, ApiErrorResponse> {
     let response = match client.complete_stream(&request).await {
         Ok(response) => response,
@@ -2283,9 +2344,6 @@ async fn stream_chat_completion(
                     }
                 }
                 StreamEvent::ReasoningDelta(reasoning) => {
-                    raw_full_text.push_str("<think>");
-                    raw_full_text.push_str(&reasoning);
-                    raw_full_text.push_str("</think>");
                     append_live_stream_delta_for_request(&state_for_stream, &request_id, "reasoning", &reasoning).await;
                     let chunk_json = serde_json::json!({
                         "id": id,
@@ -2317,7 +2375,9 @@ async fn stream_chat_completion(
                         &stripped,
                         &reasoning_text,
                     );
-                    let parse_trace = build_parse_trace(&profile, &full_text, &stripped);
+                    let parse_trace = crate::normalize::parse_trace::build_parse_trace(
+                        &profile, &full_text, &stripped, None,
+                    );
                     let elapsed_ms = generation_started.elapsed().as_millis() as u64;
                     let metrics = crate::state::RuntimePerformanceMetrics {
                         source: "api".to_string(),
@@ -2357,6 +2417,7 @@ async fn stream_chat_completion(
                                 tc,
                                 requested_tools.as_ref(),
                                 Some(i),
+                                tool_argument_repair_enabled,
                             )
                             .await,
                         );
@@ -2495,16 +2556,23 @@ async fn stream_chat_completion(
         if !raw_full_text.is_empty() {
             let stripped = strip_think_tags_with_style(&raw_full_text, profile.think_tag_style);
             let mut s = state_for_stream.write().await;
-            s.last_parse_trace = Some(build_parse_trace(&profile, &raw_full_text, &stripped));
+            s.last_parse_trace = Some(crate::normalize::parse_trace::build_parse_trace(
+                &profile,
+                &raw_full_text,
+                &stripped,
+                None,
+            ));
         }
         guard.mark_completed();
         finish_api_generation_for_request(&state_for_stream, &request_id, "completed").await;
         yield Ok(Event::default().data("[DONE]"));
     };
 
-    Ok(Sse::new(stream)
+    let mut response = Sse::new(stream)
         .keep_alive(KeepAlive::default())
-        .into_response())
+        .into_response();
+    apply_compaction_headers(&mut response, compaction.as_ref());
+    Ok(response)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2674,7 +2742,12 @@ pub async fn text_completions(
         summarize_reasoning_tokens(response.tokens_predicted, &text, &reasoning_text);
     {
         let mut s = state.write().await;
-        s.last_parse_trace = Some(build_parse_trace(&profile, &response.content, &text));
+        s.last_parse_trace = Some(crate::normalize::parse_trace::build_parse_trace(
+            &profile,
+            &response.content,
+            &text,
+            None,
+        ));
     }
 
     Ok(Json(TextCompletionResponse {
@@ -2968,7 +3041,8 @@ mod tests {
         };
 
         let profile = ModelProfile::detect("Qwen3.6-27B-Q4_K_M.gguf");
-        let api_value = api_tool_call_value(None, &profile, &tool_call, Some(&tools), None).await;
+        let api_value =
+            api_tool_call_value(None, &profile, &tool_call, Some(&tools), None, true).await;
         let args_text = api_value["function"]["arguments"]
             .as_str()
             .expect("arguments should be stringified JSON");
@@ -3017,7 +3091,8 @@ mod tests {
         };
 
         let profile = ModelProfile::detect("Qwen3.6-27B-Q4_K_M.gguf");
-        let api_value = api_tool_call_value(None, &profile, &tool_call, Some(&tools), None).await;
+        let api_value =
+            api_tool_call_value(None, &profile, &tool_call, Some(&tools), None, true).await;
         let args: serde_json::Value = serde_json::from_str(
             api_value["function"]["arguments"]
                 .as_str()

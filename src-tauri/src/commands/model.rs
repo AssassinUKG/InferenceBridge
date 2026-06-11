@@ -655,7 +655,7 @@ pub async fn backend_load_model_with_overrides(
 
         let mut s = state.write().await;
         let hf_metadata = model.hf_metadata.clone();
-        let ctx = resolve_launch_context_size(context_size);
+        let ctx = resolve_launch_context_size(context_size.or(s.config.server.default_ctx_size));
         let mut process_config = s.config.process.clone();
         if let Some(fit_mode) = overrides.fit_mode.as_ref() {
             process_config.fit_mode = fit_mode.clone();
@@ -1543,8 +1543,29 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
         active_generation,
         last_generation_metrics,
         live_stream,
+        live_streams,
     ) = {
         let s = state.read().await;
+        let live_streams = s.live_streams.clone();
+        let current_live_stream = live_streams
+            .iter()
+            .rev()
+            .find(|stream| matches!(stream.status.as_str(), "running" | "streaming"))
+            .cloned()
+            .or_else(|| s.live_stream.clone());
+        let active_generation = s.active_generation.clone().or_else(|| {
+            current_live_stream
+                .as_ref()
+                .filter(|stream| matches!(stream.status.as_str(), "running" | "streaming"))
+                .map(|stream| crate::state::GenerationRequest {
+                    id: stream.request_id.clone(),
+                    source: stream.source.clone(),
+                    session_id: None,
+                    model: stream.model.clone(),
+                    started_at: stream.started_at.clone(),
+                    status: stream.status.clone(),
+                })
+        });
         let process_state = s.process.state();
         let is_running = process_state != crate::engine::process::ProcessState::Idle;
         (
@@ -1566,9 +1587,10 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
             s.request_scheduler.snapshot(),
             s.model_load_state.clone(),
             s.model_load_progress.clone(),
-            s.active_generation.clone(),
+            active_generation,
             s.last_generation_metrics.clone(),
-            s.live_stream.clone(),
+            current_live_stream,
+            live_streams,
         )
     }; // read lock released before any async I/O
 
@@ -1726,6 +1748,7 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
         active_generation,
         last_generation_metrics,
         live_stream,
+        live_streams,
     })
 }
 
@@ -2155,6 +2178,7 @@ pub struct ProcessStatusInfo {
     pub last_launch_preview: Option<LaunchPreview>,
     pub last_generation_metrics: Option<RuntimePerformanceMetrics>,
     pub live_stream: Option<crate::state::LiveStreamSnapshot>,
+    pub live_streams: Vec<crate::state::LiveStreamSnapshot>,
 }
 
 #[derive(Clone, serde::Serialize)]

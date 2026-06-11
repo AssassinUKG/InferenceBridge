@@ -287,16 +287,28 @@ function LiveStreamFeed({ snapshot }: { snapshot: LiveStreamSnapshot | null }) {
 
 void LiveStreamFeed;
 
-function LiveStreamFeedV2({ snapshot }: { snapshot: LiveStreamSnapshot | null }) {
-  const [streams, setStreams] = useState<LiveStreamSnapshot[]>(() => (snapshot ? [snapshot] : []));
+function LiveStreamFeedV2({
+  snapshot,
+  snapshots = [],
+}: {
+  snapshot: LiveStreamSnapshot | null;
+  snapshots?: LiveStreamSnapshot[];
+}) {
+  const [streams, setStreams] = useState<LiveStreamSnapshot[]>(() =>
+    snapshots.length > 0 ? snapshots : snapshot ? [snapshot] : []
+  );
   const [mode, setMode] = useState<"full" | "visible" | "reasoning" | "events" | "json">("full");
   const [showHistory, setShowHistory] = useState(true);
   const outputRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
+    if (snapshots.length > 0) {
+      setStreams(snapshots);
+      return;
+    }
     if (!snapshot) return;
     setStreams((current) => upsertLiveStream(current, snapshot));
-  }, [snapshot?.request_id, snapshot?.status, snapshot?.raw_output]);
+  }, [snapshot?.request_id, snapshot?.status, snapshot?.raw_output, snapshots]);
 
   useEffect(() => {
     const cleanups: Array<Promise<() => void>> = [];
@@ -563,7 +575,13 @@ function liveToolSummary(stream: LiveStreamSnapshot) {
     : `${calls.length} tool call event${calls.length === 1 ? "" : "s"} captured.`;
 }
 
-function LogsWorkspace({ snapshot }: { snapshot: LiveStreamSnapshot | null }) {
+function LogsWorkspace({
+  snapshot,
+  snapshots,
+}: {
+  snapshot: LiveStreamSnapshot | null;
+  snapshots: LiveStreamSnapshot[];
+}) {
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
       <div
@@ -583,7 +601,7 @@ function LogsWorkspace({ snapshot }: { snapshot: LiveStreamSnapshot | null }) {
         </div>
       </div>
       <div className="min-h-0 flex-1">
-        <LiveStreamFeedV2 snapshot={snapshot} />
+        <LiveStreamFeedV2 snapshot={snapshot} snapshots={snapshots} />
       </div>
     </div>
   );
@@ -650,7 +668,7 @@ function App() {
   const model = useModel();
   const session = useSession();
   const chat = useChat(session.activeId);
-  const context = useContext(1000);
+  const context = useContext();
   const gpuStats = useGpuStats();
 
   const hasModel = !!model.processStatus?.model;
@@ -974,7 +992,10 @@ function App() {
           </div>
 
           <div className={`h-full ${activeTab === "logs" ? "block" : "hidden"}`}>
-            <LogsWorkspace snapshot={model.processStatus?.live_stream ?? null} />
+            <LogsWorkspace
+              snapshot={model.processStatus?.live_stream ?? null}
+              snapshots={model.processStatus?.live_streams ?? []}
+            />
           </div>
 
           <div className={`h-full ${activeTab === "debug" ? "block" : "hidden"}`}>
