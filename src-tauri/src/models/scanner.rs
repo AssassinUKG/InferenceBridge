@@ -57,9 +57,12 @@ fn scan_recursive(dir: &Path, models: &mut Vec<ScannedModel>) {
 fn parse_model_file(path: &Path) -> Option<ScannedModel> {
     let filename = path.file_name()?.to_string_lossy().to_string();
     let metadata = std::fs::metadata(path).ok()?;
-    let profile = super::overrides::detect_effective_profile(&filename);
-    let hf_metadata = super::overrides::effective_hf_metadata(&filename);
     let gguf_meta = super::gguf::read_gguf_meta(path);
+    let architecture = gguf_meta
+        .as_ref()
+        .and_then(|meta| meta.architecture.as_deref());
+    let profile = super::overrides::detect_effective_profile_with_arch(&filename, architecture);
+    let hf_metadata = super::overrides::effective_hf_metadata(&filename);
     Some(ScannedModel {
         path: path.to_path_buf(),
         filename,

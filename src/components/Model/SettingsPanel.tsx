@@ -1141,6 +1141,76 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, onSetApiSe
                   placeholder="--temp 0.6 --top-p 0.95"
                 />
               </FieldRow>
+              <Divider />
+              <FieldRow label="DiffusionGemma Runner" hint="Path to llama-diffusion-cli from the DiffusionGemma llama.cpp build">
+                <FlatInput
+                  value={settings.llama_diffusion_cli_path}
+                  onChange={(v) =>
+                    setSettings({
+                      ...settings,
+                      llama_diffusion_cli_path: v,
+                    })
+                  }
+                  placeholder="C:\\llama.cpp\\build\\bin\\Release\\llama-diffusion-cli.exe"
+                />
+              </FieldRow>
+              <Divider />
+              <FieldRow label="DiffusionGemma Defaults" hint="-n and --diffusion-kv-cache for llama-diffusion-cli">
+                <div className="grid grid-cols-3 gap-2">
+                  <FlatInput
+                    type="number"
+                    value={settings.diffusion_n_predict}
+                    onChange={(v) =>
+                      setSettings({
+                        ...settings,
+                        diffusion_n_predict: Math.max(1, Number(v) || 2048),
+                      })
+                    }
+                    min={1}
+                    placeholder="2048"
+                  />
+                  <select
+                    className="w-full bg-[var(--bg-3)] border border-[var(--border-1)] rounded px-2 py-1.5 text-sm"
+                    value={settings.diffusion_kv_cache}
+                    onChange={(e) =>
+                      setSettings({
+                        ...settings,
+                        diffusion_kv_cache: e.target.value,
+                      })
+                    }
+                  >
+                    <option value="auto">KV auto</option>
+                    <option value="on">KV on</option>
+                    <option value="off">KV off</option>
+                  </select>
+                  <label className="flex items-center gap-2 text-sm text-[var(--text-2)]">
+                    <input
+                      type="checkbox"
+                      checked={settings.diffusion_visual}
+                      onChange={(e) =>
+                        setSettings({
+                          ...settings,
+                          diffusion_visual: e.target.checked,
+                        })
+                      }
+                    />
+                    Visual
+                  </label>
+                </div>
+              </FieldRow>
+              <Divider />
+              <FieldRow label="DiffusionGemma Extra Args" hint="Raw llama-diffusion-cli args appended last">
+                <FlatInput
+                  value={formatCliArgs(settings.diffusion_extra_args)}
+                  onChange={(v) =>
+                    setSettings({
+                      ...settings,
+                      diffusion_extra_args: parseCliArgs(v),
+                    })
+                  }
+                  placeholder="--diffusion-max-steps 48"
+                />
+              </FieldRow>
             </div>
           </div>
         </SectionPanel>

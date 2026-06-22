@@ -42,6 +42,12 @@ pub struct GgufMeta {
     pub n_kv_heads: Option<u32>,
     /// Architecture identifier string (`general.architecture`, e.g. `"qwen2"`)
     pub architecture: Option<String>,
+    /// Human-readable model name (`general.name`).
+    pub general_name: Option<String>,
+    /// Whether the file carries an embedded chat template
+    /// (`tokenizer.chat_template`). When present, llama-server can be run with
+    /// `--jinja` to use the model author's own template verbatim.
+    pub has_chat_template: bool,
 }
 
 impl GgufMeta {
@@ -183,8 +189,8 @@ pub fn read_gguf_meta(path: &Path) -> Option<GgufMeta> {
     let mut found: u8 = 0;
 
     for _ in 0..n_kv {
-        if found >= 6 {
-            break; // all six target fields collected
+        if found >= 8 {
+            break; // all target fields collected
         }
 
         let key = read_str(&mut r, v1)?;
@@ -195,6 +201,17 @@ pub fn read_gguf_meta(path: &Path) -> Option<GgufMeta> {
         match (key.as_str(), ty) {
             ("general.architecture", T_STRING) => {
                 meta.architecture = Some(read_str(&mut r, v1)?);
+                found += 1;
+            }
+            ("general.name", T_STRING) => {
+                meta.general_name = Some(read_str(&mut r, v1)?);
+                found += 1;
+            }
+            ("tokenizer.chat_template", T_STRING) => {
+                // Only record presence — the template itself can be many KB and
+                // we don't want it bloating the in-memory model registry.
+                meta.has_chat_template = true;
+                skip_val(&mut r, ty, v1)?;
                 found += 1;
             }
             (k, T_U32) if k.ends_with(".context_length") => {

@@ -32,6 +32,8 @@ export interface ModelInfo {
   n_kv_heads: number | null;
   head_dim: number | null;
   gguf_architecture: string | null;
+  // Whether the GGUF ships its own embedded chat template (loaded with --jinja).
+  has_chat_template: boolean;
 }
 
 export interface LaunchPreview {
@@ -224,6 +226,11 @@ export interface AppSettings {
   draft_min_tokens: number;
   draft_p_min: number;
   extra_args: string[];
+  llama_diffusion_cli_path: string;
+  diffusion_n_predict: number;
+  diffusion_kv_cache: string;
+  diffusion_visual: boolean;
+  diffusion_extra_args: string[];
   api_key: string | null;
   active_provider: string;
   lm_studio_enabled: boolean;

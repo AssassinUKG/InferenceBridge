@@ -433,6 +433,7 @@ export function ModelSelector({
         n_kv_heads: null,
         head_dim: null,
         gguf_architecture: null,
+        has_chat_template: false,
       })
     : null;
   const selectedModel =
@@ -622,8 +623,8 @@ export function ModelSelector({
           previousModel={previousModel}
           processStatus={processStatus}
           isLoading={isLoading}
-          onLoad={(modelName) => onLoad(modelName)}
-          onSwap={(modelName) => onSwap(modelName)}
+          onLoad={onLoad}
+          onSwap={onSwap}
           onUnload={onUnload}
           onSwapBack={() => onSwap()}
         />
@@ -744,8 +745,10 @@ function ModelInspector({
 }) {
   const [activeInspectorTab, setActiveInspectorTab] = useState<"info" | "load" | "inference">("info");
   const defaultContext = model?.context_window ?? model?.max_context_window ?? 8192;
+  const maxContext = model?.max_context_window ?? Math.max(defaultContext * 4, 32768);
+  const minContext = 512;
   const [contextSize, setContextSize] = useState(defaultContext);
-  const [fitMode, setFitMode] = useState("on");
+  const [fitMode, setFitMode] = useState("off");
   const [useJinja, setUseJinja] = useState(model?.template_mode === "repo");
   const [reasoningMode, setReasoningMode] = useState(model?.supports_reasoning ? "auto" : "off");
   const [templateMode, setTemplateMode] = useState(model?.template_mode ?? "repo");
@@ -759,11 +762,12 @@ function ModelInspector({
   const [topK, setTopK] = useState(fmtSamplingValue(model?.default_top_k));
   const [minP, setMinP] = useState(fmtSamplingValue(model?.default_min_p));
   const [presencePenalty, setPresencePenalty] = useState(fmtSamplingValue(model?.default_presence_penalty));
+  const gpuStats = useGpuStats();
 
   useEffect(() => {
     const nextContext = model?.context_window ?? model?.max_context_window ?? 8192;
     setContextSize(nextContext);
-    setFitMode("on");
+    setFitMode("off");
     setUseJinja(model?.template_mode === "repo");
     setReasoningMode(model?.supports_reasoning ? "auto" : "off");
     setTemplateMode(model?.template_mode ?? "repo");
@@ -779,9 +783,40 @@ function ModelInspector({
     setPresencePenalty(fmtSamplingValue(model?.default_presence_penalty));
   }, [model?.filename, model?.context_window, model?.max_context_window, model?.template_mode, model?.supports_reasoning, model?.default_temperature, model?.default_top_p, model?.default_top_k, model?.default_min_p, model?.default_presence_penalty]);
 
+  const setClampedContextSize = (value: number) => {
+    if (!Number.isFinite(value)) {
+      setContextSize(minContext);
+      setFitMode("off");
+      return;
+    }
+    setContextSize(Math.max(minContext, Math.min(maxContext, Math.round(value))));
+    setFitMode("off");
+  };
+
   if (!model) {
     return <EmptyMsg title="No model selected" body="Select a model to inspect details and launch controls." />;
   }
+
+  const kvBytesPerToken =
+    model.n_layers != null && model.n_kv_heads != null && model.head_dim != null
+      ? model.n_layers * 2 * model.n_kv_heads * model.head_dim
+      : null;
+  const estimateContextVRAM = (tokens: number) => {
+    const modelMb = (model.size_gb || 0) * 1024;
+    const graphOverheadMb = Math.max(512, Math.min(2048, modelMb * 0.08));
+    if (kvBytesPerToken != null) {
+      const kvMb = (tokens * kvBytesPerToken) / (1024 * 1024);
+      return modelMb + graphOverheadMb + kvMb * 1.15;
+    }
+    const name = `${model.filename} ${model.family ?? ""}`.toLowerCase();
+    const fallbackKvMbPerToken =
+      name.includes("gemma-4-26b") || name.includes("a4b")
+        ? 0.04
+        : modelMb > 10 * 1024
+          ? 0.035
+          : 0.025;
+    return modelMb + graphOverheadMb + tokens * fallbackKvMbPerToken;
+  };
 
   const loaded = model.filename === loadedModel;
   const liveContext =
@@ -886,6 +921,7 @@ function ModelInspector({
           <InfoRow label="State" value={loaded ? "Loaded" : "Not loaded"} />
           <InfoRow label="Context" value={launchPreview?.context_size ? `${fmtNum(launchPreview.context_size)} tokens` : model.max_context_window ? `${fmtNum(model.max_context_window)} max` : "Model default"} />
           <InfoRow label="Template" value={launchPreview?.template_source ?? model.template_source ?? model.template_mode ?? "-"} />
+          <InfoRow label="Chat Template" value={model.has_chat_template ? "Embedded (uses --jinja)" : "Built-in fallback"} />
           <InfoRow label="MMProj" value={launchPreview?.mmproj_path ? "Attached" : model.supports_vision ? "Not attached" : "Not required"} />
           <InfoRow label="Draft" value={launchPreview?.draft_model_path ? "Enabled" : "Disabled"} />
           {launchPreview?.draft_model_path && (
@@ -897,7 +933,52 @@ function ModelInspector({
           )}
           <div className="mt-4 space-y-2">
             <EditableRow label="Context">
-              <input type="number" min={512} step={512} value={contextSize} onChange={(e) => setContextSize(Math.max(512, Number(e.target.value) || 512))} style={editInputStyle()} />
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <input
+                    type="range"
+                    min={minContext}
+                    max={maxContext}
+                    step={512}
+                    value={contextSize}
+                    onChange={(e) => setClampedContextSize(Number(e.target.value))}
+                    className="min-w-0 flex-1"
+                  />
+                  <input
+                    type="number"
+                    min={minContext}
+                    max={maxContext}
+                    step={512}
+                    value={contextSize}
+                    onChange={(e) => setClampedContextSize(Number(e.target.value) || minContext)}
+                    style={{ ...editInputStyle(), width: 112 }}
+                  />
+                </div>
+                <div className="flex justify-between text-[10px]" style={{ color: "var(--text-2)" }}>
+                  <span>{fmtNum(minContext)}</span>
+                  <button
+                    type="button"
+                    onClick={() => setClampedContextSize(defaultContext)}
+                    className="rounded px-1.5 py-0.5"
+                    style={{
+                      background: "var(--surface-2)",
+                      border: "1px solid var(--border)",
+                      color: "var(--text-1)",
+                    }}
+                  >
+                    Reset {fmtNum(defaultContext)}
+                  </button>
+                  <span>{fmtNum(maxContext)}</span>
+                </div>
+                {gpuStats && (
+                  <VramBar
+                    usedMb={estimateContextVRAM(contextSize)}
+                    dedicatedMb={gpuStats.dedicated_mb}
+                    systemRamMb={gpuStats.system_ram_mb}
+                    mode="estimate"
+                  />
+                )}
+              </div>
             </EditableRow>
             <EditableRow label="Fit">
               <input value={fitMode} onChange={(e) => setFitMode(e.target.value)} style={editInputStyle()} placeholder="on / off / auto" />
@@ -1254,6 +1335,8 @@ function LoadedModelRow({
           {model.template_mode && (
             <CapBadge label={`Template ${model.template_mode}`} tone="slate" />
           )}
+          {model.has_chat_template && <CapBadge label="Embedded Template" tone="emerald" />}
+          {model.gguf_architecture && <CapBadge label={model.gguf_architecture} tone="slate" />}
         </div>
 
         {/* Actions */}
@@ -1335,7 +1418,7 @@ function ModelRow({
   const maxCtx = model.max_context_window ?? Math.max(defaultCtx * 4, 32768);
   const minCtx = 512;
   const [contextSize, setContextSize] = useState(defaultCtx);
-  const [fitMode, setFitMode] = useState("on");
+  const [fitMode, setFitMode] = useState("off");
   const [useJinja, setUseJinja] = useState(model.template_mode === "repo");
   const [reasoningMode, setReasoningMode] = useState("on");
   const [templateMode, setTemplateMode] = useState(model.template_mode ?? "builtin");
@@ -1368,6 +1451,11 @@ function ModelRow({
     setTemplateMode(config.templateMode);
     setChatTemplateKwargsJson(config.chatTemplateKwargsJson);
     setExtraArgs(config.extraArgs);
+  }
+
+  function setManualContextSize(value: number) {
+    setContextSize(value);
+    setFitMode("off");
   }
 
   function applyRecommendedConfig(config: RecommendedModelConfig) {
@@ -1531,6 +1619,8 @@ function ModelRow({
           {model.template_mode && (
             <CapBadge label={`Template ${model.template_mode}`} tone="slate" />
           )}
+          {model.has_chat_template && <CapBadge label="Embedded Template" tone="emerald" />}
+          {model.gguf_architecture && <CapBadge label={model.gguf_architecture} tone="slate" />}
         </div>
 
         {/* Actions */}
@@ -1590,7 +1680,7 @@ function ModelRow({
                   {contextSize.toLocaleString()}
                 </span>
                 <button
-                  onClick={() => setContextSize(defaultCtx)}
+                  onClick={() => setManualContextSize(defaultCtx)}
                   className="rounded px-1.5 py-0.5 text-[10px] transition"
                   style={{
                     background: "var(--surface-3)",
@@ -1609,7 +1699,7 @@ function ModelRow({
               max={maxCtx}
               step={512}
               value={contextSize}
-              onChange={(e) => setContextSize(Number(e.target.value))}
+              onChange={(e) => setManualContextSize(Number(e.target.value))}
             />
             <div className="mt-1 flex justify-between text-[10px]" style={{ color: "var(--text-2)" }}>
               <span>{minCtx.toLocaleString()}</span>

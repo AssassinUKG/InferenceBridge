@@ -56,42 +56,17 @@ pub fn start_managed(state: SharedState, host: String, port: u16, source: &'stat
 
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let handle = tauri::async_runtime::spawn(async move {
-        let (effective_host, effective_port) = if should_try_startup_port_fallback(
-            source, &host, port,
-        ) {
-            match reserve_startup_api_port(&host, port).await {
-                Ok((fallback_host, fallback_port)) => (fallback_host, fallback_port),
-                Err(error) => {
-                    tracing::warn!(
-                        source,
-                        host = %host,
-                        port,
-                        error = %error,
-                        "Could not preflight startup API port; continuing with configured endpoint"
-                    );
-                    (host.clone(), port)
-                }
-            }
-        } else {
-            (host.clone(), port)
-        };
-
         if source == "gui" {
             // Brief pause only if the port is still held from a previous instance.
             // Skip entirely when the port is already free (the common case).
-            let addr = format!("{effective_host}:{effective_port}");
+            let addr = format!("{host}:{port}");
             if tokio::net::TcpListener::bind(&addr).await.is_err() {
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
         }
-        if let Err(error) = crate::api::server::start_api_server_with_shutdown(
-            state,
-            &effective_host,
-            effective_port,
-            source,
-            stop_rx,
-        )
-        .await
+        if let Err(error) =
+            crate::api::server::start_api_server_with_shutdown(state, &host, port, source, stop_rx)
+                .await
         {
             tracing::error!(error = %error, source, "Managed API server task exited with error");
         }
@@ -105,6 +80,18 @@ pub fn start_managed(state: SharedState, host: String, port: u16, source: &'stat
 }
 
 pub async fn stop_managed(state: SharedState) -> bool {
+    let endpoint = {
+        let app_state = state.read().await;
+        (
+            app_state
+                .api_server_host
+                .clone()
+                .unwrap_or_else(|| app_state.config.server.host.clone()),
+            app_state
+                .api_server_port
+                .unwrap_or(app_state.config.server.port),
+        )
+    };
     let managed = {
         let registry = registry();
         let mut guard = match registry.lock() {
@@ -125,9 +112,20 @@ pub async fn stop_managed(state: SharedState) -> bool {
         let _ = stop_tx.send(());
     }
 
-    tokio::time::timeout(Duration::from_secs(2), &mut managed.handle)
-        .await
-        .ok();
+    match tokio::time::timeout(Duration::from_secs(5), &mut managed.handle).await {
+        Ok(join_result) => {
+            if let Err(error) = join_result {
+                tracing::warn!(error = %error, "Managed API server task ended with join error");
+            }
+        }
+        Err(_) => {
+            tracing::warn!("Managed API server did not stop after shutdown signal; aborting task");
+            managed.handle.abort();
+            let _ = managed.handle.await;
+        }
+    }
+
+    wait_for_api_port_release(&endpoint.0, endpoint.1).await;
 
     let mut app_state = state.write().await;
     app_state.api_server_state = ApiServerState::Idle;
@@ -135,35 +133,19 @@ pub async fn stop_managed(state: SharedState) -> bool {
     true
 }
 
-fn should_try_startup_port_fallback(source: &'static str, host: &str, port: u16) -> bool {
-    source == "gui" && host == "127.0.0.1" && port == 8800
-}
-
-async fn reserve_startup_api_port(host: &str, port: u16) -> Result<(String, u16), String> {
-    if tokio::net::TcpListener::bind(format!("{host}:{port}"))
-        .await
-        .is_ok()
-    {
-        return Ok((host.to_string(), port));
-    }
-
-    for candidate in 8802..=8810 {
-        if tokio::net::TcpListener::bind(format!("{host}:{candidate}"))
-            .await
-            .is_ok()
-        {
-            tracing::warn!(
-                requested_port = port,
-                fallback_port = candidate,
-                host = %host,
-                "Default public API port was unavailable on startup; using session-only fallback port"
-            );
-
-            return Ok((host.to_string(), candidate));
+async fn wait_for_api_port_release(host: &str, port: u16) {
+    let probe_host = crate::api::server::reachable_probe_host(host);
+    let addr = format!("{probe_host}:{port}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpListener::bind(&addr).is_ok() {
+            tracing::debug!(%addr, "Managed API port released after stop");
+            return;
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-
-    Err(format!(
-        "No fallback public API port was free in the startup range 8802-8810 for {host}:{port}"
-    ))
+    tracing::warn!(
+        %addr,
+        "Managed API port was still busy after waiting for shutdown; restart may need bind retry"
+    );
 }

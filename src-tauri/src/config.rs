@@ -65,6 +65,8 @@ pub struct ExternalProviderConfig {
 pub struct ProcessConfig {
     /// Path to llama-server binary. Empty = auto-detect.
     pub llama_server_path: String,
+    /// Path to llama-diffusion-cli binary for DiffusionGemma GGUFs. Empty = auto-detect.
+    pub llama_diffusion_cli_path: String,
     /// Number of GPU layers. -1 = all layers on GPU.
     pub gpu_layers: i32,
     /// Number of threads for generation. 0 = auto-detect.
@@ -146,6 +148,14 @@ pub struct ProcessConfig {
     pub draft_p_min: f32,
     /// Extra raw llama-server args appended after curated settings.
     pub extra_args: Vec<String>,
+    /// DiffusionGemma output token budget passed to llama-diffusion-cli (-n).
+    pub diffusion_n_predict: u32,
+    /// DiffusionGemma KV cache mode: "auto", "on", or "off".
+    pub diffusion_kv_cache: String,
+    /// Show llama-diffusion-cli visual diffusion progress.
+    pub diffusion_visual: bool,
+    /// Extra raw llama-diffusion-cli args appended after curated settings.
+    pub diffusion_extra_args: Vec<String>,
     /// Maximum time (seconds) to wait for a model to load. Default 300 (5 min).
     pub model_load_timeout_secs: u64,
     /// Maximum time (seconds) to wait for the first token during inference. Default 300.
@@ -184,7 +194,7 @@ impl Default for ServerConfig {
             default_top_p: None,
             default_top_k: None,
             default_max_tokens: None,
-            default_ctx_size: None,
+            default_ctx_size: Some(32768),
             tool_argument_repair_enabled: true,
             api_key: None,
         }
@@ -224,6 +234,7 @@ impl Default for ProcessConfig {
     fn default() -> Self {
         Self {
             llama_server_path: String::new(),
+            llama_diffusion_cli_path: String::new(),
             gpu_layers: -1,
             threads: 0,
             threads_batch: 0,
@@ -261,6 +272,10 @@ impl Default for ProcessConfig {
             draft_min_tokens: 0,
             draft_p_min: 0.0,
             extra_args: Vec::new(),
+            diffusion_n_predict: 2048,
+            diffusion_kv_cache: "auto".to_string(),
+            diffusion_visual: false,
+            diffusion_extra_args: Vec::new(),
             model_load_timeout_secs: 300,
             first_token_timeout_secs: 300,
             inter_token_timeout_secs: 120,

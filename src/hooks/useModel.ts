@@ -48,6 +48,9 @@ function sameProcessStatus(
     return false;
   }
 
+  const latestA = a.live_streams.length > 0 ? a.live_streams[a.live_streams.length - 1] : null;
+  const latestB = b.live_streams.length > 0 ? b.live_streams[b.live_streams.length - 1] : null;
+
   return (
     a.state === b.state &&
     a.model === b.model &&
@@ -67,6 +70,11 @@ function sameProcessStatus(
     a.live_stream?.status === b.live_stream?.status &&
     a.live_stream?.raw_output.length === b.live_stream?.raw_output.length &&
     a.live_stream?.events.length === b.live_stream?.events.length &&
+    a.live_streams.length === b.live_streams.length &&
+    (latestA?.request_id ?? null) === (latestB?.request_id ?? null) &&
+    (latestA?.status ?? null) === (latestB?.status ?? null) &&
+    (latestA?.raw_output.length ?? 0) === (latestB?.raw_output.length ?? 0) &&
+    (latestA?.events.length ?? 0) === (latestB?.events.length ?? 0) &&
     a.crash_count === b.crash_count &&
     a.server_version === b.server_version &&
     a.server_path === b.server_path &&
@@ -175,6 +183,18 @@ export function useModel() {
         refresh();
       }
     );
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [refresh]);
+
+  // Listen for llama-server process state changes (Starting/Running/Stopping/
+  // Error) pushed from Rust, so status reflects start/stop/crash instantly
+  // instead of waiting for the background poll.
+  useEffect(() => {
+    const unlisten = listen<string>("process-state-changed", () => {
+      refresh();
+    });
     return () => {
       unlisten.then((fn) => fn());
     };

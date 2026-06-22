@@ -47,6 +47,11 @@ pub struct AppSettings {
     pub draft_min_tokens: u32,
     pub draft_p_min: f32,
     pub extra_args: Vec<String>,
+    pub llama_diffusion_cli_path: String,
+    pub diffusion_n_predict: u32,
+    pub diffusion_kv_cache: String,
+    pub diffusion_visual: bool,
+    pub diffusion_extra_args: Vec<String>,
     /// API key for Bearer token auth. None / empty string = no auth required.
     pub api_key: Option<String>,
     pub active_provider: String,
@@ -109,6 +114,11 @@ pub async fn get_settings(state: tauri::State<'_, SharedState>) -> Result<AppSet
         draft_min_tokens: s.config.process.draft_min_tokens,
         draft_p_min: s.config.process.draft_p_min,
         extra_args: s.config.process.extra_args.clone(),
+        llama_diffusion_cli_path: s.config.process.llama_diffusion_cli_path.clone(),
+        diffusion_n_predict: s.config.process.diffusion_n_predict,
+        diffusion_kv_cache: s.config.process.diffusion_kv_cache.clone(),
+        diffusion_visual: s.config.process.diffusion_visual,
+        diffusion_extra_args: s.config.process.diffusion_extra_args.clone(),
         api_key: s.config.server.api_key.clone(),
         active_provider: s.config.providers.active.clone(),
         lm_studio_enabled: s.config.providers.lm_studio.enabled,
@@ -228,6 +238,25 @@ pub async fn update_settings(
         s.config.process.draft_p_min = settings.draft_p_min.max(0.0);
         s.config.process.extra_args = settings
             .extra_args
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect();
+        s.config.process.llama_diffusion_cli_path =
+            settings.llama_diffusion_cli_path.trim().to_string();
+        let diffusion_cli_path = s.config.process.llama_diffusion_cli_path.clone();
+        if !diffusion_cli_path.is_empty() {
+            s.process.set_diffusion_cli_path(diffusion_cli_path.into());
+        }
+        s.config.process.diffusion_n_predict = settings.diffusion_n_predict.max(1);
+        let kv_cache = settings.diffusion_kv_cache.trim().to_ascii_lowercase();
+        s.config.process.diffusion_kv_cache = match kv_cache.as_str() {
+            "on" | "off" => kv_cache,
+            _ => "auto".to_string(),
+        };
+        s.config.process.diffusion_visual = settings.diffusion_visual;
+        s.config.process.diffusion_extra_args = settings
+            .diffusion_extra_args
             .iter()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())

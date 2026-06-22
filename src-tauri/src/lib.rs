@@ -185,6 +185,7 @@ pub fn run() {
             commands::model::update_llama_server,
             commands::model::list_llama_processes,
             commands::model::kill_process,
+            commands::model::recover_api_port,
             commands::model::kill_all_llama_processes,
             commands::model::get_gpu_stats,
             commands::chat::send_message,
@@ -229,6 +230,9 @@ pub fn run() {
                 state::AppState::new(app_config).expect("Failed to initialize app state");
             // Store the app handle so API/backend paths can emit GUI events.
             app_state.app_handle = Some(app.handle().clone());
+            // Also give the llama-server process handle the ability to push live
+            // stdout/stderr and state-change events to the GUI.
+            app_state.process.set_app_handle(app.handle().clone());
             let shared_state: state::SharedState = Arc::new(RwLock::new(app_state));
 
             // Register state so Tauri commands can access it
@@ -629,6 +633,10 @@ async fn legacy_headless_load_model(
             draft_max_tokens: s.config.process.draft_max_tokens,
             draft_min_tokens: s.config.process.draft_min_tokens,
             draft_p_min: s.config.process.draft_p_min,
+            diffusion_n_predict: s.config.process.diffusion_n_predict,
+            diffusion_kv_cache: s.config.process.diffusion_kv_cache.clone(),
+            diffusion_visual: s.config.process.diffusion_visual,
+            diffusion_extra_args: s.config.process.diffusion_extra_args.clone(),
         }
     };
 

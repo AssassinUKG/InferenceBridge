@@ -125,6 +125,9 @@ export const getProcessStatus = () =>
 export const killProcess = (pid: number) =>
   invoke<string>("kill_process", { pid });
 
+export const recoverApiPort = (pid: number, port: number) =>
+  invoke<string>("recover_api_port", { pid, port });
+
 export const checkLlamaServer = () =>
   invoke<ServerInfo>("check_llama_server");
 

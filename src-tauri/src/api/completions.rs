@@ -1981,6 +1981,7 @@ pub async fn chat_completions(
 ) -> Result<Response, ApiErrorResponse> {
     if let Some(upstream) = crate::api::upstream::active_openai_provider(&state).await {
         return crate::api::upstream::proxy_json_to_openai_provider(
+            state.clone(),
             upstream,
             "/chat/completions",
             body,
@@ -2645,8 +2646,13 @@ pub async fn text_completions(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ApiErrorResponse> {
     if let Some(upstream) = crate::api::upstream::active_openai_provider(&state).await {
-        return crate::api::upstream::proxy_json_to_openai_provider(upstream, "/completions", body)
-            .await;
+        return crate::api::upstream::proxy_json_to_openai_provider(
+            state.clone(),
+            upstream,
+            "/completions",
+            body,
+        )
+        .await;
     }
 
     let req: TextCompletionRequest = serde_json::from_value(body)
@@ -2838,6 +2844,7 @@ mod tests {
 
     fn test_launch_preview(context_size: Option<u32>) -> LaunchPreview {
         LaunchPreview {
+            runtime: "llama-server".to_string(),
             server_path: String::new(),
             model_path: String::new(),
             hf_repo: None,

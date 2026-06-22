@@ -146,6 +146,7 @@ async fn serve_api_server(
         }
     };
 
+    update_api_endpoint(&state, host.to_string(), port).await;
     update_api_status(&state, ApiServerState::Running, None).await;
     spawn_startup_probe(state.clone(), host.to_string(), port, attempt, source);
     tracing::info!(pid, attempt, source, %addr, "API server bound and running");
@@ -164,11 +165,13 @@ async fn serve_api_server(
     match result {
         Ok(()) => {
             tracing::info!(pid, attempt, source, %addr, "API server exited cleanly");
+            clear_api_endpoint(&state, host, port).await;
             update_api_status(&state, ApiServerState::Idle, None).await;
         }
         Err(e) => {
             let msg = format!("API server stopped unexpectedly: {e}");
             tracing::error!(pid, attempt, source, %addr, error = %e, "API server exited with error");
+            clear_api_endpoint(&state, host, port).await;
             update_api_status(&state, ApiServerState::Error, Some(msg.clone())).await;
             return Err(e.into());
         }
@@ -228,13 +231,25 @@ async fn evict_port_blocker(host: &str, port: u16, current_pid: u32) {
         let owner_name = resolve_pid_name(owner_pid);
 
         if owner_pid == current_pid {
-            tracing::error!(
+            tracing::warn!(
                 port,
                 owner_pid,
                 current_pid,
-                "evict_port_blocker: port is owned by OUR OWN PROCESS — \
-                 double-start bug, ApiServerGuard should have caught this"
+                "evict_port_blocker: port is still owned by this process; waiting for previous listener to release"
             );
+            if wait_until_port_bindable(&probe_host, port, Duration::from_secs(5)).await {
+                tracing::info!(
+                    port,
+                    owner_pid,
+                    "evict_port_blocker: previous self-owned listener released port"
+                );
+            } else {
+                tracing::warn!(
+                    port,
+                    owner_pid,
+                    "evict_port_blocker: previous self-owned listener did not release before bind attempt"
+                );
+            }
             return;
         }
 
@@ -268,16 +283,7 @@ async fn evict_port_blocker(host: &str, port: u16, current_pid: u32) {
             "evict_port_blocker: taskkill issued"
         );
 
-        // Poll up to 1.5 s for the socket to actually disappear.
-        let deadline = std::time::Instant::now() + Duration::from_millis(1500);
-        let mut freed = false;
-        while std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            if TcpListener::bind(format!("{probe_host}:{port}")).is_ok() {
-                freed = true;
-                break;
-            }
-        }
+        let freed = wait_until_port_bindable(&probe_host, port, Duration::from_secs(5)).await;
 
         if freed {
             tracing::info!(
@@ -301,6 +307,18 @@ async fn evict_port_blocker(host: &str, port: u16, current_pid: u32) {
 
     #[cfg(not(windows))]
     let _ = (host, port, current_pid);
+}
+
+#[cfg(windows)]
+async fn wait_until_port_bindable(probe_host: &str, port: u16, timeout: Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if std::net::TcpListener::bind(format!("{probe_host}:{port}")).is_ok() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
 }
 
 fn port_owner_is_killable(owner_pid: u32, owner_name: Option<&str>, current_pid: u32) -> bool {
@@ -444,12 +462,12 @@ fn force_kill_pid(pid: u32) -> bool {
 // Bind with retry
 // ---------------------------------------------------------------------------
 
-/// Bind the public API listener.  Retries a few times with short delays to
-/// handle the window between our eviction attempt and the OS releasing the port.
+/// Bind the public API listener. Retries long enough for Windows to release a
+/// listener that was just stopped during settings-save/API restarts.
 async fn bind_with_retry(host: &str, port: u16) -> std::io::Result<tokio::net::TcpListener> {
     let addr = format!("{host}:{port}");
-    const MAX_ATTEMPTS: u32 = 4;
-    const RETRY_DELAY_MS: u64 = 300;
+    const MAX_ATTEMPTS: u32 = 20;
+    const RETRY_DELAY_MS: u64 = 250;
 
     let mut last_err: Option<std::io::Error> = None;
 
@@ -763,6 +781,22 @@ fn native_api_routes() -> Router<SharedState> {
 // ---------------------------------------------------------------------------
 // State helpers
 // ---------------------------------------------------------------------------
+
+async fn update_api_endpoint(state: &SharedState, host: String, port: u16) {
+    let mut s = state.write().await;
+    s.api_server_host = Some(host);
+    s.api_server_port = Some(port);
+}
+
+async fn clear_api_endpoint(state: &SharedState, host: &str, port: u16) {
+    let mut s = state.write().await;
+    let matches_endpoint =
+        s.api_server_host.as_deref() == Some(host) && s.api_server_port == Some(port);
+    if matches_endpoint {
+        s.api_server_host = None;
+        s.api_server_port = None;
+    }
+}
 
 async fn update_api_status(
     state: &SharedState,

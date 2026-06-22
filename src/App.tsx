@@ -664,6 +664,8 @@ function filenameLooksVisionCapable(modelName: string | null) {
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("chat");
   const [settings, setSettings] = useState<AppSettings | null>(null);
+  const [apiRecoveryMessage, setApiRecoveryMessage] = useState<string | null>(null);
+  const [apiRecoveryBusy, setApiRecoveryBusy] = useState(false);
 
   const model = useModel();
   const session = useSession();
@@ -715,6 +717,7 @@ function App() {
   const apiRunning = apiState === "Running" && apiReachable;
   const apiStarting = apiState === "Starting";
   const apiPortOwner = model.processStatus?.api_port_owner ?? null;
+  const configuredApiPort = settings?.server_port ?? 8800;
 
   useEffect(() => {
     let cancelled = false;
@@ -724,6 +727,12 @@ function App() {
       .catch(() => { if (!cancelled) setSettings(null); });
     return () => { cancelled = true; };
   }, []);
+
+  useEffect(() => {
+    if (apiReachable) {
+      setApiRecoveryMessage(null);
+    }
+  }, [apiReachable]);
 
   const handleNewSession = async () => {
     const name = `Chat ${session.sessions.length + 1}`;
@@ -874,6 +883,11 @@ function App() {
               Port owner: {apiPortOwner.name ?? "Unknown process"} (PID {apiPortOwner.pid})
             </p>
           )}
+          {apiRecoveryMessage && (
+            <p className="mt-2 text-xs" style={{ color: "#fde68a" }}>
+              {apiRecoveryMessage}
+            </p>
+          )}
           <div className="mt-3 flex items-center gap-2">
             <button
               onClick={() => model.setApiServerRunning(true)}
@@ -902,19 +916,35 @@ function App() {
             {apiPortOwner?.killable && (
               <button
                 onClick={async () => {
-                  await api.killProcess(apiPortOwner.pid);
-                  await model.refresh();
-                  await model.setApiServerRunning(true);
+                  setApiRecoveryBusy(true);
+                  setApiRecoveryMessage(null);
+                  try {
+                    const message = await api.recoverApiPort(apiPortOwner.pid, configuredApiPort);
+                    setApiRecoveryMessage(message);
+                    await model.refresh();
+                    await model.setApiServerRunning(true);
+                  } catch (error) {
+                    setApiRecoveryMessage(String(error));
+                    await model.refresh();
+                  } finally {
+                    setApiRecoveryBusy(false);
+                  }
                 }}
+                disabled={apiRecoveryBusy}
                 className="rounded px-3 py-1.5 text-xs font-medium transition"
                 style={{
                   background: "rgba(251,191,36,0.14)",
                   color: "#fde68a",
                   border: "1px solid rgba(251,191,36,0.24)",
-                  cursor: "pointer",
+                  cursor: apiRecoveryBusy ? "wait" : "pointer",
+                  opacity: apiRecoveryBusy ? 0.7 : 1,
                 }}
               >
-                Kill {apiPortOwner.kind === "llama-server" ? "llama-server" : "stale app"} ({apiPortOwner.pid})
+                {apiRecoveryBusy
+                  ? "Checking..."
+                  : apiPortOwner.kind === "ghost"
+                    ? `Diagnose ghost owner (${apiPortOwner.pid})`
+                    : `Kill ${apiPortOwner.kind === "llama-server" ? "llama-server" : "stale app"} (${apiPortOwner.pid})`}
               </button>
             )}
           </div>

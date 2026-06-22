@@ -151,6 +151,8 @@ pub struct AppState {
     pub model_stats: Option<ModelStats>,
     pub api_server_state: ApiServerState,
     pub api_server_error: Option<String>,
+    pub api_server_host: Option<String>,
+    pub api_server_port: Option<u16>,
     pub app_handle: Option<tauri::AppHandle>,
     pub active_downloads: HashMap<String, ActiveDownload>,
     pub request_scheduler: Arc<RequestScheduler>,
@@ -164,9 +166,16 @@ impl AppState {
     pub fn new(config: AppConfig) -> anyhow::Result<Self> {
         let session_db = SessionDb::open()?;
         let scheduler_limit = config.process.parallel_slots;
+        let mut process = LlamaProcess::new();
+        if !config.process.llama_server_path.trim().is_empty() {
+            process.set_server_path(config.process.llama_server_path.clone().into());
+        }
+        if !config.process.llama_diffusion_cli_path.trim().is_empty() {
+            process.set_diffusion_cli_path(config.process.llama_diffusion_cli_path.clone().into());
+        }
         Ok(Self {
             config,
-            process: LlamaProcess::new(),
+            process,
             model_registry: ModelRegistry::new(),
             session_db: Mutex::new(session_db),
             loaded_model: None,
@@ -190,6 +199,8 @@ impl AppState {
             model_stats: None,
             api_server_state: ApiServerState::Idle,
             api_server_error: None,
+            api_server_host: None,
+            api_server_port: None,
             app_handle: None,
             active_downloads: HashMap::new(),
             request_scheduler: Arc::new(RequestScheduler::new(scheduler_limit)),
@@ -431,6 +442,7 @@ pub async fn append_live_stream_delta_for_request(
                 "raw" | "error" => {
                     stream.raw_output.push_str(text);
                 }
+                "content_buffered" => {}
                 "tool_call" => {}
                 _ => {
                     stream.raw_output.push_str(text);
@@ -530,7 +542,10 @@ pub fn summarize_reasoning_tokens(
 
 #[cfg(test)]
 mod tests {
-    use super::{begin_api_generation, cancel_all_generations, AppState};
+    use super::{
+        append_live_stream_delta_for_request, begin_api_generation, cancel_all_generations,
+        AppState,
+    };
     use crate::config::AppConfig;
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -552,5 +567,28 @@ mod tests {
         assert_eq!(cancelled, 2);
         assert!(first.cancel.is_cancelled());
         assert!(second.cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn buffered_content_events_do_not_duplicate_raw_log_output() {
+        let state = Arc::new(RwLock::new(
+            AppState::new(AppConfig::default()).expect("state should initialize"),
+        ));
+
+        let generation = begin_api_generation(&state, "model-a".to_string()).await;
+        append_live_stream_delta_for_request(&state, &generation.request_id, "raw", "Hello").await;
+        append_live_stream_delta_for_request(
+            &state,
+            &generation.request_id,
+            "content_buffered",
+            "Hello",
+        )
+        .await;
+
+        let s = state.read().await;
+        let stream = s.live_stream.as_ref().expect("stream should exist");
+        assert_eq!(stream.raw_output, "Hello");
+        assert_eq!(stream.events.len(), 2);
+        assert_eq!(stream.events[1].kind, "content_buffered");
     }
 }

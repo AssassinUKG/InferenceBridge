@@ -35,6 +35,39 @@ fn apply_thinking_preference(
     profile: &ModelProfile,
     show_thinking: Option<bool>,
 ) -> Vec<ChatMessage> {
+    if profile.family == ModelFamily::Gemma4 {
+        match show_thinking {
+            Some(true) => {
+                if let Some(system) = messages.iter_mut().find(|message| message.role == "system") {
+                    if !system.content.trim_start().starts_with("<|think|>") {
+                        system.content = format!("<|think|>\n{}", system.content);
+                    }
+                } else {
+                    messages.insert(
+                        0,
+                        ChatMessage {
+                            role: "system".to_string(),
+                            content:
+                                "<|think|>\nYou may use internal reasoning before the final answer."
+                                    .to_string(),
+                        },
+                    );
+                }
+            }
+            Some(false) => {
+                messages.insert(
+                    0,
+                    ChatMessage {
+                        role: "system".to_string(),
+                        content: "Respond directly. Do not emit hidden reasoning or thought-channel content.".to_string(),
+                    },
+                );
+            }
+            None => {}
+        }
+        return messages;
+    }
+
     let Some(last) = messages.last_mut().filter(|message| message.role == "user") else {
         return messages;
     };

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { listen } from "@tauri-apps/api/event";
 import type {
   DebugApiResponse,
   EffectiveProfileInfo,
@@ -386,6 +387,26 @@ export function DebugInspector({
       refreshLogs();
     }, 3000);
     return () => window.clearInterval(timer);
+  }, [activeTab, autoRefreshLogs]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Live: llama-server pushes a `llama-server-log` event per output line.
+  // Coalesce bursts into a debounced refresh so the console tracks the server
+  // in ~real time without refetching the buffer on every single line. The 3s
+  // poll above stays as a backstop.
+  useEffect(() => {
+    if (activeTab !== "logs" || !autoRefreshLogs) return;
+    let timer: number | undefined;
+    const unlisten = listen("llama-server-log", () => {
+      if (timer != null) return;
+      timer = window.setTimeout(() => {
+        timer = undefined;
+        refreshLogs();
+      }, 250);
+    });
+    return () => {
+      if (timer != null) window.clearTimeout(timer);
+      unlisten.then((fn) => fn());
+    };
   }, [activeTab, autoRefreshLogs]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadExample = (example: Example) => {

@@ -256,6 +256,10 @@ fn preview_matches_effective_launch(
     draft_max_tokens: u32,
     draft_min_tokens: u32,
     draft_p_min: f32,
+    diffusion_n_predict: u32,
+    diffusion_kv_cache: &str,
+    diffusion_visual: bool,
+    diffusion_extra_args: &[String],
     extra_args: &[String],
 ) -> bool {
     let model_ok = names_match(&preview.model_path, model_filename)
@@ -272,6 +276,33 @@ fn preview_matches_effective_launch(
             .unwrap_or(false);
 
     model_ok
+        && {
+            let diffusion_ok = if preview.runtime == "diffusion-cli" {
+                preview.args.contains(&"-n".to_string())
+                    && preview
+                        .args
+                        .windows(2)
+                        .any(|pair| pair[0] == "-n" && pair[1] == diffusion_n_predict.to_string())
+                    && preview.args.windows(2).any(|pair| {
+                        pair[0] == "--diffusion-kv-cache" && pair[1] == diffusion_kv_cache
+                    })
+                    && (!diffusion_visual
+                        || preview.args.contains(&"--diffusion-visual".to_string()))
+                    && preview
+                        .args
+                        .iter()
+                        .rev()
+                        .take(diffusion_extra_args.len())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .eq(diffusion_extra_args.iter().cloned())
+            } else {
+                true
+            };
+            diffusion_ok
+        }
         && preview.context_size == requested_context_size
         && preview.template_mode == template_mode
         && preview.template_source.as_deref() == template_source
@@ -314,9 +345,48 @@ fn loaded_context_satisfies_request(
     })
 }
 
+fn disable_fit_for_explicit_context(context_size: Option<u32>, fit_mode: &mut String) -> bool {
+    if context_size.is_some() && fit_mode.trim().eq_ignore_ascii_case("on") {
+        *fit_mode = "off".to_string();
+        true
+    } else {
+        false
+    }
+}
+
+fn effective_api_endpoint<'a>(
+    configured_host: &'a str,
+    configured_port: u16,
+    active_host: Option<&'a str>,
+    active_port: Option<u16>,
+) -> (&'a str, u16) {
+    (
+        active_host.unwrap_or(configured_host),
+        active_port.unwrap_or(configured_port),
+    )
+}
+
+fn classify_api_port_owner(pid: u32, current_pid: u32, name: Option<&str>) -> (String, bool) {
+    let lower = name.unwrap_or_default().to_lowercase();
+    if pid == current_pid {
+        ("self".to_string(), false)
+    } else if lower.contains("llama-server") {
+        ("llama-server".to_string(), true)
+    } else if lower.contains("inference-bridge") {
+        ("inference-bridge".to_string(), true)
+    } else if lower.is_empty() {
+        ("ghost".to_string(), true)
+    } else {
+        ("other".to_string(), false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{loaded_context_satisfies_request, resolve_launch_context_size};
+    use super::{
+        classify_api_port_owner, disable_fit_for_explicit_context, effective_api_endpoint,
+        loaded_context_satisfies_request, resolve_launch_context_size,
+    };
 
     #[test]
     fn passes_through_requested_context() {
@@ -345,6 +415,68 @@ mod tests {
     #[test]
     fn loaded_context_does_not_satisfy_higher_request() {
         assert!(!loaded_context_satisfies_request(Some(65536), Some(32768)));
+    }
+
+    #[test]
+    fn explicit_context_disables_fit_on_so_llama_cannot_silently_clamp() {
+        let mut fit_mode = "on".to_string();
+
+        assert!(disable_fit_for_explicit_context(
+            Some(140_288),
+            &mut fit_mode
+        ));
+        assert_eq!(fit_mode, "off");
+    }
+
+    #[test]
+    fn missing_context_leaves_fit_mode_unchanged() {
+        let mut fit_mode = "on".to_string();
+
+        assert!(!disable_fit_for_explicit_context(None, &mut fit_mode));
+        assert_eq!(fit_mode, "on");
+    }
+
+    #[test]
+    fn explicit_context_leaves_manual_fit_off_unchanged() {
+        let mut fit_mode = "off".to_string();
+
+        assert!(!disable_fit_for_explicit_context(
+            Some(140_288),
+            &mut fit_mode
+        ));
+        assert_eq!(fit_mode, "off");
+    }
+
+    #[test]
+    fn active_bound_api_endpoint_overrides_stale_configured_endpoint() {
+        assert_eq!(
+            effective_api_endpoint("127.0.0.1", 8800, Some("127.0.0.1"), Some(8802)),
+            ("127.0.0.1", 8802)
+        );
+    }
+
+    #[test]
+    fn configured_api_endpoint_is_used_when_no_fallback_is_active() {
+        assert_eq!(
+            effective_api_endpoint("127.0.0.1", 8800, None, None),
+            ("127.0.0.1", 8800)
+        );
+    }
+
+    #[test]
+    fn unknown_port_owner_is_reported_as_killable_ghost() {
+        assert_eq!(
+            classify_api_port_owner(24_752, 13_080, None),
+            ("ghost".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn current_process_port_owner_is_not_killable() {
+        assert_eq!(
+            classify_api_port_owner(13_080, 13_080, Some("inference-bridge.exe")),
+            ("self".to_string(), false)
+        );
     }
 }
 
@@ -660,6 +792,12 @@ pub async fn backend_load_model_with_overrides(
         if let Some(fit_mode) = overrides.fit_mode.as_ref() {
             process_config.fit_mode = fit_mode.clone();
         }
+        if disable_fit_for_explicit_context(ctx, &mut process_config.fit_mode) {
+            tracing::warn!(
+                requested_context_size = ?ctx,
+                "Explicit context size requested; disabling --fit so llama-server does not silently reduce n_ctx"
+            );
+        }
         if let Some(cache_ram_mb) = overrides.cache_ram_mb {
             process_config.cache_ram_mb = Some(cache_ram_mb);
         }
@@ -706,11 +844,47 @@ pub async fn backend_load_model_with_overrides(
             process_config.extra_args = extra_args.clone();
         }
 
-        let effective_profile = detect_effective_profile(&model.filename);
+        let architecture = model
+            .gguf_meta
+            .as_ref()
+            .and_then(|meta| meta.architecture.as_deref());
+        let effective_profile = crate::models::overrides::detect_effective_profile_with_arch(
+            &model.filename,
+            architecture,
+        );
         if profile_needs_jinja(&effective_profile) && !process_config.use_jinja {
             tracing::warn!(
                 model = %model.filename,
                 "Model tool-call profile requires llama.cpp Jinja chat-template mode; enabling --jinja for this launch"
+            );
+            process_config.use_jinja = true;
+        }
+
+        // Prefer the model's own embedded chat template when it ships one, unless
+        // the user explicitly picked a template (custom/repo/named builtin). This
+        // routes through resolve_template_selection's "gguf:embedded-jinja" path.
+        let has_embedded_template = model
+            .gguf_meta
+            .as_ref()
+            .map(|meta| meta.has_chat_template)
+            .unwrap_or(false);
+        let template_mode = process_config.template_mode.trim().to_lowercase();
+        let explicit_template = template_mode == "custom"
+            || template_mode == "repo"
+            || process_config
+                .custom_template_path
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+            || process_config
+                .template_name
+                .as_deref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false);
+        if has_embedded_template && !explicit_template && !process_config.use_jinja {
+            tracing::info!(
+                model = %model.filename,
+                "GGUF ships an embedded chat template; enabling --jinja to use the model's own template"
             );
             process_config.use_jinja = true;
         }
@@ -775,6 +949,10 @@ pub async fn backend_load_model_with_overrides(
             draft_max_tokens: process_config.draft_max_tokens,
             draft_min_tokens: process_config.draft_min_tokens,
             draft_p_min: process_config.draft_p_min,
+            diffusion_n_predict: process_config.diffusion_n_predict,
+            diffusion_kv_cache: process_config.diffusion_kv_cache.clone(),
+            diffusion_visual: process_config.diffusion_visual,
+            diffusion_extra_args: process_config.diffusion_extra_args.clone(),
         };
 
         LlamaProcess::validate_launch_config(&config).map_err(|e| {
@@ -802,6 +980,22 @@ pub async fn backend_load_model_with_overrides(
             emit_load_progress_payload(&app_handle, &payload);
             msg
         })?;
+        if preview.runtime == "diffusion-cli" {
+            let msg = format!(
+                "DiffusionGemma is configured with llama-diffusion-cli, but that runner does not expose a llama-server HTTP API yet. OpenAI-compatible chat proxying is disabled for this model until llama.cpp adds server support. Runner: {} Args: {}",
+                preview.server_path,
+                preview.args.join(" ")
+            );
+            let payload = crate::state::LoadProgress {
+                stage: "error".to_string(),
+                message: msg.clone(),
+                progress: 0.0,
+                done: true,
+                error: Some(msg.clone()),
+            };
+            emit_load_progress_payload(&app_handle, &payload);
+            return Err(msg);
+        }
 
         let reuse_existing = if let (Some(loaded), Some(last_preview)) =
             (s.loaded_model.clone(), s.last_launch_preview.as_ref())
@@ -828,6 +1022,10 @@ pub async fn backend_load_model_with_overrides(
                 config.draft_max_tokens,
                 config.draft_min_tokens,
                 config.draft_p_min,
+                config.diffusion_n_predict,
+                &config.diffusion_kv_cache,
+                config.diffusion_visual,
+                &config.diffusion_extra_args,
                 &config.extra_args,
             );
             let lower_or_equal_context_request =
@@ -913,6 +1111,12 @@ pub async fn backend_load_model_with_overrides(
         s.process.launch(config).await.map_err(|e| {
             let msg = format!("Failed to launch llama-server: {e}");
             emit_load_progress(&app_handle, "error", &msg, 0.0, true, Some(msg.clone()));
+            if !matches!(
+                s.process.state(),
+                crate::engine::process::ProcessState::Running
+            ) {
+                clear_runtime_after_backend_exit(&mut s, Some(msg.clone()));
+            }
             msg
         })?;
     } // write lock released
@@ -960,6 +1164,13 @@ pub async fn backend_load_model_with_overrides(
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(load_timeout_secs);
     let mut attempt = 0u32;
+
+    // Shared handle to the real load-progress fraction parsed from llama-server
+    // stderr. Captured once so we don't take the state lock every poll.
+    let load_progress_handle = {
+        let s = state.read().await;
+        s.process.load_progress_handle()
+    };
 
     loop {
         if start.elapsed() > timeout {
@@ -1027,7 +1238,12 @@ pub async fn backend_load_model_with_overrides(
                     }
                     if body.contains("loading") {
                         let elapsed = start.elapsed().as_secs();
-                        let progress = (0.1 + (elapsed as f32 * 0.01)).min(0.9);
+                        let estimate = (0.1 + (elapsed as f32 * 0.01)).min(0.9);
+                        // Prefer the real fraction parsed from stderr; fall back
+                        // to the elapsed-time estimate until something is parsed.
+                        let progress = (*load_progress_handle.lock().await)
+                            .map(|p| p.max(estimate))
+                            .unwrap_or(estimate);
                         emit_load_progress(
                             &app_handle,
                             "loading",
@@ -1041,7 +1257,10 @@ pub async fn backend_load_model_with_overrides(
                     }
                 } else if status_code.as_u16() == 503 {
                     let elapsed = start.elapsed().as_secs();
-                    let progress = (0.1 + (elapsed as f32 * 0.01)).min(0.9);
+                    let estimate = (0.1 + (elapsed as f32 * 0.01)).min(0.9);
+                    let progress = (*load_progress_handle.lock().await)
+                        .map(|p| p.max(estimate))
+                        .unwrap_or(estimate);
                     emit_load_progress(
                         &app_handle,
                         "loading",
@@ -1292,6 +1511,11 @@ pub async fn list_models(state: tauri::State<'_, SharedState>) -> Result<Vec<Mod
                 n_kv_heads: m.gguf_meta.as_ref().and_then(|g| g.n_kv_heads),
                 head_dim: m.gguf_meta.as_ref().and_then(|g| g.head_dim()),
                 gguf_architecture: m.gguf_meta.as_ref().and_then(|g| g.architecture.clone()),
+                has_chat_template: m
+                    .gguf_meta
+                    .as_ref()
+                    .map(|g| g.has_chat_template)
+                    .unwrap_or(false),
             }
         })
         .collect())
@@ -1380,6 +1604,7 @@ async fn list_active_external_provider_models(state: SharedState) -> Option<Vec<
                     n_kv_heads: None,
                     head_dim: None,
                     gguf_architecture: None,
+                    has_chat_template: false,
                 }
             })
             .collect(),
@@ -1534,6 +1759,7 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
         api_error,
         api_url,
         api_port,
+        configured_api_port,
         last_launch_preview,
         startup_duration_ms,
         parallel_slots,
@@ -1568,6 +1794,12 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
         });
         let process_state = s.process.state();
         let is_running = process_state != crate::engine::process::ProcessState::Idle;
+        let (api_host, api_port) = effective_api_endpoint(
+            &s.config.server.host,
+            s.config.server.port,
+            s.api_server_host.as_deref(),
+            s.api_server_port,
+        );
         (
             process_state,
             is_running,
@@ -1579,7 +1811,8 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
             s.process.detected_backend(),
             format!("{:?}", s.api_server_state),
             s.api_server_error.clone(),
-            crate::api::server::reachable_api_url(&s.config.server.host, s.config.server.port),
+            crate::api::server::reachable_api_url(api_host, api_port),
+            api_port,
             s.config.server.port,
             s.last_launch_preview.clone(),
             s.last_startup_duration_ms,
@@ -1672,8 +1905,10 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
     // Try managed binary version file first, then query live server /props
     let server_version = download::current_version();
 
-    let api_port_owner = if !api_reachable && !transition_active {
-        detect_api_port_owner(api_port)
+    let api_port_owner = if (!api_reachable && !transition_active)
+        || (api_reachable && api_port != configured_api_port)
+    {
+        detect_api_port_owner(configured_api_port)
     } else {
         None
     };
@@ -1692,7 +1927,15 @@ pub async fn collect_process_status(state: SharedState) -> Result<ProcessStatusI
         api_state.clone()
     };
 
-    let effective_api_error = if api_reachable || transition_active || api_owned_by_self {
+    let effective_api_error = if api_reachable {
+        if api_port != configured_api_port {
+            Some(format!(
+                "The API is running on fallback endpoint {api_url} because configured port {configured_api_port} is unavailable."
+            ))
+        } else {
+            None
+        }
+    } else if transition_active || api_owned_by_self {
         None
     } else if effective_api_state == "Error" {
         if let Some(owner) = api_port_owner.as_ref() {
@@ -1847,22 +2090,11 @@ fn detect_api_port_owner_windows(port: u16) -> Option<ApiPortOwnerInfo> {
         }
 
         let name = process_name_for_pid(pid);
-        let lower = name.as_deref().unwrap_or_default().to_lowercase();
-        let (kind, killable) = if pid == current_pid {
-            ("self".to_string(), false)
-        } else if lower.contains("llama-server") {
-            ("llama-server".to_string(), true)
-        } else if lower.contains("inference-bridge") {
-            ("inference-bridge".to_string(), true)
-        } else if lower.is_empty() {
-            return None;
-        } else {
-            ("other".to_string(), false)
-        };
+        let (kind, killable) = classify_api_port_owner(pid, current_pid, name.as_deref());
 
         return Some(ApiPortOwnerInfo {
             pid,
-            name,
+            name: name.or_else(|| Some("System / Windows networking".to_string())),
             kind,
             killable,
         });
@@ -2022,6 +2254,46 @@ pub async fn kill_process(pid: u32) -> Result<String, String> {
 }
 
 #[tauri::command]
+pub async fn recover_api_port(pid: u32, port: u16) -> Result<String, String> {
+    let before = detect_api_port_owner(port)
+        .ok_or_else(|| format!("No LISTENING owner found on port {port}."))?;
+    if before.pid != pid {
+        return Err(format!(
+            "Port {port} is no longer owned by PID {pid}; current owner is PID {}.",
+            before.pid
+        ));
+    }
+
+    if before.kind == "ghost" {
+        return Err(format!(
+            "Windows reports port {port} is owned by PID {pid}, but that PID does not exist in the process table. This is usually a stale System/HNS/WinNAT/WSL networking listener, not a killable process. Run an elevated PowerShell and execute: `wsl --shutdown; Restart-Service hns -Force; Restart-Service WinNAT -Force`. Then retry InferenceBridge. If Windows still reports the listener after that, restart Windows."
+        ));
+    }
+
+    if !before.killable {
+        return Err(format!(
+            "Port {port} is owned by {} (PID {pid}), which InferenceBridge will not kill automatically.",
+            before.name.unwrap_or_else(|| "an unknown process".to_string())
+        ));
+    }
+
+    kill_process(pid).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    if let Some(after) = detect_api_port_owner(port) {
+        Err(format!(
+            "Killed PID {pid}, but port {port} is still held by {} (PID {}).",
+            after
+                .name
+                .unwrap_or_else(|| "an unknown process".to_string()),
+            after.pid
+        ))
+    } else {
+        Ok(format!("Released port {port} from PID {pid}."))
+    }
+}
+
+#[tauri::command]
 pub async fn kill_all_llama_processes() -> Result<String, String> {
     let procs = list_llama_processes().await?;
     if procs.is_empty() {
@@ -2150,6 +2422,10 @@ pub struct ModelInfo {
     pub n_kv_heads: Option<u32>,
     pub head_dim: Option<u32>,
     pub gguf_architecture: Option<String>,
+    /// Whether the GGUF ships its own embedded chat template. When true, the
+    /// model is loaded with `--jinja` (unless a custom/repo/named template is
+    /// explicitly chosen), so it uses the model author's own template.
+    pub has_chat_template: bool,
 }
 
 #[derive(serde::Serialize)]

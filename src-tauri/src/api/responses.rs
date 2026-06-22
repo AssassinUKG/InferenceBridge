@@ -264,8 +264,13 @@ pub async fn responses(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Response, ApiErrorResponse> {
     if let Some(upstream) = crate::api::upstream::active_openai_provider(&state).await {
-        return crate::api::upstream::proxy_json_to_openai_provider(upstream, "/responses", body)
-            .await;
+        return crate::api::upstream::proxy_json_to_openai_provider(
+            state.clone(),
+            upstream,
+            "/responses",
+            body,
+        )
+        .await;
     }
 
     let original_request_body = body.clone();

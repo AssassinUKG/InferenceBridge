@@ -1,7 +1,7 @@
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::Response;
-use futures_util::TryStreamExt;
+use futures_util::StreamExt;
 
 use crate::api::errors::ApiErrorResponse;
 use crate::state::SharedState;
@@ -28,10 +28,20 @@ pub async fn active_openai_provider(state: &SharedState) -> Option<OpenAiProvide
 }
 
 pub async fn proxy_json_to_openai_provider(
+    state: SharedState,
     provider: OpenAiProvider,
     endpoint: &str,
     body: serde_json::Value,
 ) -> Result<Response, ApiErrorResponse> {
+    let model = body
+        .get("model")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("upstream")
+        .to_string();
+    let generation = crate::state::begin_api_generation(&state, model).await;
+    let request_id = generation.request_id.clone();
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
         .build()
@@ -50,17 +60,30 @@ pub async fn proxy_json_to_openai_provider(
         request = request.bearer_auth(api_key);
     }
 
-    let upstream = request.send().await.map_err(|error| {
-        ApiErrorResponse::service_unavailable(format!(
-            "{} provider request failed: {error}",
-            provider.name
-        ))
-    })?;
+    let upstream = match request.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            crate::state::append_live_stream_delta_for_request(
+                &state,
+                &request_id,
+                "error",
+                &format!("{} provider request failed: {error}", provider.name),
+            )
+            .await;
+            crate::state::finish_api_generation_for_request(&state, &request_id, "error").await;
+            return Err(ApiErrorResponse::service_unavailable(format!(
+                "{} provider request failed: {error}",
+                provider.name
+            )));
+        }
+    };
 
-    response_from_upstream(provider.name, upstream).await
+    response_from_upstream(state, request_id, provider.name, upstream).await
 }
 
 async fn response_from_upstream(
+    state: SharedState,
+    request_id: String,
     provider_name: String,
     upstream: reqwest::Response,
 ) -> Result<Response, ApiErrorResponse> {
@@ -71,12 +94,50 @@ async fn response_from_upstream(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|value| HeaderValue::from_bytes(value.as_bytes()).ok());
 
-    let stream = upstream.bytes_stream().map_err(move |error| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("{provider_name} provider response failed: {error}"),
-        )
-    });
+    let state_for_stream = state.clone();
+    let request_id_for_stream = request_id.clone();
+    let provider_for_stream = provider_name.clone();
+    let mut upstream_stream = upstream.bytes_stream();
+    let stream = async_stream::stream! {
+        while let Some(chunk) = upstream_stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    crate::state::append_live_stream_delta_for_request(
+                        &state_for_stream,
+                        &request_id_for_stream,
+                        "raw",
+                        &text,
+                    ).await;
+                    yield Ok::<Bytes, std::io::Error>(bytes);
+                }
+                Err(error) => {
+                    let message = format!("{provider_for_stream} provider response failed: {error}");
+                    crate::state::append_live_stream_delta_for_request(
+                        &state_for_stream,
+                        &request_id_for_stream,
+                        "error",
+                        &message,
+                    ).await;
+                    crate::state::finish_api_generation_for_request(
+                        &state_for_stream,
+                        &request_id_for_stream,
+                        "error",
+                    ).await;
+                    yield Err::<Bytes, std::io::Error>(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        message,
+                    ));
+                    return;
+                }
+            }
+        }
+        crate::state::finish_api_generation_for_request(
+            &state_for_stream,
+            &request_id_for_stream,
+            if status.is_success() { "completed" } else { "error" },
+        ).await;
+    };
 
     let mut response = Response::builder().status(status);
     if let Some(content_type) = content_type {

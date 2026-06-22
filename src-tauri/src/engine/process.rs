@@ -10,6 +10,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
 
+use crate::models::profiles::{ModelFamily, ModelProfile};
+
 fn system_command(program: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new(program);
     #[cfg(windows)]
@@ -26,6 +28,47 @@ fn filename_supports_vision(path: &Path) -> bool {
         .map(|name| name.to_string_lossy().to_lowercase())
         .unwrap_or_default();
     crate::models::overrides::detect_effective_profile(&name).supports_vision
+}
+
+fn reasoning_mode_disables_thinking(reasoning_mode: Option<&str>) -> bool {
+    matches!(
+        reasoning_mode.map(|value| value.trim().to_ascii_lowercase()),
+        Some(value)
+            if matches!(
+                value.as_str(),
+                "off" | "false" | "none" | "disabled" | "disable" | "0" | "no"
+            )
+    )
+}
+
+fn normalize_chat_template_kwargs_for_profile(
+    kwargs_json: Option<&str>,
+    reasoning_mode: Option<&str>,
+    profile: &ModelProfile,
+) -> anyhow::Result<Option<String>> {
+    let trimmed = kwargs_json.map(str::trim).filter(|value| !value.is_empty());
+    let should_disable_template_thinking =
+        matches!(profile.family, ModelFamily::Gemma4 | ModelFamily::Qwen3)
+            && reasoning_mode_disables_thinking(reasoning_mode);
+
+    if !should_disable_template_thinking {
+        return Ok(trimmed.map(ToOwned::to_owned));
+    }
+
+    let mut value = match trimmed {
+        Some(raw) => serde_json::from_str::<serde_json::Value>(raw)
+            .map_err(|error| anyhow::anyhow!("Invalid chat_template_kwargs_json: {error}"))?,
+        None => serde_json::json!({}),
+    };
+
+    let Some(object) = value.as_object_mut() else {
+        anyhow::bail!("chat_template_kwargs_json must be a JSON object");
+    };
+    object
+        .entry("enable_thinking".to_string())
+        .or_insert(serde_json::Value::Bool(false));
+
+    Ok(Some(serde_json::to_string(&value)?))
 }
 
 fn is_mmproj_candidate(path: &Path) -> bool {
@@ -113,13 +156,56 @@ fn find_mmproj_for_model(model_path: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{filename_supports_vision, find_mmproj_for_model};
+    use super::{
+        filename_supports_vision, find_mmproj_for_model,
+        normalize_chat_template_kwargs_for_profile, parse_llama_load_progress, LaunchConfig,
+        LlamaProcess,
+    };
+    use crate::models::profiles::ModelProfile;
 
     #[test]
     fn gemma4_12b_filename_is_vision_capable() {
         assert!(filename_supports_vision(std::path::Path::new(
             "gemma-4-12B-it-Q4_K_M.gguf"
         )));
+    }
+
+    #[test]
+    fn gemma4_reasoning_off_sets_enable_thinking_false() {
+        let profile = ModelProfile::detect("gemma-4-26B-A4B-it-QAT-Q4_0.gguf");
+        let kwargs =
+            normalize_chat_template_kwargs_for_profile(None, Some("off"), &profile).unwrap();
+
+        assert_eq!(kwargs.as_deref(), Some(r#"{"enable_thinking":false}"#));
+    }
+
+    #[test]
+    fn qwen36_reasoning_off_sets_enable_thinking_false_without_clobbering_kwargs() {
+        let profile = ModelProfile::detect("Qwen3.6-27B-Q4_K_M.gguf");
+        let kwargs = normalize_chat_template_kwargs_for_profile(
+            Some(r#"{"preserve_thinking":true}"#),
+            Some("none"),
+            &profile,
+        )
+        .unwrap()
+        .expect("kwargs should exist");
+        let parsed: serde_json::Value = serde_json::from_str(&kwargs).unwrap();
+
+        assert_eq!(parsed["enable_thinking"], false);
+        assert_eq!(parsed["preserve_thinking"], true);
+    }
+
+    #[test]
+    fn explicit_enable_thinking_kwargs_are_preserved() {
+        let profile = ModelProfile::detect("Qwen3.6-27B-Q4_K_M.gguf");
+        let kwargs = normalize_chat_template_kwargs_for_profile(
+            Some(r#"{"enable_thinking":true}"#),
+            Some("off"),
+            &profile,
+        )
+        .unwrap();
+
+        assert_eq!(kwargs.as_deref(), Some(r#"{"enable_thinking":true}"#));
     }
 
     #[test]
@@ -141,6 +227,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_real_load_progress_from_stderr() {
+        // GPU-offload counter → real fraction in the 0.20–0.65 band.
+        let p = parse_llama_load_progress("load_tensors: offloaded 49/49 layers to GPU").unwrap();
+        assert!((p - 0.65).abs() < 1e-4, "got {p}");
+        let half = parse_llama_load_progress("offloaded 24/48 layers to GPU").unwrap();
+        assert!((half - 0.425).abs() < 1e-3, "got {half}");
+
+        // Milestones are monotonic checkpoints.
+        assert_eq!(
+            parse_llama_load_progress(
+                "load_tensors: loading model tensors, this can take a while..."
+            ),
+            Some(0.15)
+        );
+        assert_eq!(
+            parse_llama_load_progress("main: server is listening on 127.0.0.1:8080"),
+            Some(0.95)
+        );
+
+        // Explicit percentage if a build prints one.
+        let pct = parse_llama_load_progress("loading: 50%").unwrap();
+        assert!((pct - 0.525).abs() < 1e-3, "got {pct}");
+
+        // Unrelated lines carry no signal.
+        assert_eq!(
+            parse_llama_load_progress("ggml_cuda_init: found 1 CUDA device"),
+            None
+        );
+    }
+
+    #[test]
     fn ignores_unrelated_mmproj_sidecar() {
         let dir = std::env::temp_dir().join(format!(
             "inference-bridge-mmproj-test-{}",
@@ -153,6 +270,180 @@ mod tests {
         std::fs::write(&mmproj, b"").expect("write mmproj placeholder");
 
         assert!(find_mmproj_for_model(&model).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diffusion_gemma_preview_uses_diffusion_cli_runner() {
+        let dir = std::env::temp_dir().join(format!(
+            "inference-bridge-diffusion-preview-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let model = dir.join("diffusiongemma-26B-A4B-it-Q4_K_M.gguf");
+        let runner = dir.join(if cfg!(windows) {
+            "llama-diffusion-cli.exe"
+        } else {
+            "llama-diffusion-cli"
+        });
+        std::fs::write(&model, b"").expect("write model placeholder");
+        std::fs::write(&runner, b"").expect("write runner placeholder");
+
+        let mut process = LlamaProcess::new();
+        process.set_diffusion_cli_path(runner.clone());
+        let preview = process
+            .build_args_preview(&LaunchConfig {
+                model_path: model.clone(),
+                hf_repo: None,
+                hf_file: None,
+                context_size: None,
+                gpu_layers: -1,
+                threads: 0,
+                threads_batch: 0,
+                port: 8800,
+                backend_preference: "auto".to_string(),
+                batch_size: 0,
+                ubatch_size: 0,
+                flash_attn: true,
+                use_mmap: true,
+                use_mlock: false,
+                cont_batching: true,
+                parallel_slots: 1,
+                main_gpu: 0,
+                defrag_thold: 0.1,
+                rope_freq_scale: 0.0,
+                fit_mode: None,
+                cache_ram_mb: None,
+                ctxcp: None,
+                use_jinja: false,
+                reasoning_mode: None,
+                template_mode: "repo".to_string(),
+                template_source: None,
+                template_file: None,
+                template_name: None,
+                chat_template_kwargs_json: None,
+                extra_args: vec![],
+                cache_type_k: "q8_0".to_string(),
+                cache_type_v: "q8_0".to_string(),
+                kv_unified: true,
+                no_warmup: false,
+                ctx_shift: false,
+                tensor_split: vec![],
+                draft_model_path: String::new(),
+                spec_type: String::new(),
+                spec_draft_n_max: 0,
+                draft_max_tokens: 0,
+                draft_min_tokens: 0,
+                draft_p_min: 0.0,
+                diffusion_n_predict: 2048,
+                diffusion_kv_cache: "auto".to_string(),
+                diffusion_visual: true,
+                diffusion_extra_args: vec!["--diffusion-max-steps".to_string(), "48".to_string()],
+            })
+            .expect("build diffusion preview");
+
+        assert_eq!(preview.runtime, "diffusion-cli");
+        assert_eq!(preview.server_path, runner.to_string_lossy());
+        assert_eq!(preview.port, 0);
+        assert!(preview
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "-m" && pair[1] == model.to_string_lossy()));
+        assert!(preview
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "-ngl" && pair[1] == "999"));
+        assert!(preview.args.contains(&"-cnv".to_string()));
+        assert!(preview
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "-n" && pair[1] == "2048"));
+        assert!(preview
+            .args
+            .windows(2)
+            .any(|pair| { pair[0] == "--diffusion-kv-cache" && pair[1] == "auto" }));
+        assert!(preview.args.contains(&"--diffusion-visual".to_string()));
+        assert!(preview
+            .args
+            .windows(2)
+            .any(|pair| pair[0] == "--diffusion-max-steps" && pair[1] == "48"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn test_launch_config(model_path: std::path::PathBuf) -> LaunchConfig {
+        LaunchConfig {
+            model_path,
+            hf_repo: None,
+            hf_file: None,
+            context_size: None,
+            gpu_layers: -1,
+            threads: 0,
+            threads_batch: 0,
+            port: 8800,
+            backend_preference: "auto".to_string(),
+            batch_size: 0,
+            ubatch_size: 0,
+            flash_attn: true,
+            use_mmap: true,
+            use_mlock: false,
+            cont_batching: true,
+            parallel_slots: 1,
+            main_gpu: 0,
+            defrag_thold: 0.1,
+            rope_freq_scale: 0.0,
+            fit_mode: None,
+            cache_ram_mb: None,
+            ctxcp: None,
+            use_jinja: false,
+            reasoning_mode: None,
+            template_mode: "repo".to_string(),
+            template_source: None,
+            template_file: None,
+            template_name: None,
+            chat_template_kwargs_json: None,
+            extra_args: vec![],
+            cache_type_k: "q8_0".to_string(),
+            cache_type_v: "q8_0".to_string(),
+            kv_unified: true,
+            no_warmup: false,
+            ctx_shift: false,
+            tensor_split: vec![],
+            draft_model_path: String::new(),
+            spec_type: String::new(),
+            spec_draft_n_max: 0,
+            draft_max_tokens: 0,
+            draft_min_tokens: 0,
+            draft_p_min: 0.0,
+            diffusion_n_predict: 2048,
+            diffusion_kv_cache: "auto".to_string(),
+            diffusion_visual: true,
+            diffusion_extra_args: vec![],
+        }
+    }
+
+    #[test]
+    fn validates_missing_draft_model_before_launch() {
+        let dir = std::env::temp_dir().join(format!(
+            "inference-bridge-missing-draft-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let model = dir.join("gemma-4-26B-A4B-it-QAT-Q4_0.gguf");
+        std::fs::write(&model, b"").expect("write model placeholder");
+
+        let missing_draft = dir.join("missing-draft.gguf");
+        let mut config = test_launch_config(model);
+        config.draft_model_path = missing_draft.to_string_lossy().to_string();
+        config.spec_type = "draft-mtp".to_string();
+
+        let error = LlamaProcess::validate_launch_config(&config)
+            .expect_err("missing draft model should fail validation")
+            .to_string();
+
+        assert!(error.contains("Draft model file does not exist"));
+        assert!(error.contains("missing-draft.gguf"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -215,10 +506,15 @@ pub struct LaunchConfig {
     pub draft_max_tokens: u32,
     pub draft_min_tokens: u32,
     pub draft_p_min: f32,
+    pub diffusion_n_predict: u32,
+    pub diffusion_kv_cache: String,
+    pub diffusion_visual: bool,
+    pub diffusion_extra_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LaunchPreview {
+    pub runtime: String,
     pub server_path: String,
     pub model_path: String,
     pub hf_repo: Option<String>,
@@ -253,6 +549,7 @@ pub struct LlamaProcess {
     child: Option<Child>,
     state: ProcessState,
     llama_server_path: Option<PathBuf>,
+    llama_diffusion_cli_path: Option<PathBuf>,
     current_model: Option<String>,
     current_pid: Option<u32>,
     current_port: u16,
@@ -265,6 +562,82 @@ pub struct LlamaProcess {
     stderr_lines: Arc<TokioMutex<VecDeque<String>>>,
     /// Handles for background I/O reader tasks — aborted on shutdown to prevent leaks.
     io_tasks: Vec<JoinHandle<()>>,
+    /// App handle for pushing live GUI events (llama-server output + state
+    /// changes) so the UI updates in real time instead of polling.
+    app_handle: Option<tauri::AppHandle>,
+    /// Real load progress (0.0–1.0) parsed from llama-server stderr during the
+    /// current launch. Monotonic; reset to `None` on each launch/shutdown.
+    load_progress: Arc<TokioMutex<Option<f32>>>,
+}
+
+/// Parse a coarse load-progress fraction (0.0–1.0) from a single llama-server
+/// stderr line, or `None` if the line carries no progress signal.
+///
+/// llama.cpp doesn't print a continuous percentage during mmap loads, so we map
+/// its stable milestone lines to checkpoints and extract a real fraction from
+/// the GPU-offload counter (`offloaded X/Y layers`) — the slow part of a load.
+/// Callers keep the maximum so the reported progress is monotonic.
+pub fn parse_llama_load_progress(line: &str) -> Option<f32> {
+    let lower = line.to_lowercase();
+
+    // Real sub-progress during GPU offload, e.g. "offloaded 33/49 layers to GPU".
+    if let Some(rest) = lower.split("offloaded ").nth(1) {
+        if let Some(frac) = rest.split(" layers").next() {
+            if let Some((done, total)) = frac.split_once('/') {
+                if let (Ok(done), Ok(total)) =
+                    (done.trim().parse::<f32>(), total.trim().parse::<f32>())
+                {
+                    if total > 0.0 {
+                        return Some(0.20 + 0.45 * (done / total).clamp(0.0, 1.0));
+                    }
+                }
+            }
+        }
+    }
+
+    // Explicit percentage if a build happens to print one (e.g. "... 42%").
+    if let Some(pct) = extract_trailing_percent(&lower) {
+        return Some(0.10 + 0.85 * (pct / 100.0).clamp(0.0, 1.0));
+    }
+
+    // Stable milestone lines → coarse checkpoints.
+    let checkpoint = if lower.contains("loading model tensors") {
+        0.15
+    } else if lower.contains("model buffer size") {
+        0.68
+    } else if lower.contains("kv cache") || lower.contains("kv self size") {
+        0.82
+    } else if lower.contains("warming up") || lower.contains("warmup") {
+        0.90
+    } else if lower.contains("model loaded")
+        || lower.contains("server is listening")
+        || lower.contains("starting the main loop")
+    {
+        0.95
+    } else {
+        return None;
+    };
+    Some(checkpoint)
+}
+
+/// Extract a number immediately preceding a `%` sign, e.g. `"42%"` → `42.0`.
+fn extract_trailing_percent(s: &str) -> Option<f32> {
+    let pos = s.find('%')?;
+    let bytes = s.as_bytes();
+    let mut start = pos;
+    while start > 0 {
+        let c = bytes[start - 1];
+        if c.is_ascii_digit() || c == b'.' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let token = s[start..pos].trim_matches('.');
+    if token.is_empty() {
+        return None;
+    }
+    token.parse::<f32>().ok()
 }
 
 impl LlamaProcess {
@@ -282,6 +655,16 @@ impl LlamaProcess {
         if config.hf_repo.as_deref().unwrap_or("").trim().is_empty() && !config.model_path.exists()
         {
             anyhow::bail!("Model file does not exist: {}", config.model_path.display());
+        }
+        let draft_model_path = config.draft_model_path.trim();
+        if !draft_model_path.is_empty() {
+            let draft_path = Path::new(draft_model_path);
+            if !draft_path.exists() {
+                anyhow::bail!("Draft model file does not exist: {}", draft_path.display());
+            }
+            if !draft_path.is_file() {
+                anyhow::bail!("Draft model path is not a file: {}", draft_path.display());
+            }
         }
         if config.context_size == Some(0) {
             anyhow::bail!("Context size must be greater than 0 when specified");
@@ -315,6 +698,17 @@ impl LlamaProcess {
     pub fn build_args_preview(&self, config: &LaunchConfig) -> anyhow::Result<LaunchPreview> {
         Self::validate_launch_config(config)?;
 
+        let profile = ModelProfile::detect(&format!(
+            "{} {} {}",
+            config.model_path.to_string_lossy(),
+            config.hf_repo.as_deref().unwrap_or_default(),
+            config.hf_file.as_deref().unwrap_or_default()
+        ));
+
+        if matches!(profile.family, ModelFamily::DiffusionGemma) {
+            return self.build_diffusion_args_preview(config);
+        }
+
         let server_path = self
             .find_server_binary_with_preference(&config.backend_preference)
             .ok_or_else(|| anyhow::anyhow!("llama-server binary not found"))?;
@@ -324,6 +718,12 @@ impl LlamaProcess {
         } else {
             None
         };
+
+        let chat_template_kwargs_json = normalize_chat_template_kwargs_for_profile(
+            config.chat_template_kwargs_json.as_deref(),
+            config.reasoning_mode.as_deref(),
+            &profile,
+        )?;
 
         let mut args = vec![];
 
@@ -405,8 +805,7 @@ impl LlamaProcess {
             args.push("--chat-template-file".to_string());
             args.push(template_file.to_string_lossy().to_string());
         }
-        if let Some(kwargs_json) = config
-            .chat_template_kwargs_json
+        if let Some(kwargs_json) = chat_template_kwargs_json
             .as_ref()
             .filter(|value| !value.trim().is_empty())
         {
@@ -518,6 +917,7 @@ impl LlamaProcess {
         args.extend(config.extra_args.iter().cloned());
 
         Ok(LaunchPreview {
+            runtime: "llama-server".to_string(),
             server_path: server_path.to_string_lossy().to_string(),
             model_path: config.model_path.to_string_lossy().to_string(),
             hf_repo: config.hf_repo.clone(),
@@ -539,13 +939,85 @@ impl LlamaProcess {
                 .as_ref()
                 .map(|path| path.to_string_lossy().to_string()),
             template_name: config.template_name.clone(),
-            chat_template_kwargs_json: config.chat_template_kwargs_json.clone(),
+            chat_template_kwargs_json,
             draft_model_path: config.draft_model_path.clone(),
             spec_type: config.spec_type.clone(),
             spec_draft_n_max: config.spec_draft_n_max,
             draft_max_tokens: config.draft_max_tokens,
             draft_min_tokens: config.draft_min_tokens,
             draft_p_min: config.draft_p_min,
+            args,
+        })
+    }
+
+    fn build_diffusion_args_preview(&self, config: &LaunchConfig) -> anyhow::Result<LaunchPreview> {
+        if config
+            .hf_repo
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+        {
+            anyhow::bail!(
+                "DiffusionGemma currently requires a local GGUF file for llama-diffusion-cli; HF repo loading is not supported by the bridge yet"
+            );
+        }
+
+        let runner_path = self
+            .find_diffusion_cli_binary_with_preference(&config.backend_preference)
+            .ok_or_else(|| anyhow::anyhow!("llama-diffusion-cli binary not found"))?;
+
+        let n_predict = config.diffusion_n_predict.max(1);
+        let kv_cache = config.diffusion_kv_cache.trim();
+        let mut args = vec![
+            "-m".to_string(),
+            config.model_path.to_string_lossy().to_string(),
+            "-ngl".to_string(),
+            if config.gpu_layers < 0 {
+                "999".to_string()
+            } else {
+                config.gpu_layers.to_string()
+            },
+            "-cnv".to_string(),
+            "-n".to_string(),
+            n_predict.to_string(),
+        ];
+
+        if !kv_cache.is_empty() {
+            args.push("--diffusion-kv-cache".to_string());
+            args.push(kv_cache.to_string());
+        }
+        if config.diffusion_visual {
+            args.push("--diffusion-visual".to_string());
+        }
+        args.extend(config.diffusion_extra_args.iter().cloned());
+
+        Ok(LaunchPreview {
+            runtime: "diffusion-cli".to_string(),
+            server_path: runner_path.to_string_lossy().to_string(),
+            model_path: config.model_path.to_string_lossy().to_string(),
+            hf_repo: config.hf_repo.clone(),
+            hf_file: config.hf_file.clone(),
+            mmproj_path: None,
+            backend_preference: config.backend_preference.clone(),
+            context_size: config.context_size,
+            port: 0,
+            parallel_slots: 1,
+            fit_mode: config.fit_mode.clone(),
+            cache_ram_mb: config.cache_ram_mb,
+            ctxcp: config.ctxcp,
+            use_jinja: false,
+            reasoning_mode: config.reasoning_mode.clone(),
+            template_mode: "diffusion-cli".to_string(),
+            template_source: Some("llama-diffusion-cli:-cnv".to_string()),
+            template_path: None,
+            template_name: None,
+            chat_template_kwargs_json: None,
+            draft_model_path: String::new(),
+            spec_type: String::new(),
+            spec_draft_n_max: 0,
+            draft_max_tokens: 0,
+            draft_min_tokens: 0,
+            draft_p_min: 0.0,
             args,
         })
     }
@@ -669,6 +1141,84 @@ impl LlamaProcess {
             .find(|p| Self::matches_backend_preference(p, backend_preference))
     }
 
+    pub fn find_diffusion_cli_binary_with_preference(
+        &self,
+        backend_preference: &str,
+    ) -> Option<PathBuf> {
+        if let Some(ref path) = self.llama_diffusion_cli_path {
+            if Path::new(path).exists() {
+                return Some(path.clone());
+            }
+        }
+
+        let our_dir = Self::managed_binary_dir();
+        let our_exe = our_dir.join("llama-diffusion-cli.exe");
+        if our_exe.exists() && Self::matches_backend_preference(&our_exe, backend_preference) {
+            return Some(our_exe);
+        }
+
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        for binary in ["llama-diffusion-cli", "llama-diffusion-cli.exe"] {
+            if let Ok(output) = system_command("where").arg(binary).output() {
+                if output.status.success() {
+                    for line in String::from_utf8_lossy(&output.stdout).lines() {
+                        let p = PathBuf::from(line.trim());
+                        if p.exists() {
+                            candidates.push(p);
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(local_app_data) = dirs::data_local_dir() {
+            let winget_base = local_app_data
+                .join("Microsoft")
+                .join("WinGet")
+                .join("Packages");
+            if winget_base.is_dir() {
+                if let Ok(entries) = std::fs::read_dir(&winget_base) {
+                    for entry in entries.flatten() {
+                        let name = entry.file_name().to_string_lossy().to_string();
+                        if name.contains("llamacpp")
+                            || name.contains("llama.cpp")
+                            || name.contains("ggml")
+                        {
+                            for sub in ["", "bin", "build/bin", "build/bin/Release"] {
+                                let exe = entry.path().join(sub).join("llama-diffusion-cli.exe");
+                                if exe.exists() {
+                                    candidates.push(exe);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let common = [
+            dirs::home_dir().map(|h| h.join(".local/bin/llama-diffusion-cli.exe")),
+            dirs::home_dir().map(|h| h.join("llama.cpp/build/bin/llama-diffusion-cli.exe")),
+            dirs::home_dir().map(|h| h.join("llama.cpp/build/bin/Release/llama-diffusion-cli.exe")),
+            Some(PathBuf::from("C:/llama.cpp/llama-diffusion-cli.exe")),
+            Some(PathBuf::from(
+                "C:/llama.cpp/build/bin/llama-diffusion-cli.exe",
+            )),
+            Some(PathBuf::from(
+                "C:/llama.cpp/build/bin/Release/llama-diffusion-cli.exe",
+            )),
+        ];
+        for candidate in common.into_iter().flatten() {
+            if candidate.exists() {
+                candidates.push(candidate);
+            }
+        }
+
+        candidates
+            .into_iter()
+            .find(|p| Self::matches_backend_preference(p, backend_preference))
+    }
+
     /// Reserve a free TCP port by binding to port 0 and holding the listener
     /// until immediately before spawning llama-server. This narrows the race
     /// window compared with dropping the listener before process launch.
@@ -684,6 +1234,7 @@ impl LlamaProcess {
             child: None,
             state: ProcessState::Idle,
             llama_server_path: None,
+            llama_diffusion_cli_path: None,
             current_model: None,
             current_pid: None,
             current_port: 0,
@@ -693,12 +1244,21 @@ impl LlamaProcess {
             detected_backend: Arc::new(TokioMutex::new(None)),
             stderr_lines: Arc::new(TokioMutex::new(VecDeque::new())),
             io_tasks: Vec::new(),
+            app_handle: None,
+            load_progress: Arc::new(TokioMutex::new(None)),
         }
     }
 
     /// Returns the GPU backend detected from the server's startup logs.
     pub fn detected_backend(&self) -> Arc<TokioMutex<Option<String>>> {
         self.detected_backend.clone()
+    }
+
+    /// Shared handle to the live load-progress fraction parsed from stderr.
+    /// Callers can read `*handle.lock().await` each poll without touching the
+    /// state lock.
+    pub fn load_progress_handle(&self) -> Arc<TokioMutex<Option<f32>>> {
+        self.load_progress.clone()
     }
 
     /// Get a receiver for state change notifications.
@@ -742,9 +1302,25 @@ impl LlamaProcess {
         self.llama_server_path = Some(path);
     }
 
+    pub fn set_diffusion_cli_path(&mut self, path: PathBuf) {
+        self.llama_diffusion_cli_path = Some(path);
+    }
+
     fn set_state(&mut self, state: ProcessState) {
         self.state = state;
+        // Push the transition to the GUI immediately so status panels don't
+        // wait for the next background poll.
+        if let Some(handle) = &self.app_handle {
+            use tauri::Emitter;
+            let _ = handle.emit("process-state-changed", format!("{state:?}"));
+        }
         let _ = self.state_tx.send(state);
+    }
+
+    /// Store the app handle used to push live `llama-server-log` and
+    /// `process-state-changed` events to the GUI. Set once at startup.
+    pub fn set_app_handle(&mut self, handle: tauri::AppHandle) {
+        self.app_handle = Some(handle);
     }
 
     /// Externally mark the process as running (called after health check passes).
@@ -795,10 +1371,6 @@ impl LlamaProcess {
     /// not held during a slow system scan.
     pub async fn launch(&mut self, mut config: LaunchConfig) -> anyhow::Result<()> {
         Self::validate_launch_config(&config)?;
-        // Shutdown any existing process first
-        self.shutdown().await?;
-        // NOTE: stale-process cleanup (kill_all_managed_processes) was moved
-        // to `clear_stale_managed_processes()` and must be called BEFORE the write lock.
 
         // Auto-assign a free ephemeral port when port is 0, and keep the
         // reservation open until just before the child is spawned.
@@ -814,7 +1386,19 @@ impl LlamaProcess {
         }
 
         let preview = self.build_args_preview(&config)?;
+        if preview.runtime == "diffusion-cli" {
+            anyhow::bail!(
+                "DiffusionGemma GGUFs require llama-diffusion-cli and do not expose a llama-server HTTP API yet. Launch preview is ready, but OpenAI-compatible /v1 chat proxying is disabled until llama.cpp provides server support for DiffusionGemma. Runner: {} Args: {}",
+                preview.server_path,
+                preview.args.join(" ")
+            );
+        }
         let server_path = PathBuf::from(&preview.server_path);
+
+        // Shutdown any existing process only after the new launch is known to be valid.
+        self.shutdown().await?;
+        // NOTE: stale-process cleanup (kill_all_managed_processes) was moved
+        // to `clear_stale_managed_processes()` and must be called BEFORE the write lock.
 
         self.current_port = config.port;
         self.set_state(ProcessState::Starting);
@@ -862,7 +1446,16 @@ impl LlamaProcess {
         );
 
         drop(port_reservation);
-        let mut child = cmd.spawn()?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                self.current_port = 0;
+                self.current_model = None;
+                self.current_pid = None;
+                self.set_state(ProcessState::Error);
+                return Err(error.into());
+            }
+        };
         let child_pid = child.id();
 
         // Abort any leftover I/O tasks from a previous launch
@@ -872,10 +1465,15 @@ impl LlamaProcess {
 
         // Spawn background tasks to stream stdout/stderr to tracing
         if let Some(stdout) = child.stdout.take() {
+            let app_handle = self.app_handle.clone();
             let handle = tokio::spawn(async move {
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let mut reader = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = reader.next_line().await {
+                    if let Some(h) = &app_handle {
+                        use tauri::Emitter;
+                        let _ = h.emit("llama-server-log", &line);
+                    }
                     tracing::info!(target: "llama_server", "{}", line);
                 }
             });
@@ -884,8 +1482,12 @@ impl LlamaProcess {
         if let Some(stderr) = child.stderr.take() {
             let backend_handle = self.detected_backend.clone();
             let stderr_buf = self.stderr_lines.clone();
+            let app_handle = self.app_handle.clone();
+            let load_progress = self.load_progress.clone();
             // Clear previous stderr
             stderr_buf.lock().await.clear();
+            // Fresh load — reset parsed progress to unknown.
+            *load_progress.lock().await = None;
             let handle = tokio::spawn(async move {
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let mut reader = BufReader::new(stderr).lines();
@@ -914,6 +1516,19 @@ impl LlamaProcess {
                         if buf.len() > 50 {
                             buf.pop_front();
                         }
+                    }
+                    // Track real load progress (monotonic) for the progress bar.
+                    if let Some(p) = parse_llama_load_progress(&line) {
+                        let mut guard = load_progress.lock().await;
+                        if guard.map_or(true, |current| p > current) {
+                            *guard = Some(p);
+                        }
+                    }
+                    // Push the line to the GUI live so the console is 1-1 with
+                    // llama-server instead of waiting for the log poll.
+                    if let Some(h) = &app_handle {
+                        use tauri::Emitter;
+                        let _ = h.emit("llama-server-log", &line);
                     }
                     // llama-server logs almost everything to stderr
                     tracing::info!(target: "llama_server", "{}", line);
@@ -1027,6 +1642,7 @@ impl LlamaProcess {
             self.current_pid = None;
             *self.detected_backend.lock().await = None;
             self.stderr_lines.lock().await.clear();
+            *self.load_progress.lock().await = None;
 
             // Abort background I/O reader tasks before waiting on the port so
             // lingering pipes/handles do not slow teardown.

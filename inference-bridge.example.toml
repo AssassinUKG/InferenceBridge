@@ -6,7 +6,7 @@
 port = 8800
 host = "127.0.0.1"
 # Safe startup/load default. API clients can request a larger context explicitly.
-default_ctx_size = 16384
+default_ctx_size = 32768
 # Enables one bounded local repair pass if a model emits malformed tool-call arguments.
 tool_argument_repair_enabled = true
 
@@ -19,6 +19,9 @@ scan_dirs = [
 [process]
 # Leave empty to auto-detect llama-server from PATH
 llama_server_path = ""
+# DiffusionGemma GGUFs require the special llama-diffusion-cli target from
+# the DiffusionGemma llama.cpp build, not the normal llama-server binary.
+llama_diffusion_cli_path = ""
 # -1 = offload all layers to GPU
 gpu_layers = -1
 # 0 = auto-detect thread count
@@ -27,6 +30,11 @@ threads = 0
 # draft_model_path = "C:\\path\\to\\draft-model.gguf"
 # spec_type = "draft-mtp"
 # spec_draft_n_max = 3
+# DiffusionGemma defaults used when building the llama-diffusion-cli launch preview.
+diffusion_n_predict = 2048
+diffusion_kv_cache = "auto" # auto, on, off
+diffusion_visual = false
+diffusion_extra_args = []
 
 [ui]
 theme = "dark"

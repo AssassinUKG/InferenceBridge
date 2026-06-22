@@ -9,6 +9,7 @@ pub enum ModelFamily {
     Llama3,
     Phi,
     Mistral,
+    DiffusionGemma,
     Gemma4,
     Gemma,
     Generic,
@@ -72,6 +73,57 @@ pub struct ModelProfile {
 
 impl ModelProfile {
     pub fn detect(model_name: &str) -> Self {
+        Self::detect_with_arch(model_name, None)
+    }
+
+    /// Detect the model profile, using the GGUF `general.architecture` string as
+    /// a fallback when the filename alone doesn't match a known family.
+    ///
+    /// The filename still wins when it carries finer-grained signal (e.g.
+    /// `qwen3.5` vs `qwen3`, or a `-vl` vision marker). The architecture only
+    /// rescues models whose names are unrecognized — so a renamed or obscurely
+    /// named GGUF gets a real profile instead of falling through to `Generic`.
+    pub fn detect_with_arch(model_name: &str, architecture: Option<&str>) -> Self {
+        let mut profile = Self::detect_by_name(model_name);
+
+        // If the filename told us nothing, try to recover the family from the
+        // embedded architecture identifier.
+        if profile.family == ModelFamily::Generic {
+            if let Some(arch_profile) = architecture.and_then(Self::detect_by_architecture) {
+                let preserved_vision = profile.supports_vision;
+                profile = arch_profile;
+                profile.supports_vision = profile.supports_vision || preserved_vision;
+            }
+        }
+
+        profile
+    }
+
+    /// Map a GGUF `general.architecture` value to a base profile. Conservative:
+    /// only maps to coarse families (the filename handles finer variants).
+    fn detect_by_architecture(architecture: &str) -> Option<Self> {
+        let arch = architecture.to_lowercase();
+        let profile = if arch.starts_with("qwen3") {
+            Self::qwen3(&arch)
+        } else if arch.starts_with("qwen2") || arch.starts_with("qwen") {
+            Self::qwen2_5()
+        } else if arch.starts_with("gemma") {
+            Self::gemma()
+        } else if arch.starts_with("phi") {
+            Self::phi()
+        } else if arch.starts_with("mistral") {
+            Self::mistral()
+        } else if arch.starts_with("llama") {
+            // Note: many Mistral/derivative GGUFs also report `llama` here; the
+            // filename matcher catches those before we reach this fallback.
+            Self::llama3()
+        } else {
+            return None;
+        };
+        Some(profile)
+    }
+
+    fn detect_by_name(model_name: &str) -> Self {
         let lower = model_name.to_lowercase();
         let supports_vision = Self::infer_vision_support(&lower);
 
@@ -85,6 +137,8 @@ impl ModelProfile {
             && (lower.contains("r1") || lower.contains("reasoning"))
         {
             Self::deepseek_r1()
+        } else if lower.contains("diffusiongemma") || lower.contains("diffusion-gemma") {
+            Self::diffusion_gemma()
         } else if lower.contains("gemma-4") || lower.contains("gemma4") {
             Self::gemma4()
         } else if lower.contains("gemma") {
@@ -142,6 +196,9 @@ impl ModelProfile {
             // Qwen3.5 35B-A3B multimodal variants are commonly published as plain GGUF
             // filenames without an explicit `vision` or `-vl` marker.
             || normalized.contains("qwen3.5-35b-a3b")
+            // DiffusionGemma is a multimodal diffusion model with image understanding support.
+            || normalized.contains("diffusiongemma")
+            || normalized.contains("diffusion-gemma")
     }
 
     fn qwen3_5() -> Self {
@@ -189,9 +246,10 @@ impl ModelProfile {
             renderer_type: RendererType::QwenChat,
             stop_markers: vec!["</tool_call>".into(), "</function>".into()],
             allow_fallback_extraction: true,
-            default_presence_penalty: Some(1.3),
-            // Unsloth recommended: temp=0.6, top_p=0.95, top_k=20, min_p=0.0
-            // for reasoning; temp=0.7, top_p=0.8, top_k=20 for instruct.
+            default_presence_penalty: Some(1.5),
+            // Qwen3.6 model card: thinking general temp=1.0/top_p=0.95/top_k=20,
+            // coding temp=0.6/top_p=0.95/top_k=20, instruct/non-thinking
+            // temp=0.7/top_p=0.8/top_k=20/presence_penalty=1.5.
             // We use the instruct defaults as the general case.
             default_temperature: Some(0.7),
             default_top_p: Some(0.8),
@@ -373,10 +431,41 @@ impl ModelProfile {
                 "<tool_call|>".into(),
             ],
             allow_fallback_extraction: true,
-            default_presence_penalty: Some(0.0),
-            default_temperature: Some(0.7),
-            default_top_p: Some(0.9),
-            default_top_k: Some(40),
+            default_presence_penalty: Some(1.0),
+            default_temperature: Some(1.0),
+            default_top_p: Some(0.95),
+            default_top_k: Some(64),
+            default_min_p: Some(0.0),
+            disable_thinking_for_tools: true,
+            split_tool_calling: false,
+        }
+    }
+
+    fn diffusion_gemma() -> Self {
+        Self {
+            family: ModelFamily::DiffusionGemma,
+            tool_call_format: ToolCallFormat::Gemma4Native,
+            think_tag_style: ThinkTagStyle::None,
+            interleaved_think_tool: true,
+            supports_parallel_tools: false,
+            supports_vision: true,
+            default_max_output_tokens: Some(2048),
+            default_context_window: None, // let the diffusion runner use model metadata
+            max_context_window: Some(262144),
+            parser_type: ParserType::Gemma4StateMachine,
+            renderer_type: RendererType::Gemma4Chat,
+            stop_markers: vec![
+                "<turn|>".into(),
+                "<|turn>".into(),
+                "<end_of_turn>".into(),
+                "<start_of_turn>".into(),
+                "<tool_call|>".into(),
+            ],
+            allow_fallback_extraction: true,
+            default_presence_penalty: Some(1.0),
+            default_temperature: Some(1.0),
+            default_top_p: Some(0.95),
+            default_top_k: Some(64),
             default_min_p: Some(0.0),
             disable_thinking_for_tools: true,
             split_tool_calling: false,
@@ -436,6 +525,7 @@ impl std::fmt::Display for ModelFamily {
             Self::Llama3 => write!(f, "Llama3"),
             Self::Phi => write!(f, "Phi"),
             Self::Mistral => write!(f, "Mistral"),
+            Self::DiffusionGemma => write!(f, "DiffusionGemma"),
             Self::Gemma4 => write!(f, "Gemma4"),
             Self::Gemma => write!(f, "Gemma"),
             Self::Generic => write!(f, "Generic"),
@@ -474,6 +564,19 @@ mod tests {
     }
 
     #[test]
+    fn detect_diffusion_gemma_before_regular_gemma() {
+        let profile = ModelProfile::detect(
+            "unsloth/diffusiongemma-26B-A4B-it-GGUF/diffusiongemma-26B-A4B-it-Q4_K_M.gguf",
+        );
+        assert_eq!(profile.family, ModelFamily::DiffusionGemma);
+        assert_eq!(profile.renderer_type, RendererType::Gemma4Chat);
+        assert_eq!(profile.parser_type, ParserType::Gemma4StateMachine);
+        assert!(profile.supports_vision);
+        assert_eq!(profile.max_context_window, Some(262144));
+        assert_eq!(profile.default_max_output_tokens, Some(2048));
+    }
+
+    #[test]
     fn detect_vision_support() {
         let profile = ModelProfile::detect("qwen2.5-vl-7b-instruct-q4.gguf");
         assert!(profile.supports_vision);
@@ -490,5 +593,46 @@ mod tests {
         let profile =
             ModelProfile::detect("HauhauCS/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive");
         assert!(profile.supports_vision);
+    }
+
+    #[test]
+    fn arch_rescues_unknown_filename() {
+        // A renamed file the name matcher can't place would be Generic...
+        assert_eq!(
+            ModelProfile::detect("my-cool-merge-v2-q4_k_m.gguf").family,
+            ModelFamily::Generic
+        );
+        // ...but the embedded architecture recovers the real family.
+        let profile = ModelProfile::detect_with_arch("my-cool-merge-v2-q4_k_m.gguf", Some("qwen3"));
+        assert_eq!(profile.family, ModelFamily::Qwen3);
+        assert_eq!(profile.parser_type, ParserType::QwenStateMachine);
+    }
+
+    #[test]
+    fn name_wins_over_arch_when_recognized() {
+        // Filename says qwen3.5 (finer than the `qwen3` arch string); name wins.
+        let profile = ModelProfile::detect_with_arch("Qwen3.5-35B-A3B-Q4_K_M.gguf", Some("qwen3"));
+        assert_eq!(profile.family, ModelFamily::Qwen3_5);
+    }
+
+    #[test]
+    fn arch_maps_common_families() {
+        assert_eq!(
+            ModelProfile::detect_with_arch("unknown.gguf", Some("gemma2")).family,
+            ModelFamily::Gemma
+        );
+        assert_eq!(
+            ModelProfile::detect_with_arch("unknown.gguf", Some("phi3")).family,
+            ModelFamily::Phi
+        );
+        assert_eq!(
+            ModelProfile::detect_with_arch("unknown.gguf", Some("llama")).family,
+            ModelFamily::Llama3
+        );
+        // Truly unknown architecture stays Generic.
+        assert_eq!(
+            ModelProfile::detect_with_arch("unknown.gguf", Some("rwkv")).family,
+            ModelFamily::Generic
+        );
     }
 }

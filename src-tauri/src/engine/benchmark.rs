@@ -99,6 +99,10 @@ pub async fn test_model(
             draft_max_tokens: state.config.process.draft_max_tokens,
             draft_min_tokens: state.config.process.draft_min_tokens,
             draft_p_min: state.config.process.draft_p_min,
+            diffusion_n_predict: state.config.process.diffusion_n_predict,
+            diffusion_kv_cache: state.config.process.diffusion_kv_cache.clone(),
+            diffusion_visual: state.config.process.diffusion_visual,
+            diffusion_extra_args: state.config.process.diffusion_extra_args.clone(),
         };
         state.process.launch(config).await?;
         state.loaded_model = Some(model.filename.clone());

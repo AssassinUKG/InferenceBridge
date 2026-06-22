@@ -129,8 +129,48 @@ impl ModelOverrideStore {
     }
 }
 
+/// Recommended-settings defaults keyed by GGUF `general.architecture`.
+///
+/// This is the runtime-editable surface for keeping sampler/profile defaults
+/// current with what model authors publish — edit `model-defaults.json` and
+/// reload, no recompile. Applied *after* the base profile but *before* the
+/// per-model overrides in `model-overrides.json`, so a per-model entry always
+/// wins.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ArchDefaultsStore {
+    #[serde(default)]
+    pub architectures: HashMap<String, ModelProfileOverride>,
+}
+
+impl ArchDefaultsStore {
+    pub fn matching(&self, architecture: &str) -> Option<&ModelProfileOverride> {
+        self.architectures.get(&architecture.to_lowercase())
+    }
+}
+
 fn overrides_path() -> PathBuf {
     crate::config::app_support_dir().join("model-overrides.json")
+}
+
+fn arch_defaults_path() -> PathBuf {
+    crate::config::app_support_dir().join("model-defaults.json")
+}
+
+/// Load architecture-keyed recommended defaults. Missing file = no defaults.
+pub fn load_arch_defaults() -> ArchDefaultsStore {
+    let path = arch_defaults_path();
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(_) => return ArchDefaultsStore::default(),
+    };
+
+    match serde_json::from_str::<ArchDefaultsStore>(&contents) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), error = %error, "Failed to parse model defaults");
+            ArchDefaultsStore::default()
+        }
+    }
 }
 
 fn save_overrides(store: &ModelOverrideStore) -> Result<(), String> {
@@ -164,7 +204,22 @@ pub fn load_overrides() -> ModelOverrideStore {
 }
 
 pub fn detect_effective_profile(model_name: &str) -> ModelProfile {
-    let mut profile = ModelProfile::detect(model_name);
+    detect_effective_profile_with_arch(model_name, None)
+}
+
+/// Build the effective profile, layering (highest precedence last):
+/// base profile (name + architecture) → architecture defaults
+/// (`model-defaults.json`) → per-model overrides (`model-overrides.json`).
+pub fn detect_effective_profile_with_arch(
+    model_name: &str,
+    architecture: Option<&str>,
+) -> ModelProfile {
+    let mut profile = ModelProfile::detect_with_arch(model_name, architecture);
+    if let Some(arch) = architecture {
+        if let Some(defaults) = load_arch_defaults().matching(arch) {
+            defaults.apply(&mut profile);
+        }
+    }
     if let Some(override_entry) = load_overrides().matching_override(model_name) {
         override_entry.apply(&mut profile);
     }
