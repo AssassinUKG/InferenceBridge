@@ -1,40 +1,96 @@
-# InferenceBridge — example configuration
-# Copy to: %APPDATA%\InferenceBridge\inference-bridge.toml (Windows)
-#       or: ~/.config/InferenceBridge/inference-bridge.toml (Linux/Mac)
+# InferenceBridge example configuration
+#
+# Copy to the app support config path if you want to seed settings by hand.
+# Windows: %LOCALAPPDATA%\InferenceBridge\inference-bridge.toml
+# macOS:   ~/Library/Application Support/InferenceBridge/inference-bridge.toml
+# Linux:   ~/.local/share/InferenceBridge/inference-bridge.toml
+#
+# Do not put real tokens or secrets in this example file.
 
 [server]
 port = 8800
 host = "127.0.0.1"
-# Safe startup/load default. API clients can request a larger context explicitly.
+autostart = true
 default_ctx_size = 32768
-# Enables one bounded local repair pass if a model emits malformed tool-call arguments.
 tool_argument_repair_enabled = true
+# Empty or omitted means no Bearer auth is required.
+api_key = ""
+# Optional server defaults can be added when needed:
+# default_temperature = 0.2
+# default_top_p = 0.95
+# default_top_k = 40
+# default_max_tokens = 2048
 
 [models]
-# Point at your LM Studio models cache and any additional model directories
-scan_dirs = [
-    "C:\\Users\\USER\\.cache\\lm-studio\\models",
-]
+# Add absolute model directories here. Leave empty to let the app auto-detect
+# common LM Studio / Hugging Face cache locations.
+scan_dirs = []
 
 [process]
-# Leave empty to auto-detect llama-server from PATH
 llama_server_path = ""
-# DiffusionGemma GGUFs require the special llama-diffusion-cli target from
-# the DiffusionGemma llama.cpp build, not the normal llama-server binary.
 llama_diffusion_cli_path = ""
-# -1 = offload all layers to GPU
 gpu_layers = -1
-# 0 = auto-detect thread count
 threads = 0
-# Optional speculative decoding. For Gemma/Qwen MTP draft models:
-# draft_model_path = "C:\\path\\to\\draft-model.gguf"
-# spec_type = "draft-mtp"
-# spec_draft_n_max = 3
-# DiffusionGemma defaults used when building the llama-diffusion-cli launch preview.
+threads_batch = 0
+kill_on_exit = true
+backend_preference = "auto" # auto, cuda, cpu
+batch_size = 0
+ubatch_size = 0
+flash_attn = true
+use_mmap = true
+use_mlock = false
+cont_batching = true
+parallel_slots = 1
+main_gpu = 0
+defrag_thold = 0.1
+rope_freq_scale = 0.0
+fit_mode = ""
+# cache_ram_mb = 8192
+# ctxcp = 4
+use_jinja = false
+reasoning_mode = ""
+template_mode = "repo"
+# template_name = "chatml"
+# custom_template_path = "C:\\path\\to\\template.jinja"
+# chat_template_kwargs_json = "{\"enable_thinking\":false}"
+cache_type_k = "q8_0"
+cache_type_v = "q8_0"
+kv_unified = true
+no_warmup = false
+ctx_shift = false
+tensor_split = []
+draft_model_path = ""
+spec_type = ""
+spec_draft_n_max = 0
+draft_max_tokens = 0
+draft_min_tokens = 0
+draft_p_min = 0.0
+extra_args = []
 diffusion_n_predict = 2048
 diffusion_kv_cache = "auto" # auto, on, off
 diffusion_visual = false
 diffusion_extra_args = []
+model_load_timeout_secs = 300
+first_token_timeout_secs = 300
+inter_token_timeout_secs = 120
+health_poll_interval_ms = 150
+
+[providers]
+active = "managed_llamacpp" # managed_llamacpp, lm_studio, sglang
+
+[providers.lm_studio]
+enabled = false
+base_url = "http://127.0.0.1:1234/v1"
+api_key = ""
+
+[providers.sglang]
+enabled = false
+base_url = "http://127.0.0.1:30000/v1"
+api_key = ""
+
+[hub]
+# Hugging Face token for gated metadata/downloads. Leave blank in examples.
+hf_api_key = ""
 
 [ui]
 theme = "dark"

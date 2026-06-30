@@ -30,6 +30,9 @@ pub struct HubModel {
     pub description: String,
     pub tags: Vec<String>,
     pub supports_vision: bool,
+    pub downloads: u64,
+    pub likes: u64,
+    pub last_modified: Option<String>,
     pub quants: Vec<HubQuant>,
 }
 
@@ -40,6 +43,14 @@ struct HfSibling {
     rfilename: String,
     #[serde(default)]
     size: Option<u64>,
+    #[serde(default)]
+    lfs: Option<HfLfs>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct HfLfs {
+    #[serde(default)]
+    size: Option<u64>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -48,6 +59,10 @@ struct HfApiModel {
     model_id: String,
     #[serde(default)]
     downloads: u64,
+    #[serde(default)]
+    likes: u64,
+    #[serde(default)]
+    last_modified: Option<String>,
     #[serde(default)]
     pipeline_tag: Option<String>,
     #[serde(default)]
@@ -96,8 +111,18 @@ fn format_downloads(downloads: u64) -> String {
     grouped.chars().rev().collect()
 }
 
-fn is_hf_downloadable(model: &HfApiModel) -> bool {
-    if model.private || model.disabled {
+fn file_size_gb(file: &HfSibling) -> f32 {
+    file.size
+        .or_else(|| file.lfs.as_ref().and_then(|lfs| lfs.size))
+        .map(|sz| sz as f32 / 1_073_741_824.0)
+        .unwrap_or(0.0)
+}
+
+fn is_hf_downloadable(model: &HfApiModel, authenticated: bool) -> bool {
+    if model.disabled {
+        return false;
+    }
+    if model.private && !authenticated {
         return false;
     }
 
@@ -105,7 +130,7 @@ fn is_hf_downloadable(model: &HfApiModel) -> bool {
         None => true,
         Some(serde_json::Value::Bool(false)) => true,
         Some(serde_json::Value::Null) => true,
-        _ => false,
+        _ => authenticated,
     }
 }
 
@@ -153,15 +178,20 @@ fn hf_supports_vision(model: &HfApiModel) -> bool {
     })
 }
 
-fn hf_api_to_hub(m: HfApiModel) -> Option<HubModel> {
-    if !is_hf_downloadable(&m) {
+fn hf_api_to_hub(m: HfApiModel, authenticated: bool) -> Option<HubModel> {
+    if !is_hf_downloadable(&m, authenticated) {
         return None;
     }
 
     let gguf_files: Vec<&HfSibling> = m
         .siblings
         .iter()
-        .filter(|s| s.rfilename.to_lowercase().ends_with(".gguf"))
+        .filter(|s| {
+            let filename = s.rfilename.to_lowercase();
+            filename.ends_with(".gguf")
+                && !filename.starts_with("mmproj")
+                && !filename.contains("/mmproj")
+        })
         .collect();
     if gguf_files.is_empty() {
         return None;
@@ -171,7 +201,7 @@ fn hf_api_to_hub(m: HfApiModel) -> Option<HubModel> {
         .iter()
         .map(|s| HubQuant {
             quant: extract_quant(&s.rfilename),
-            size_gb: s.size.map(|sz| sz as f32 / 1_073_741_824.0).unwrap_or(0.0),
+            size_gb: file_size_gb(s),
             url: format!(
                 "https://huggingface.co/{}/resolve/main/{}",
                 m.model_id, s.rfilename
@@ -209,6 +239,9 @@ fn hf_api_to_hub(m: HfApiModel) -> Option<HubModel> {
         ),
         tags,
         supports_vision,
+        downloads: m.downloads,
+        likes: m.likes,
+        last_modified: m.last_modified,
         quants,
     })
 }
@@ -217,6 +250,8 @@ async fn search_hf_api_models(
     query: Option<&str>,
     offset: u32,
     limit: u32,
+    sort: Option<&str>,
+    hf_api_key: Option<&str>,
 ) -> Result<Vec<HfApiModel>, String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
@@ -224,17 +259,26 @@ async fn search_hf_api_models(
         .build()
         .map_err(|e| e.to_string())?;
 
+    let sort = match sort.unwrap_or("downloads") {
+        "lastModified" | "createdAt" | "likes" | "downloads" => sort.unwrap_or("downloads"),
+        _ => "downloads",
+    };
+
     let mut req = client.get("https://huggingface.co/api/models").query(&[
         ("filter", "gguf".to_string()),
-        ("sort", "downloads".to_string()),
+        ("sort", sort.to_string()),
         ("direction", "-1".to_string()),
         ("limit", limit.to_string()),
         ("offset", offset.to_string()),
         ("full", "true".to_string()),
+        ("blobs", "true".to_string()),
     ]);
 
     if let Some(query) = query.map(str::trim).filter(|value| !value.is_empty()) {
         req = req.query(&[("search", query.to_string())]);
+    }
+    if let Some(key) = hf_api_key.map(str::trim).filter(|value| !value.is_empty()) {
+        req = req.bearer_auth(key);
     }
 
     let resp = req
@@ -256,13 +300,18 @@ async fn fetch_hub_models(
     offset: u32,
     limit: u32,
     featured_only: bool,
+    sort: Option<&str>,
+    hf_api_key: Option<&str>,
 ) -> Result<Vec<HubModel>, String> {
-    let models = search_hf_api_models(query, offset, limit).await?;
+    let models = search_hf_api_models(query, offset, limit, sort, hf_api_key).await?;
+    let authenticated = hf_api_key
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
 
     Ok(models
         .into_iter()
         .filter(|model| !featured_only || is_hf_featured_candidate(model))
-        .filter_map(hf_api_to_hub)
+        .filter_map(|model| hf_api_to_hub(model, authenticated))
         .collect())
 }
 
@@ -271,6 +320,14 @@ fn basename_lower(path: &str) -> String {
         .file_name()
         .map(|name| name.to_string_lossy().to_lowercase())
         .unwrap_or_else(|| path.to_lowercase())
+}
+
+fn find_repo_chat_template_path(model: &HfApiModel) -> Option<String> {
+    model
+        .siblings
+        .iter()
+        .find(|sibling| basename_lower(&sibling.rfilename) == "chat_template.jinja")
+        .map(|sibling| sibling.rfilename.clone())
 }
 
 fn push_unique_query(queries: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
@@ -305,12 +362,19 @@ fn build_hf_sync_queries(filename: &str) -> Vec<String> {
     queries
 }
 
-async fn lookup_hf_metadata(filename: &str) -> Result<Option<HfModelMetadata>, String> {
+async fn lookup_hf_metadata(
+    filename: &str,
+    hf_api_key: Option<&str>,
+) -> Result<Option<HfModelMetadata>, String> {
     let target = filename.to_lowercase();
     for query in build_hf_sync_queries(filename) {
-        let models = search_hf_api_models(Some(&query), 0, 20).await?;
+        let models =
+            search_hf_api_models(Some(&query), 0, 20, Some("downloads"), hf_api_key).await?;
         for model in models {
-            if !is_hf_downloadable(&model) {
+            let authenticated = hf_api_key
+                .map(str::trim)
+                .is_some_and(|value| !value.is_empty());
+            if !is_hf_downloadable(&model, authenticated) {
                 continue;
             }
 
@@ -320,11 +384,12 @@ async fn lookup_hf_metadata(filename: &str) -> Result<Option<HfModelMetadata>, S
             });
 
             if has_exact_sibling {
+                let template_path = find_repo_chat_template_path(&model);
                 return Ok(Some(HfModelMetadata {
                     repo_id: Some(model.model_id.clone()),
                     file: Some(filename.to_string()),
-                    template_path: Some("chat_template.jinja".to_string()),
-                    has_repo_template: true,
+                    has_repo_template: template_path.is_some(),
+                    template_path,
                     supports_vision: Some(hf_supports_vision(&model)),
                 }));
             }
@@ -337,8 +402,25 @@ async fn lookup_hf_metadata(filename: &str) -> Result<Option<HfModelMetadata>, S
 /// Search HuggingFace for GGUF models. Returns up to 20 results sorted by downloads.
 /// `offset` is the number of results to skip (for pagination).
 #[tauri::command]
-pub async fn search_hub_models(query: String, offset: u32) -> Result<Vec<HubModel>, String> {
-    fetch_hub_models(Some(&query), offset, 20, false).await
+pub async fn search_hub_models(
+    state: tauri::State<'_, SharedState>,
+    query: String,
+    offset: u32,
+    sort: Option<String>,
+) -> Result<Vec<HubModel>, String> {
+    let hf_api_key = {
+        let s = state.read().await;
+        s.config.hub.hf_api_key.clone()
+    };
+    fetch_hub_models(
+        Some(&query),
+        offset,
+        20,
+        false,
+        sort.as_deref(),
+        hf_api_key.as_deref(),
+    )
+    .await
 }
 
 // Download progress event payload emitted during model downloads.
@@ -348,6 +430,8 @@ pub struct DownloadProgress {
     pub id: String,
     pub filename: String,
     pub dest_path: Option<String>,
+    pub supports_vision: Option<bool>,
+    pub repo_id: Option<String>,
     pub downloaded_bytes: u64,
     pub total_bytes: u64,
     pub percent: f32,
@@ -361,6 +445,14 @@ pub struct MetadataSyncSummary {
     pub scanned_models: usize,
     pub matched_models: usize,
     pub updated_models: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HubAccessStatus {
+    pub configured: bool,
+    pub reachable: bool,
+    pub user: Option<String>,
+    pub error: Option<String>,
 }
 
 // Tauri commands for browsing, downloading, and deleting models.
@@ -383,6 +475,14 @@ fn sanitize_download_subpath(filename: &str) -> Result<PathBuf, String> {
     }
 
     Ok(sanitized)
+}
+
+fn path_is_inside_any_dir<P: AsRef<std::path::Path>>(path: &std::path::Path, dirs: &[P]) -> bool {
+    dirs.iter().any(|dir| {
+        std::fs::canonicalize(dir)
+            .map(|scan_dir| path.starts_with(scan_dir))
+            .unwrap_or(false)
+    })
 }
 
 async fn upsert_download(
@@ -478,7 +578,7 @@ pub async fn cancel_download(
     state: tauri::State<'_, SharedState>,
     id: String,
 ) -> Result<(), String> {
-    let progress = {
+    let (progress, paused_path) = {
         let mut s = state.write().await;
         let entry = s
             .active_downloads
@@ -487,8 +587,41 @@ pub async fn cancel_download(
         if entry.progress.done {
             return Ok(());
         }
+        if entry.progress.status == "Paused" {
+            entry.progress.done = true;
+            entry.progress.status = "Cancelled".to_string();
+            (entry.progress.clone(), entry.progress.dest_path.clone())
+        } else {
+            entry.cancel_token.cancel();
+            entry.progress.status = "Cancelling".to_string();
+            (entry.progress.clone(), None)
+        }
+    };
+
+    if let Some(path) = paused_path {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    let _ = app.emit("model-download-progress", progress);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn pause_download(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+    id: String,
+) -> Result<(), String> {
+    let progress = {
+        let mut s = state.write().await;
+        let entry = s
+            .active_downloads
+            .get_mut(&id)
+            .ok_or_else(|| "Download not found.".to_string())?;
+        if entry.progress.done || entry.progress.status == "Paused" {
+            return Ok(());
+        }
         entry.cancel_token.cancel();
-        entry.progress.status = "Cancelling".to_string();
+        entry.progress.status = "Pausing".to_string();
         entry.progress.clone()
     };
 
@@ -504,10 +637,68 @@ pub async fn clear_completed_downloads(state: tauri::State<'_, SharedState>) -> 
 }
 
 #[tauri::command]
+pub async fn get_hub_access_status(
+    state: tauri::State<'_, SharedState>,
+) -> Result<HubAccessStatus, String> {
+    let hf_api_key = {
+        let s = state.read().await;
+        s.config.hub.hf_api_key.clone()
+    };
+    let Some(key) = hf_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    else {
+        return Ok(HubAccessStatus {
+            configured: false,
+            reachable: true,
+            user: None,
+            error: None,
+        });
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent("InferenceBridge/1.0")
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .get("https://huggingface.co/api/whoami-v2")
+        .bearer_auth(&key)
+        .send()
+        .await
+        .map_err(|e| format!("Hugging Face status request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Ok(HubAccessStatus {
+            configured: true,
+            reachable: false,
+            user: None,
+            error: Some(format!("Hugging Face returned HTTP {}", resp.status())),
+        });
+    }
+    let value: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Hugging Face status: {e}"))?;
+    let user = value
+        .get("name")
+        .or_else(|| value.get("fullname"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    Ok(HubAccessStatus {
+        configured: true,
+        reachable: true,
+        user,
+        error: None,
+    })
+}
+
+#[tauri::command]
 pub async fn sync_local_model_metadata(
     state: tauri::State<'_, SharedState>,
 ) -> Result<MetadataSyncSummary, String> {
-    let (filenames, scan_dirs) = {
+    let (filenames, scan_dirs, hf_api_key) = {
         let s = state.read().await;
         (
             s.model_registry
@@ -516,6 +707,7 @@ pub async fn sync_local_model_metadata(
                 .map(|model| model.filename.clone())
                 .collect::<Vec<_>>(),
             s.config.models.scan_dirs.clone(),
+            s.config.hub.hf_api_key.clone(),
         )
     };
 
@@ -523,7 +715,7 @@ pub async fn sync_local_model_metadata(
     let mut updated_models = 0usize;
 
     for filename in &filenames {
-        match lookup_hf_metadata(filename).await {
+        match lookup_hf_metadata(filename, hf_api_key.as_deref()).await {
             Ok(Some(metadata)) => {
                 matched_models += 1;
                 match crate::models::overrides::set_model_hf_metadata_override(
@@ -575,9 +767,9 @@ pub async fn download_hub_model(
 ) -> Result<String, String> {
     let relative_path = sanitize_download_subpath(&filename)?;
     let download_id = url.clone();
-    let dest_dir: std::path::PathBuf = {
+    let (dest_dir, hf_api_key): (std::path::PathBuf, Option<String>) = {
         let s = state.read().await;
-        match s.config.models.scan_dirs.first() {
+        let dest_dir = match s.config.models.scan_dirs.first() {
             Some(d) => std::path::PathBuf::from(d),
             None => {
                 return Err(
@@ -585,7 +777,8 @@ pub async fn download_hub_model(
                         .to_string(),
                 )
             }
-        }
+        };
+        (dest_dir, s.config.hub.hf_api_key.clone())
     };
 
     tokio::fs::create_dir_all(&dest_dir)
@@ -602,7 +795,7 @@ pub async fn download_hub_model(
     {
         let s = state.read().await;
         if let Some(existing) = s.active_downloads.get(&download_id) {
-            if !existing.progress.done {
+            if !existing.progress.done && existing.progress.status != "Paused" {
                 return Err(format!(
                     "Download already in progress for {}",
                     existing.progress.filename
@@ -613,6 +806,22 @@ pub async fn download_hub_model(
 
     let cancel_token = CancellationToken::new();
     let dest_path_string = dest_path.to_string_lossy().to_string();
+    let resume_from = {
+        let s = state.read().await;
+        let can_resume = s
+            .active_downloads
+            .get(&download_id)
+            .is_some_and(|entry| entry.progress.status == "Paused");
+        drop(s);
+        if can_resume {
+            tokio::fs::metadata(&dest_path)
+                .await
+                .map(|metadata| metadata.len())
+                .unwrap_or(0)
+        } else {
+            0
+        }
+    };
     emit_download_progress(
         &app,
         state.inner(),
@@ -620,11 +829,17 @@ pub async fn download_hub_model(
             id: download_id.clone(),
             filename: filename.clone(),
             dest_path: Some(dest_path_string.clone()),
-            downloaded_bytes: 0,
+            supports_vision,
+            repo_id: repo_id.clone(),
+            downloaded_bytes: resume_from,
             total_bytes: 0,
             percent: 0.0,
             done: false,
-            status: "Starting".to_string(),
+            status: if resume_from > 0 {
+                "Resuming".to_string()
+            } else {
+                "Starting".to_string()
+            },
             error: None,
         },
         Some(cancel_token.clone()),
@@ -638,9 +853,20 @@ pub async fn download_hub_model(
             .build()
             .map_err(|e| e.to_string())?;
 
-        let resp = client
+        let mut request = client
             .get(&url)
-            .header(reqwest::header::ACCEPT, "application/octet-stream")
+            .header(reqwest::header::ACCEPT, "application/octet-stream");
+        if resume_from > 0 {
+            request = request.header(reqwest::header::RANGE, format!("bytes={resume_from}-"));
+        }
+        if let Some(key) = hf_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            request = request.bearer_auth(key);
+        }
+        let resp = request
             .send()
             .await
             .map_err(|e| format!("Download request failed: {e}"))?;
@@ -653,13 +879,26 @@ pub async fn download_hub_model(
             ));
         }
 
-        let total_bytes = resp.content_length().unwrap_or(0);
-        let mut file = tokio::fs::File::create(&dest_path)
-            .await
-            .map_err(|e| format!("Cannot create {}: {e}", dest_path.display()))?;
+        let resumed = resume_from > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+        let mut downloaded: u64 = if resumed { resume_from } else { 0 };
+        let total_bytes = resp
+            .content_length()
+            .map(|length| length + downloaded)
+            .unwrap_or(downloaded);
+        let mut file = if resumed {
+            tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&dest_path)
+                .await
+                .map_err(|e| format!("Cannot open {}: {e}", dest_path.display()))?
+        } else {
+            tokio::fs::File::create(&dest_path)
+                .await
+                .map_err(|e| format!("Cannot create {}: {e}", dest_path.display()))?
+        };
 
         let mut stream = resp.bytes_stream();
-        let mut downloaded: u64 = 0;
         let mut last_emit = std::time::Instant::now();
         let mut cancelled = false;
 
@@ -689,6 +928,8 @@ pub async fn download_hub_model(
                         id: download_id.clone(),
                         filename: filename.clone(),
                         dest_path: Some(dest_path_string.clone()),
+                        supports_vision,
+                        repo_id: repo_id.clone(),
                         downloaded_bytes: downloaded,
                         total_bytes,
                         percent,
@@ -704,8 +945,16 @@ pub async fn download_hub_model(
         }
 
         if cancelled {
+            let paused = {
+                let s = state.read().await;
+                s.active_downloads
+                    .get(&download_id)
+                    .is_some_and(|entry| entry.progress.status == "Pausing")
+            };
             drop(file);
-            let _ = tokio::fs::remove_file(&dest_path).await;
+            if !paused {
+                let _ = tokio::fs::remove_file(&dest_path).await;
+            }
             emit_download_progress(
                 &app,
                 state.inner(),
@@ -713,6 +962,8 @@ pub async fn download_hub_model(
                     id: download_id.clone(),
                     filename: filename.clone(),
                     dest_path: Some(dest_path_string.clone()),
+                    supports_vision,
+                    repo_id: repo_id.clone(),
                     downloaded_bytes: downloaded,
                     total_bytes,
                     percent: if total_bytes > 0 {
@@ -720,14 +971,22 @@ pub async fn download_hub_model(
                     } else {
                         0.0
                     },
-                    done: true,
-                    status: "Cancelled".to_string(),
+                    done: !paused,
+                    status: if paused {
+                        "Paused".to_string()
+                    } else {
+                        "Cancelled".to_string()
+                    },
                     error: None,
                 },
                 None,
             )
             .await;
-            return Err("Download cancelled".to_string());
+            return Err(if paused {
+                "Download paused".to_string()
+            } else {
+                "Download cancelled".to_string()
+            });
         }
 
         file.flush()
@@ -743,8 +1002,8 @@ pub async fn download_hub_model(
             let metadata = HfModelMetadata {
                 repo_id: repo_id.clone(),
                 file: Some(filename.clone()),
-                template_path: Some("chat_template.jinja".to_string()),
-                has_repo_template: repo_id.is_some(),
+                template_path: None,
+                has_repo_template: false,
                 supports_vision,
             };
             if let Err(error) =
@@ -777,6 +1036,8 @@ pub async fn download_hub_model(
                 id: download_id.clone(),
                 filename: filename.clone(),
                 dest_path: Some(dest_path_string.clone()),
+                supports_vision,
+                repo_id: repo_id.clone(),
                 downloaded_bytes: downloaded,
                 total_bytes,
                 percent: 1.0,
@@ -793,7 +1054,7 @@ pub async fn download_hub_model(
     .await;
 
     if let Err(error) = &result {
-        if error != "Download cancelled" {
+        if error != "Download cancelled" && error != "Download paused" {
             let _ = tokio::fs::remove_file(&dest_path).await;
             emit_download_progress(
                 &app,
@@ -802,6 +1063,8 @@ pub async fn download_hub_model(
                     id: download_id,
                     filename,
                     dest_path: Some(dest_path_string),
+                    supports_vision,
+                    repo_id,
                     downloaded_bytes: 0,
                     total_bytes: 0,
                     percent: 0.0,
@@ -823,8 +1086,8 @@ pub async fn download_hub_model(
 pub async fn delete_model_file(
     state: tauri::State<'_, SharedState>,
     path: String,
-) -> Result<(), String> {
-    let p = std::path::Path::new(&path);
+) -> Result<String, String> {
+    let p = std::path::PathBuf::from(&path);
 
     match p.extension().and_then(|e| e.to_str()) {
         Some(ext) if ext.eq_ignore_ascii_case("gguf") => {}
@@ -835,27 +1098,65 @@ pub async fn delete_model_file(
         return Err(format!("File not found: {}", p.display()));
     }
 
-    tokio::fs::remove_file(p)
+    let canonical_path = tokio::fs::canonicalize(&p)
         .await
-        .map_err(|e| format!("Delete failed for {}: {e}", p.display()))?;
+        .map_err(|e| format!("Could not resolve {}: {e}", p.display()))?;
+
+    let (scan_dirs, loaded_model) = {
+        let s = state.read().await;
+        (s.config.models.scan_dirs.clone(), s.loaded_model.clone())
+    };
+
+    if !path_is_inside_any_dir(&canonical_path, &scan_dirs) {
+        return Err(format!(
+            "Refusing to delete {}; it is not inside a configured model directory.",
+            canonical_path.display()
+        ));
+    }
+
+    let filename = canonical_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("model")
+        .to_string();
+    let mut stopped_loaded_model = false;
+    if loaded_model.as_deref() == Some(&filename) {
+        let load_mutex = {
+            let s = state.read().await;
+            s.model_load_mutex.clone()
+        };
+        let _load_guard = load_mutex.lock().await;
+        crate::commands::model::stop_model_for_binary_update(state.inner().clone()).await?;
+        stopped_loaded_model = true;
+    }
+
+    tokio::fs::remove_file(&canonical_path)
+        .await
+        .map_err(|e| format!("Delete failed for {}: {e}", canonical_path.display()))?;
 
     // Rescan so deleted model vanishes from the UI
     {
-        let s = state.read().await;
-        let dirs = s.config.models.scan_dirs.clone();
-        drop(s);
-        let scanned = tokio::task::spawn_blocking(move || crate::models::scanner::scan_all(&dirs))
-            .await
-            .unwrap_or_default();
+        let scanned =
+            tokio::task::spawn_blocking(move || crate::models::scanner::scan_all(&scan_dirs))
+                .await
+                .unwrap_or_default();
         state.write().await.model_registry.update(scanned);
     }
 
-    Ok(())
+    if stopped_loaded_model {
+        Ok(format!("Deleted {filename} after unloading it."))
+    } else {
+        Ok(format!("Deleted {filename}."))
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{build_hf_sync_queries, hf_supports_vision, sanitize_download_subpath, HfApiModel};
+    use super::{
+        build_hf_sync_queries, find_repo_chat_template_path, hf_supports_vision,
+        is_hf_downloadable, path_is_inside_any_dir, sanitize_download_subpath, HfApiModel,
+        HfSibling,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -870,6 +1171,105 @@ mod tests {
     #[test]
     fn rejects_parent_traversal() {
         assert!(sanitize_download_subpath("../escape.gguf").is_err());
+    }
+
+    #[test]
+    fn public_mode_rejects_gated_models() {
+        let model = HfApiModel {
+            model_id: "owner/model".to_string(),
+            downloads: 0,
+            pipeline_tag: None,
+            tags: vec![],
+            private: false,
+            disabled: false,
+            gated: Some(serde_json::json!("manual")),
+            siblings: vec![],
+            likes: 0,
+            last_modified: None,
+        };
+
+        assert!(!is_hf_downloadable(&model, false));
+    }
+
+    #[test]
+    fn authenticated_mode_allows_gated_models() {
+        let model = HfApiModel {
+            model_id: "owner/model".to_string(),
+            downloads: 0,
+            pipeline_tag: None,
+            tags: vec![],
+            private: false,
+            disabled: false,
+            gated: Some(serde_json::json!("manual")),
+            siblings: vec![],
+            likes: 0,
+            last_modified: None,
+        };
+
+        assert!(is_hf_downloadable(&model, true));
+    }
+
+    #[test]
+    fn authenticated_mode_allows_private_models_returned_by_hf() {
+        let model = HfApiModel {
+            model_id: "owner/private".to_string(),
+            downloads: 0,
+            pipeline_tag: None,
+            tags: vec![],
+            private: true,
+            disabled: false,
+            gated: None,
+            siblings: vec![],
+            likes: 0,
+            last_modified: None,
+        };
+
+        assert!(is_hf_downloadable(&model, true));
+    }
+
+    #[test]
+    fn delete_guard_allows_models_inside_scan_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "inference-bridge-delete-test-{}",
+            std::process::id()
+        ));
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let model = nested.join("model.gguf");
+        std::fs::write(&model, b"test").unwrap();
+
+        let canonical_model = std::fs::canonicalize(&model).unwrap();
+        assert!(path_is_inside_any_dir(
+            &canonical_model,
+            &[root.to_string_lossy().to_string()]
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_guard_rejects_models_outside_scan_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "inference-bridge-delete-test-{}-root",
+            std::process::id()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "inference-bridge-delete-test-{}-outside",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let model = outside.join("model.gguf");
+        std::fs::write(&model, b"test").unwrap();
+
+        let canonical_model = std::fs::canonicalize(&model).unwrap();
+        assert!(!path_is_inside_any_dir(
+            &canonical_model,
+            &[root.to_string_lossy().to_string()]
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
     }
 
     #[test]
@@ -889,6 +1289,8 @@ mod tests {
             disabled: false,
             gated: None,
             siblings: vec![],
+            likes: 0,
+            last_modified: None,
         };
 
         assert!(hf_supports_vision(&model));
@@ -909,8 +1311,71 @@ mod tests {
             disabled: false,
             gated: None,
             siblings: vec![],
+            likes: 0,
+            last_modified: None,
         };
 
         assert!(hf_supports_vision(&model));
+    }
+
+    #[test]
+    fn detects_actual_repo_chat_template_sibling() {
+        let model = HfApiModel {
+            model_id: "owner/model".to_string(),
+            downloads: 0,
+            likes: 0,
+            last_modified: None,
+            pipeline_tag: None,
+            tags: vec![],
+            private: false,
+            disabled: false,
+            gated: None,
+            siblings: vec![
+                HfSibling {
+                    rfilename: "Qwen3-8B-Q4_K_M.gguf".to_string(),
+                    size: None,
+                    lfs: None,
+                },
+                HfSibling {
+                    rfilename: "nested/chat_template.jinja".to_string(),
+                    size: None,
+                    lfs: None,
+                },
+            ],
+        };
+
+        assert_eq!(
+            find_repo_chat_template_path(&model).as_deref(),
+            Some("nested/chat_template.jinja")
+        );
+    }
+
+    #[test]
+    fn leaves_repo_template_empty_when_sibling_is_absent() {
+        let model = HfApiModel {
+            model_id: "owner/model".to_string(),
+            downloads: 0,
+            likes: 0,
+            last_modified: None,
+            pipeline_tag: None,
+            tags: vec![],
+            private: false,
+            disabled: false,
+            gated: None,
+            siblings: vec![
+                HfSibling {
+                    rfilename: "Qwen3-8B-Q4_K_M.gguf".to_string(),
+                    size: None,
+                    lfs: None,
+                },
+                HfSibling {
+                    rfilename: "tokenizer_config.json".to_string(),
+                    size: None,
+                    lfs: None,
+                },
+            ],
+        };
+
+        assert!(find_repo_chat_template_path(&model).is_none());
     }
 }

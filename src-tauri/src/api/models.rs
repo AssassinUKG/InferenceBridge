@@ -46,6 +46,8 @@ pub struct LoadModelRequest {
     pub use_jinja: Option<bool>,
     #[serde(default, alias = "reasoning", alias = "reasoning_mode")]
     pub reasoning_mode: Option<String>,
+    #[serde(default, alias = "reasoningPreserve", alias = "reasoning_preserve")]
+    pub reasoning_preserve: Option<bool>,
     #[serde(default, alias = "templateMode", alias = "template_mode")]
     pub template_mode: Option<String>,
     #[serde(default, alias = "templateName", alias = "template_name")]
@@ -98,6 +100,8 @@ pub struct LoadModelRequest {
     pub extra_args: Option<Vec<String>>,
     #[serde(default)]
     pub echo_load_config: bool,
+    #[serde(default, alias = "forceReload", alias = "force_reload")]
+    pub force_reload: bool,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -170,6 +174,7 @@ pub async fn load_model(
             ctxcp: req.ctxcp,
             use_jinja: req.use_jinja,
             reasoning_mode: req.reasoning_mode.clone(),
+            reasoning_preserve: req.reasoning_preserve,
             template_mode: req.template_mode.clone(),
             template_name: req.template_name.clone(),
             custom_template_path: req.custom_template_path.clone(),
@@ -181,6 +186,8 @@ pub async fn load_model(
             draft_min_tokens: req.draft_min_tokens,
             draft_p_min: req.draft_p_min,
             extra_args: req.extra_args.clone(),
+            attach_mmproj: None,
+            force_reload: req.force_reload,
         },
     )
     .await
@@ -233,6 +240,21 @@ mod tests {
         .expect("request should deserialize");
 
         assert_eq!(request.requested_context_size(), Some(32768));
+    }
+
+    #[test]
+    fn deserializes_force_reload_alias_for_model_load() {
+        let request: LoadModelRequest = serde_json::from_str(
+            r#"{
+                "model": "Qwen3.6-35B.gguf",
+                "context_size": 16384,
+                "force_reload": true
+            }"#,
+        )
+        .expect("load request should parse force_reload");
+
+        assert!(request.force_reload);
+        assert_eq!(request.requested_context_size(), Some(16384));
     }
 
     #[test]
@@ -453,7 +475,7 @@ pub struct ModelStatsResponse {
 // ── Handlers ────────────────────────────────────────────────────────────
 
 pub async fn list_models(State(state): State<SharedState>) -> Json<ModelsResponse> {
-    if let Some(response) = list_active_lm_studio_models(&state).await {
+    if let Some(response) = list_active_upstream_models(&state).await {
         return Json(response);
     }
 
@@ -496,20 +518,26 @@ struct UpstreamModelObject {
     context_window: Option<u32>,
 }
 
-async fn list_active_lm_studio_models(state: &SharedState) -> Option<ModelsResponse> {
-    let (enabled, active, base_url, api_key) = {
+async fn list_active_upstream_models(state: &SharedState) -> Option<ModelsResponse> {
+    let (active, lm_studio, sglang) = {
         let s = state.read().await;
         (
-            s.config.providers.lm_studio.enabled,
             s.config.providers.active.clone(),
-            s.config.providers.lm_studio.base_url.clone(),
-            s.config.providers.lm_studio.api_key.clone(),
+            s.config.providers.lm_studio.clone(),
+            s.config.providers.sglang.clone(),
         )
     };
 
-    if !enabled || active != "lm_studio" {
-        return None;
-    }
+    let (provider_name, provider_type, base_url, api_key) = match active.as_str() {
+        "lm_studio" if lm_studio.enabled => (
+            "LM Studio",
+            "lm_studio",
+            lm_studio.base_url,
+            lm_studio.api_key,
+        ),
+        "sglang" if sglang.enabled => ("SGLang", "sglang", sglang.base_url, sglang.api_key),
+        _ => return None,
+    };
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
@@ -535,7 +563,7 @@ async fn list_active_lm_studio_models(state: &SharedState) -> Option<ModelsRespo
             id: model.id,
             object: "model".to_string(),
             created: model.created.unwrap_or(now),
-            owned_by: model.owned_by.unwrap_or_else(|| "lm_studio".to_string()),
+            owned_by: model.owned_by.unwrap_or_else(|| provider_type.to_string()),
             active: true,
             max_context_length: model
                 .max_context_length
@@ -550,13 +578,13 @@ async fn list_active_lm_studio_models(state: &SharedState) -> Option<ModelsRespo
                 default_effort: None,
             },
             template_mode: None,
-            template_source: Some("lm_studio".to_string()),
+            template_source: Some(provider_type.to_string()),
             vision_runtime_ready: None,
             mmproj_status: None,
             hf_repo: None,
             hf_file: None,
-            provider_type: "lm_studio".to_string(),
-            provider_name: "LM Studio".to_string(),
+            provider_type: provider_type.to_string(),
+            provider_name: provider_name.to_string(),
             provider_base_url: Some(crate::providers::normalize_openai_base_url(&base_url)),
             provider_managed: false,
         })
@@ -604,13 +632,30 @@ async fn model_stats_inner(
     state: SharedState,
     requested_model: Option<String>,
 ) -> Result<Json<ModelStatsResponse>, StatusCode> {
+    let requested_model = requested_model
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+
+    if requested_model.is_none() {
+        let s = state.read().await;
+        let active_model = s.loaded_model.clone();
+        let matches_active_model = active_model.is_some();
+        let (state_value, progress, stats, _) =
+            effective_model_stats_state(&s, matches_active_model);
+        return Ok(Json(ModelStatsResponse {
+            requested_model: active_model.clone(),
+            active_model,
+            matches_active_model,
+            state: state_value,
+            progress,
+            stats,
+            model: None,
+        }));
+    }
+
     let snapshot = get_or_scan_models(&state).await;
     let active_model = snapshot.loaded_model.clone();
     let loaded_ctx = snapshot.loaded_context_size;
-    let requested_model = requested_model
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .or_else(|| active_model.clone());
 
     let model = requested_model
         .as_ref()
@@ -633,12 +678,7 @@ async fn model_stats_inner(
             .unwrap_or(false);
 
         if requested_model.is_none() || matches_active {
-            (
-                s.model_load_state.clone(),
-                s.model_load_progress.clone(),
-                s.model_stats.clone(),
-                matches_active,
-            )
+            effective_model_stats_state(&s, matches_active)
         } else {
             (ModelLoadState::Idle, None, None, false)
         }
@@ -663,6 +703,41 @@ async fn model_stats_inner(
 }
 
 // ── Snapshot / scanning ─────────────────────────────────────────────────
+
+fn effective_model_stats_state(
+    state: &crate::state::AppState,
+    matches_active_model: bool,
+) -> (
+    ModelLoadState,
+    Option<LoadProgress>,
+    Option<ModelStats>,
+    bool,
+) {
+    let running = matches!(
+        state.process.state(),
+        crate::engine::process::ProcessState::Running
+    );
+    let has_loaded_model = state.loaded_model.is_some() || state.model_stats.is_some();
+    if running && has_loaded_model && matches_active_model {
+        return (
+            ModelLoadState::Loaded,
+            state
+                .model_load_progress
+                .as_ref()
+                .filter(|progress| progress.done)
+                .cloned(),
+            state.model_stats.clone(),
+            matches_active_model,
+        );
+    }
+
+    (
+        state.model_load_state.clone(),
+        state.model_load_progress.clone(),
+        state.model_stats.clone(),
+        matches_active_model,
+    )
+}
 
 #[derive(Clone)]
 struct ModelRegistrySnapshot {

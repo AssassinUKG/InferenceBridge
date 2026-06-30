@@ -43,6 +43,81 @@ fn done_model_load_state(
     }
 }
 
+pub fn write_llama_crash_report(
+    phase: &str,
+    exit_status: Option<&str>,
+    preview: Option<&crate::engine::process::LaunchPreview>,
+    stderr: &[String],
+) -> Option<std::path::PathBuf> {
+    let mut report = String::new();
+    report.push_str("InferenceBridge llama-server crash report\n");
+    report.push_str(&format!("time: {}\n", chrono::Utc::now().to_rfc3339()));
+    report.push_str(&format!("phase: {phase}\n"));
+    report.push_str(&format!(
+        "exit_status: {}\n",
+        exit_status.unwrap_or("unknown")
+    ));
+    if let Some(preview) = preview {
+        report.push_str(&format!("runtime: {}\n", preview.runtime));
+        report.push_str(&format!("server_path: {}\n", preview.server_path));
+        report.push_str(&format!("model_path: {}\n", preview.model_path));
+        report.push_str(&format!("hf_repo: {:?}\n", preview.hf_repo));
+        report.push_str(&format!("hf_file: {:?}\n", preview.hf_file));
+        report.push_str(&format!("mmproj_path: {:?}\n", preview.mmproj_path));
+        report.push_str(&format!(
+            "backend_preference: {}\n",
+            preview.backend_preference
+        ));
+        report.push_str(&format!("context_size: {:?}\n", preview.context_size));
+        report.push_str(&format!("port: {}\n", preview.port));
+        report.push_str(&format!("parallel_slots: {}\n", preview.parallel_slots));
+        report.push_str(&format!("fit_mode: {:?}\n", preview.fit_mode));
+        report.push_str(&format!("cache_ram_mb: {:?}\n", preview.cache_ram_mb));
+        report.push_str(&format!("ctxcp: {:?}\n", preview.ctxcp));
+        report.push_str(&format!("use_jinja: {}\n", preview.use_jinja));
+        report.push_str(&format!("reasoning_mode: {:?}\n", preview.reasoning_mode));
+        report.push_str(&format!(
+            "reasoning_preserve: {}\n",
+            preview.reasoning_preserve
+        ));
+        report.push_str(&format!("template_mode: {}\n", preview.template_mode));
+        report.push_str(&format!("template_source: {:?}\n", preview.template_source));
+        report.push_str(&format!("template_path: {:?}\n", preview.template_path));
+        report.push_str(&format!("template_name: {:?}\n", preview.template_name));
+        report.push_str(&format!("draft_model_path: {}\n", preview.draft_model_path));
+        report.push_str(&format!("spec_type: {}\n", preview.spec_type));
+        report.push_str(&format!("spec_draft_n_max: {}\n", preview.spec_draft_n_max));
+        report.push_str("command:\n");
+        report.push_str(&preview.server_path);
+        for arg in &preview.args {
+            report.push(' ');
+            if arg.contains(' ') {
+                report.push('"');
+                report.push_str(arg);
+                report.push('"');
+            } else {
+                report.push_str(arg);
+            }
+        }
+        report.push('\n');
+    }
+    report.push_str("\nstderr_tail:\n");
+    let tail = stderr
+        .iter()
+        .rev()
+        .take(200)
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>();
+    if tail.is_empty() {
+        report.push_str("(empty)\n");
+    } else {
+        report.push_str(&tail.join("\n"));
+        report.push('\n');
+    }
+    crate::logging::write_llama_crash_report(&report)
+}
+
 fn load_transition_for_request(
     current_model: Option<&str>,
     requested_model: &str,
@@ -89,9 +164,123 @@ fn sanitize_hf_cache_segment(value: &str) -> String {
         .collect()
 }
 
+const HF_SIDECAR_MAX_BYTES: usize = 2 * 1024 * 1024;
+const HF_SIDECAR_DEFAULT_FILES: &[&str] = &[
+    "tokenizer_config.json",
+    "config.json",
+    "generation_config.json",
+    "special_tokens_map.json",
+];
+
+fn is_allowed_hf_sidecar_path(path: &str) -> bool {
+    let trimmed = path.trim().trim_start_matches('/');
+    if trimmed.is_empty()
+        || trimmed.contains('\\')
+        || trimmed
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
+        return false;
+    }
+    let filename = std::path::Path::new(trimmed)
+        .file_name()
+        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(
+        filename.as_str(),
+        "chat_template.jinja"
+            | "tokenizer_config.json"
+            | "config.json"
+            | "generation_config.json"
+            | "special_tokens_map.json"
+    )
+}
+
+fn hf_sidecar_cache_path(repo_id: &str, relative_path: &str) -> std::path::PathBuf {
+    crate::config::app_support_dir()
+        .join("hf-sidecars")
+        .join(sanitize_hf_cache_segment(repo_id))
+        .join(relative_path.trim().trim_start_matches('/'))
+}
+
+async fn fetch_hf_small_sidecar(
+    client: &reqwest::Client,
+    repo_id: &str,
+    relative_path: &str,
+    hf_api_key: Option<&str>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let relative_path = relative_path.trim().trim_start_matches('/');
+    if !is_allowed_hf_sidecar_path(relative_path) {
+        return Err(format!("Blocked non-sidecar HF path: {relative_path}"));
+    }
+
+    let cached_path = hf_sidecar_cache_path(repo_id, relative_path);
+    if cached_path.exists() {
+        return Ok(Some(cached_path));
+    }
+
+    let url = format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        repo_id.trim(),
+        relative_path
+    );
+    let mut request = client.get(&url);
+    if let Some(key) = hf_api_key.map(str::trim).filter(|value| !value.is_empty()) {
+        request = request.bearer_auth(key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("Failed to fetch {relative_path} from {repo_id}: {error}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED
+        || response.status() == reqwest::StatusCode::FORBIDDEN
+    {
+        return Err(format!(
+            "{relative_path} requires a Hugging Face token for {repo_id}: HTTP {}",
+            response.status()
+        ));
+    }
+    if !response.status().is_success() {
+        return Err(format!(
+            "Failed to fetch {relative_path} from {repo_id}: HTTP {}",
+            response.status()
+        ));
+    }
+    if let Some(length) = response.content_length() {
+        if length > HF_SIDECAR_MAX_BYTES as u64 {
+            return Err(format!(
+                "Blocked {relative_path} from {repo_id}: {length} bytes exceeds sidecar limit"
+            ));
+        }
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("Failed to read {relative_path} from {repo_id}: {error}"))?;
+    if bytes.len() > HF_SIDECAR_MAX_BYTES {
+        return Err(format!(
+            "Blocked {relative_path} from {repo_id}: {} bytes exceeds sidecar limit",
+            bytes.len()
+        ));
+    }
+    if let Some(parent) = cached_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
+    }
+    tokio::fs::write(&cached_path, bytes)
+        .await
+        .map_err(|error| format!("Failed to write {}: {error}", cached_path.display()))?;
+    Ok(Some(cached_path))
+}
+
 async fn ensure_cached_hf_template(
     repo_id: &str,
     template_path: &str,
+    hf_api_key: Option<&str>,
 ) -> Result<std::path::PathBuf, String> {
     let template_relative = template_path.trim().trim_start_matches('/');
     let repo_dir = crate::config::app_support_dir()
@@ -118,12 +307,23 @@ async fn ensure_cached_hf_template(
         .user_agent("InferenceBridge/1.0")
         .build()
         .map_err(|error| format!("Failed to create Hugging Face client: {error}"))?;
-    let response = client
-        .get(&url)
+    let mut request = client.get(&url);
+    if let Some(key) = hf_api_key.map(str::trim).filter(|value| !value.is_empty()) {
+        request = request.bearer_auth(key);
+    }
+    let response = request
         .send()
         .await
         .map_err(|error| format!("Failed to fetch repo chat template from {url}: {error}"))?;
     if !response.status().is_success() {
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            || response.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(format!(
+                "Failed to fetch repo chat template from {url}: HTTP {}. Add a Hugging Face access token in Settings > Hugging Face if this repo is gated or private.",
+                response.status()
+            ));
+        }
         return Err(format!(
             "Failed to fetch repo chat template from {url}: HTTP {}",
             response.status()
@@ -144,6 +344,7 @@ async fn resolve_template_selection(
     process: &ProcessConfig,
     model_filename: &str,
     hf_metadata: Option<&HfModelMetadata>,
+    hf_api_key: Option<&str>,
 ) -> Result<
     (
         String,
@@ -191,15 +392,27 @@ async fn resolve_template_selection(
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
             {
-                if metadata.has_repo_template || metadata.template_path.is_some() {
-                    let cached = ensure_cached_hf_template(repo_id, repo_template_path).await?;
-                    return Ok((
-                        "repo".to_string(),
-                        Some(format!("hf:{repo_id}/{repo_template_path}")),
-                        Some(cached),
-                        None,
-                        true,
-                    ));
+                if metadata.has_repo_template {
+                    match ensure_cached_hf_template(repo_id, repo_template_path, hf_api_key).await {
+                        Ok(cached) => {
+                            return Ok((
+                                "repo".to_string(),
+                                Some(format!("hf:{repo_id}/{repo_template_path}")),
+                                Some(cached),
+                                None,
+                                true,
+                            ));
+                        }
+                        Err(error) if error.contains("HTTP 404") => {
+                            tracing::warn!(
+                                model = %model_filename,
+                                repo = %repo_id,
+                                template = %repo_template_path,
+                                "Repo chat template was not found; falling back to embedded or built-in template"
+                            );
+                        }
+                        Err(error) => return Err(error),
+                    }
                 }
             }
         }
@@ -250,6 +463,7 @@ fn preview_matches_effective_launch(
     ctxcp: Option<u32>,
     use_jinja: bool,
     reasoning_mode: Option<&str>,
+    reasoning_preserve: bool,
     draft_model_path: &str,
     spec_type: &str,
     spec_draft_n_max: u32,
@@ -317,6 +531,7 @@ fn preview_matches_effective_launch(
         && preview.ctxcp == ctxcp
         && preview.use_jinja == use_jinja
         && preview.reasoning_mode.as_deref() == reasoning_mode
+        && preview.reasoning_preserve == reasoning_preserve
         && preview.draft_model_path == draft_model_path
         && preview.spec_type == spec_type
         && preview.spec_draft_n_max == spec_draft_n_max
@@ -511,6 +726,30 @@ async fn publish_model_load_progress(
     emit_load_progress_payload(&app_handle, &payload);
 }
 
+async fn mark_model_reused_loaded(
+    state: &SharedState,
+    model_filename: &str,
+    launch_preview: LaunchPreview,
+) {
+    let payload = crate::state::LoadProgress {
+        stage: "loaded".to_string(),
+        message: format!("{model_filename} already loaded; reusing running llama-server."),
+        progress: 1.0,
+        done: true,
+        error: None,
+    };
+    let app_handle = {
+        let mut s = state.write().await;
+        s.loaded_model = Some(model_filename.to_string());
+        s.last_launch_preview = Some(launch_preview);
+        s.model_load_state = crate::state::ModelLoadState::Loaded;
+        s.model_load_progress = Some(payload.clone());
+        s.app_handle.clone()
+    };
+
+    emit_load_progress_payload(&app_handle, &payload);
+}
+
 fn model_load_state_label(state: &crate::state::ModelLoadState) -> String {
     match state {
         crate::state::ModelLoadState::Idle => "Idle".to_string(),
@@ -607,6 +846,7 @@ pub struct RuntimeLoadOverrides {
     pub ctxcp: Option<u32>,
     pub use_jinja: Option<bool>,
     pub reasoning_mode: Option<String>,
+    pub reasoning_preserve: Option<bool>,
     pub template_mode: Option<String>,
     pub template_name: Option<String>,
     pub custom_template_path: Option<String>,
@@ -618,6 +858,8 @@ pub struct RuntimeLoadOverrides {
     pub draft_min_tokens: Option<u32>,
     pub draft_p_min: Option<f32>,
     pub extra_args: Option<Vec<String>>,
+    pub attach_mmproj: Option<bool>,
+    pub force_reload: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -640,6 +882,8 @@ pub struct RuntimeLoadRequest {
     #[serde(default)]
     pub reasoning_mode: Option<String>,
     #[serde(default)]
+    pub reasoning_preserve: Option<bool>,
+    #[serde(default)]
     pub template_mode: Option<String>,
     #[serde(default)]
     pub template_name: Option<String>,
@@ -661,6 +905,10 @@ pub struct RuntimeLoadRequest {
     pub draft_p_min: Option<f32>,
     #[serde(default)]
     pub extra_args: Option<Vec<String>>,
+    #[serde(default)]
+    pub attach_mmproj: Option<bool>,
+    #[serde(default)]
+    pub force_reload: bool,
 }
 
 impl RuntimeLoadRequest {
@@ -677,6 +925,7 @@ impl RuntimeLoadRequest {
             ctxcp: self.ctxcp,
             use_jinja: self.use_jinja,
             reasoning_mode: self.reasoning_mode,
+            reasoning_preserve: self.reasoning_preserve,
             template_mode: self.template_mode,
             template_name: self.template_name,
             custom_template_path: self.custom_template_path,
@@ -688,6 +937,8 @@ impl RuntimeLoadRequest {
             draft_min_tokens: self.draft_min_tokens,
             draft_p_min: self.draft_p_min,
             extra_args: self.extra_args,
+            attach_mmproj: self.attach_mmproj,
+            force_reload: self.force_reload,
         }
     }
 }
@@ -749,7 +1000,14 @@ pub async fn backend_load_model_with_overrides(
     .await;
 
     // Phase 1: Resolve model info (brief lock) + claim loading generation
-    let (config, model_filename, my_generation, launch_preview, reused_existing) = {
+    let (
+        config,
+        model_filename,
+        my_generation,
+        launch_preview,
+        reused_existing,
+        forced_jinja_for_tool_profile,
+    ) = {
         let model = {
             let s = state.read().await;
             s.model_registry.find_by_name(&model_name).cloned()
@@ -787,6 +1045,7 @@ pub async fn backend_load_model_with_overrides(
 
         let mut s = state.write().await;
         let hf_metadata = model.hf_metadata.clone();
+        let hf_api_key = s.config.hub.hf_api_key.clone();
         let ctx = resolve_launch_context_size(context_size.or(s.config.server.default_ctx_size));
         let mut process_config = s.config.process.clone();
         if let Some(fit_mode) = overrides.fit_mode.as_ref() {
@@ -809,6 +1068,9 @@ pub async fn backend_load_model_with_overrides(
         }
         if let Some(reasoning_mode) = overrides.reasoning_mode.as_ref() {
             process_config.reasoning_mode = reasoning_mode.clone();
+        }
+        if let Some(reasoning_preserve) = overrides.reasoning_preserve {
+            process_config.reasoning_preserve = reasoning_preserve;
         }
         if let Some(template_mode) = overrides.template_mode.as_ref() {
             process_config.template_mode = template_mode.clone();
@@ -852,12 +1114,10 @@ pub async fn backend_load_model_with_overrides(
             &model.filename,
             architecture,
         );
+        let mut forced_jinja_for_tool_profile = false;
         if profile_needs_jinja(&effective_profile) && !process_config.use_jinja {
-            tracing::warn!(
-                model = %model.filename,
-                "Model tool-call profile requires llama.cpp Jinja chat-template mode; enabling --jinja for this launch"
-            );
             process_config.use_jinja = true;
+            forced_jinja_for_tool_profile = true;
         }
 
         // Prefer the model's own embedded chat template when it ships one, unless
@@ -890,21 +1150,38 @@ pub async fn backend_load_model_with_overrides(
         }
 
         let (template_mode, template_source, template_file, template_name, use_jinja) =
-            resolve_template_selection(&process_config, &model.filename, hf_metadata.as_ref())
-                .await?;
+            match resolve_template_selection(
+                &process_config,
+                &model.filename,
+                hf_metadata.as_ref(),
+                hf_api_key.as_deref(),
+            )
+            .await
+            {
+                Ok(selection) => selection,
+                Err(error) => {
+                    let payload = crate::state::LoadProgress {
+                        stage: "error".to_string(),
+                        message: error.clone(),
+                        progress: 0.0,
+                        done: true,
+                        error: Some(error.clone()),
+                    };
+                    s.model_load_state = crate::state::ModelLoadState::Error(error.clone());
+                    s.model_load_progress = Some(payload.clone());
+                    emit_load_progress_payload(&app_handle, &payload);
+                    return Err(error);
+                }
+            };
 
         let config = LaunchConfig {
             model_path: model.path.clone(),
-            hf_repo: overrides.hf_repo.clone().or_else(|| {
-                hf_metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.repo_id.clone())
-            }),
-            hf_file: overrides.hf_file.clone().or_else(|| {
-                hf_metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.file.clone())
-            }),
+            // Scanned local models must launch from the local GGUF path.
+            // HF metadata is still used for templates/model cards, but passing
+            // it through here makes llama-server resolve the whole repo again
+            // and can accidentally hit sidecar files such as mmproj GGUFs.
+            hf_repo: overrides.hf_repo.clone(),
+            hf_file: overrides.hf_file.clone(),
             context_size: ctx,
             gpu_layers: s.config.process.gpu_layers,
             threads: s.config.process.threads,
@@ -928,6 +1205,7 @@ pub async fn backend_load_model_with_overrides(
             use_jinja,
             reasoning_mode: Some(process_config.reasoning_mode.clone())
                 .filter(|value| !value.trim().is_empty()),
+            reasoning_preserve: process_config.reasoning_preserve,
             template_mode: template_mode.clone(),
             template_source: template_source.clone(),
             template_file: template_file.clone(),
@@ -953,6 +1231,7 @@ pub async fn backend_load_model_with_overrides(
             diffusion_kv_cache: process_config.diffusion_kv_cache.clone(),
             diffusion_visual: process_config.diffusion_visual,
             diffusion_extra_args: process_config.diffusion_extra_args.clone(),
+            attach_mmproj: overrides.attach_mmproj.unwrap_or(true),
         };
 
         LlamaProcess::validate_launch_config(&config).map_err(|e| {
@@ -997,65 +1276,75 @@ pub async fn backend_load_model_with_overrides(
             return Err(msg);
         }
 
-        let reuse_existing = if let (Some(loaded), Some(last_preview)) =
-            (s.loaded_model.clone(), s.last_launch_preview.as_ref())
-        {
-            let model_matches = names_match(&loaded, &model.filename);
-            let loaded_context = s.model_stats.as_ref().map(|stats| stats.context_size);
-            let exact_launch_matches = preview_matches_effective_launch(
-                last_preview,
-                &model.filename,
-                ctx,
-                &template_mode,
-                template_source.as_deref(),
-                template_name.as_deref(),
-                template_file.as_deref(),
-                config.chat_template_kwargs_json.as_deref(),
-                config.fit_mode.as_deref(),
-                config.cache_ram_mb,
-                config.ctxcp,
-                config.use_jinja,
-                config.reasoning_mode.as_deref(),
-                &config.draft_model_path,
-                &config.spec_type,
-                config.spec_draft_n_max,
-                config.draft_max_tokens,
-                config.draft_min_tokens,
-                config.draft_p_min,
-                config.diffusion_n_predict,
-                &config.diffusion_kv_cache,
-                config.diffusion_visual,
-                &config.diffusion_extra_args,
-                &config.extra_args,
-            );
-            let lower_or_equal_context_request =
-                ctx.is_some() && loaded_context_satisfies_request(ctx, loaded_context);
+        let reuse_existing = if !overrides.force_reload {
+            if let (Some(loaded), Some(last_preview)) =
+                (s.loaded_model.clone(), s.last_launch_preview.as_ref())
+            {
+                let model_matches = names_match(&loaded, &model.filename);
+                let loaded_context = s.model_stats.as_ref().map(|stats| stats.context_size);
+                let exact_launch_matches = preview_matches_effective_launch(
+                    last_preview,
+                    &model.filename,
+                    ctx,
+                    &template_mode,
+                    template_source.as_deref(),
+                    template_name.as_deref(),
+                    template_file.as_deref(),
+                    config.chat_template_kwargs_json.as_deref(),
+                    config.fit_mode.as_deref(),
+                    config.cache_ram_mb,
+                    config.ctxcp,
+                    config.use_jinja,
+                    config.reasoning_mode.as_deref(),
+                    config.reasoning_preserve,
+                    &config.draft_model_path,
+                    &config.spec_type,
+                    config.spec_draft_n_max,
+                    config.draft_max_tokens,
+                    config.draft_min_tokens,
+                    config.draft_p_min,
+                    config.diffusion_n_predict,
+                    &config.diffusion_kv_cache,
+                    config.diffusion_visual,
+                    &config.diffusion_extra_args,
+                    &config.extra_args,
+                );
+                let lower_or_equal_context_request =
+                    ctx.is_some() && loaded_context_satisfies_request(ctx, loaded_context);
 
-            if model_matches && exact_launch_matches {
-                tracing::info!(
-                    model = %model.filename,
-                    context_size = ?ctx,
-                    template_mode = %template_mode,
-                    "Model already loaded with matching effective launch config"
-                );
-                Some((loaded, last_preview.clone()))
-            } else if model_matches && lower_or_equal_context_request {
-                tracing::info!(
-                    model = %model.filename,
-                    requested_context_size = ?ctx,
-                    loaded_context_size = ?loaded_context,
-                    "Model already loaded with equal or larger context; skipping lower-context reload"
-                );
-                Some((loaded, last_preview.clone()))
+                if model_matches && exact_launch_matches {
+                    tracing::info!(
+                        model = %model.filename,
+                        context_size = ?ctx,
+                        template_mode = %template_mode,
+                        "Model already loaded with matching effective launch config"
+                    );
+                    Some((loaded, last_preview.clone()))
+                } else if model_matches && lower_or_equal_context_request {
+                    tracing::info!(
+                        model = %model.filename,
+                        requested_context_size = ?ctx,
+                        loaded_context_size = ?loaded_context,
+                        "Model already loaded with equal or larger context; skipping lower-context reload"
+                    );
+                    Some((loaded, last_preview.clone()))
+                } else {
+                    None
+                }
             } else {
                 None
             }
         } else {
+            tracing::info!(
+                model = %model.filename,
+                context_size = ?ctx,
+                "Force reload requested; skipping existing model reuse"
+            );
             None
         };
 
         if let Some((loaded, preview)) = reuse_existing {
-            (config, loaded, s.loading_generation, preview, true)
+            (config, loaded, s.loading_generation, preview, true, false)
         } else {
             // If ctx is None (no one specified), use 0 as placeholder; it will be
             // updated from /slots or /props after health check succeeds.
@@ -1078,13 +1367,27 @@ pub async fn backend_load_model_with_overrides(
                 "Phase 1: Resolved model (API/backend)"
             );
 
-            (config, model.filename.clone(), gen, preview, false)
+            (
+                config,
+                model.filename.clone(),
+                gen,
+                preview,
+                false,
+                forced_jinja_for_tool_profile,
+            )
         }
     }; // write lock released
 
     if reused_existing {
-        store_launch_preview(&state, launch_preview.clone()).await;
+        mark_model_reused_loaded(&state, &model_filename, launch_preview.clone()).await;
         return Ok(model_filename);
+    }
+
+    if forced_jinja_for_tool_profile {
+        tracing::info!(
+            model = %model_filename,
+            "Model tool-call profile requires llama.cpp Jinja chat-template mode; enabling --jinja for this launch"
+        );
     }
 
     store_launch_preview(&state, launch_preview.clone()).await;
@@ -1195,7 +1498,7 @@ pub async fn backend_load_model_with_overrides(
         // Check if process crashed — every ~13 iterations (~2 seconds).
         let process_exited = if attempt % 13 == 0 {
             let mut s = state.write().await;
-            s.process.poll_exited()
+            s.process.poll_exited() || !s.process.has_child()
         } else {
             false
         };
@@ -1204,16 +1507,29 @@ pub async fn backend_load_model_with_overrides(
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let mut s = state.write().await;
             let stderr = s.process.last_stderr().await;
+            let exit_status = s.process.last_exit_status();
+            let preview = s.last_launch_preview.clone();
+            let report_path = write_llama_crash_report(
+                "model-load-startup",
+                exit_status.as_deref(),
+                preview.as_ref(),
+                &stderr,
+            );
             let last_lines: String = stderr
                 .iter()
                 .rev()
-                .take(10)
+                .take(80)
                 .rev()
                 .cloned()
                 .collect::<Vec<_>>()
                 .join("\n");
             let msg = format!(
-                "llama-server crashed on startup.\n{}",
+                "llama-server crashed on startup. Exit: {}. Crash report: {}\n{}",
+                exit_status.as_deref().unwrap_or("unknown"),
+                report_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "not written".to_string()),
                 if last_lines.is_empty() {
                     "No stderr output captured.".to_string()
                 } else {
@@ -1380,6 +1696,300 @@ pub async fn backend_load_model_with_overrides(
     .await;
     tracing::info!("{result}");
     Ok(result)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HfSidecarSyncFile {
+    pub repo_id: String,
+    pub path: String,
+    pub cached_path: Option<String>,
+    pub status: String,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HfSidecarSyncSummary {
+    pub models_checked: usize,
+    pub repos_checked: usize,
+    pub files_cached: usize,
+    pub files_skipped: usize,
+    pub files_failed: usize,
+    pub hf_token_configured: bool,
+    pub cache_root: String,
+    pub results: Vec<HfSidecarSyncFile>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct HfSidecarCacheStatus {
+    pub filename: String,
+    pub repo_id: Option<String>,
+    pub template_path: Option<String>,
+    pub template_cached: bool,
+    pub template_cache_path: Option<String>,
+    pub sidecar_cached_count: usize,
+    pub sidecar_expected_count: usize,
+    pub sidecar_cache_dir: Option<String>,
+}
+
+fn hf_template_cache_path(repo_id: &str, template_path: &str) -> std::path::PathBuf {
+    crate::config::app_support_dir()
+        .join("hf-templates")
+        .join(sanitize_hf_cache_segment(repo_id))
+        .join(template_path.trim().trim_start_matches('/'))
+}
+
+#[tauri::command]
+pub async fn get_hf_sidecar_cache_status(
+    state: tauri::State<'_, SharedState>,
+) -> Result<Vec<HfSidecarCacheStatus>, String> {
+    let models = {
+        let s = state.read().await;
+        s.model_registry
+            .list()
+            .iter()
+            .map(|model| (model.filename.clone(), model.hf_metadata.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    let mut statuses = Vec::with_capacity(models.len());
+    for (filename, metadata) in models {
+        let Some(metadata) = metadata else {
+            statuses.push(HfSidecarCacheStatus {
+                filename,
+                repo_id: None,
+                template_path: None,
+                template_cached: false,
+                template_cache_path: None,
+                sidecar_cached_count: 0,
+                sidecar_expected_count: HF_SIDECAR_DEFAULT_FILES.len(),
+                sidecar_cache_dir: None,
+            });
+            continue;
+        };
+        let repo_id = metadata
+            .repo_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let Some(repo_id_value) = repo_id.as_deref() else {
+            statuses.push(HfSidecarCacheStatus {
+                filename,
+                repo_id: None,
+                template_path: None,
+                template_cached: false,
+                template_cache_path: None,
+                sidecar_cached_count: 0,
+                sidecar_expected_count: HF_SIDECAR_DEFAULT_FILES.len(),
+                sidecar_cache_dir: None,
+            });
+            continue;
+        };
+
+        let template_path = metadata.has_repo_template.then(|| {
+            metadata
+                .template_path
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("chat_template.jinja")
+                .to_string()
+        });
+        let template_cache = template_path
+            .as_deref()
+            .map(|path| hf_template_cache_path(repo_id_value, path));
+        let sidecar_dir = crate::config::app_support_dir()
+            .join("hf-sidecars")
+            .join(sanitize_hf_cache_segment(repo_id_value));
+        let sidecar_cached_count = HF_SIDECAR_DEFAULT_FILES
+            .iter()
+            .filter(|path| hf_sidecar_cache_path(repo_id_value, path).exists())
+            .count();
+
+        statuses.push(HfSidecarCacheStatus {
+            filename,
+            repo_id,
+            template_path,
+            template_cached: template_cache.as_ref().is_some_and(|path| path.exists()),
+            template_cache_path: template_cache.map(|path| path.display().to_string()),
+            sidecar_cached_count,
+            sidecar_expected_count: HF_SIDECAR_DEFAULT_FILES.len(),
+            sidecar_cache_dir: Some(sidecar_dir.display().to_string()),
+        });
+    }
+
+    Ok(statuses)
+}
+
+#[tauri::command]
+pub async fn sync_hf_sidecar_cache(
+    state: tauri::State<'_, SharedState>,
+    model_names: Option<Vec<String>>,
+) -> Result<HfSidecarSyncSummary, String> {
+    let (models, hf_api_key) = {
+        let s = state.read().await;
+        let requested = model_names.unwrap_or_default();
+        let requested_lower = requested
+            .iter()
+            .map(|value| value.to_ascii_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        let models = s
+            .model_registry
+            .list()
+            .iter()
+            .filter(|model| {
+                requested_lower.is_empty()
+                    || requested_lower.contains(&model.filename.to_ascii_lowercase())
+            })
+            .map(|model| (model.filename.clone(), model.hf_metadata.clone()))
+            .collect::<Vec<_>>();
+        (models, s.config.hub.hf_api_key.clone())
+    };
+    let hf_token_configured = hf_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("InferenceBridge/1.0")
+        .build()
+        .map_err(|error| format!("Failed to create Hugging Face client: {error}"))?;
+
+    let mut results = Vec::new();
+    let mut seen_repos = std::collections::HashSet::new();
+    for (_filename, metadata) in models.iter() {
+        let Some(metadata) = metadata else {
+            continue;
+        };
+        let Some(repo_id) = metadata
+            .repo_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        if !seen_repos.insert(repo_id.to_string()) {
+            continue;
+        }
+
+        let mut paths = Vec::new();
+        if metadata.has_repo_template {
+            paths.push(
+                metadata
+                    .template_path
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("chat_template.jinja")
+                    .to_string(),
+            );
+        }
+        paths.extend(
+            HF_SIDECAR_DEFAULT_FILES
+                .iter()
+                .map(|value| value.to_string()),
+        );
+        paths.sort();
+        paths.dedup();
+
+        for path in paths {
+            if !is_allowed_hf_sidecar_path(&path) {
+                results.push(HfSidecarSyncFile {
+                    repo_id: repo_id.to_string(),
+                    path,
+                    cached_path: None,
+                    status: "blocked".to_string(),
+                    message: Some(
+                        "Blocked because the path is not an allowed small sidecar file."
+                            .to_string(),
+                    ),
+                });
+                continue;
+            }
+
+            if path.ends_with("chat_template.jinja") {
+                match ensure_cached_hf_template(repo_id, &path, hf_api_key.as_deref()).await {
+                    Ok(cached) => {
+                        results.push(HfSidecarSyncFile {
+                            repo_id: repo_id.to_string(),
+                            path,
+                            cached_path: Some(cached.display().to_string()),
+                            status: "cached".to_string(),
+                            message: None,
+                        });
+                        continue;
+                    }
+                    Err(error) if error.contains("HTTP 404") => {
+                        results.push(HfSidecarSyncFile {
+                            repo_id: repo_id.to_string(),
+                            path,
+                            cached_path: None,
+                            status: "missing".to_string(),
+                            message: Some(error),
+                        });
+                        continue;
+                    }
+                    Err(error) => {
+                        results.push(HfSidecarSyncFile {
+                            repo_id: repo_id.to_string(),
+                            path,
+                            cached_path: None,
+                            status: "failed".to_string(),
+                            message: Some(error),
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            match fetch_hf_small_sidecar(&client, repo_id, &path, hf_api_key.as_deref()).await {
+                Ok(Some(cached)) => results.push(HfSidecarSyncFile {
+                    repo_id: repo_id.to_string(),
+                    path,
+                    cached_path: Some(cached.display().to_string()),
+                    status: "cached".to_string(),
+                    message: None,
+                }),
+                Ok(None) => results.push(HfSidecarSyncFile {
+                    repo_id: repo_id.to_string(),
+                    path,
+                    cached_path: None,
+                    status: "missing".to_string(),
+                    message: None,
+                }),
+                Err(error) => results.push(HfSidecarSyncFile {
+                    repo_id: repo_id.to_string(),
+                    path,
+                    cached_path: None,
+                    status: "failed".to_string(),
+                    message: Some(error),
+                }),
+            }
+        }
+    }
+
+    let files_cached = results
+        .iter()
+        .filter(|result| result.status == "cached")
+        .count();
+    let files_skipped = results
+        .iter()
+        .filter(|result| matches!(result.status.as_str(), "missing" | "blocked"))
+        .count();
+    let files_failed = results
+        .iter()
+        .filter(|result| result.status == "failed")
+        .count();
+    Ok(HfSidecarSyncSummary {
+        models_checked: models.len(),
+        repos_checked: seen_repos.len(),
+        files_cached,
+        files_skipped,
+        files_failed,
+        hf_token_configured,
+        cache_root: crate::config::app_support_dir().display().to_string(),
+        results,
+    })
 }
 
 pub async fn backend_load_model(
@@ -1596,7 +2206,7 @@ async fn list_active_external_provider_models(state: SharedState) -> Option<Vec<
                     template_source: Some(provider.name.clone()),
                     vision_runtime_ready: false,
                     vision_status: "Provider managed".to_string(),
-                    provider_type: "lm_studio".to_string(),
+                    provider_type: provider.provider_type.clone(),
                     provider_name: provider.name.clone(),
                     provider_base_url: Some(provider.base_url.clone()),
                     provider_managed: false,
@@ -1684,7 +2294,10 @@ pub async fn backend_unload_model(state: SharedState) -> Result<String, String> 
     )
     .await;
 
-    {
+    // Take the live process resources while holding the write lock, then release the lock
+    // before doing the slow async shutdown (HTTP + kill + port wait = up to ~5s).
+    // This prevents the write lock from blocking frontend reads during teardown (IB-020).
+    let pending = {
         let mut s = state.write().await;
         for cancel in s.generation_cancels.values() {
             cancel.cancel();
@@ -1692,11 +2305,17 @@ pub async fn backend_unload_model(state: SharedState) -> Result<String, String> 
         s.generation_cancels.clear();
         s.generation_cancel.cancel();
         s.active_generation = None;
-        s.process.shutdown().await.map_err(|error| {
-            let message = format!("Failed to shut down llama-server: {error}");
-            clear_runtime_after_backend_exit(&mut s, Some(message.clone()));
-            message
-        })?;
+        s.process.begin_shutdown()
+        // lock released here
+    };
+
+    if let Some(shutdown) = pending {
+        shutdown.complete().await;
+    }
+
+    {
+        let mut s = state.write().await;
+        s.process.mark_idle_if_no_child();
         clear_runtime_after_backend_exit(&mut s, None);
         s.model_load_progress = None;
     }
@@ -1718,6 +2337,53 @@ pub async fn backend_unload_model(state: SharedState) -> Result<String, String> 
     )
     .await;
     Ok(result)
+}
+
+pub async fn stop_model_for_binary_update(state: SharedState) -> Result<Option<String>, String> {
+    let loaded_model = {
+        let s = state.read().await;
+        s.loaded_model.clone()
+    };
+
+    let pending = {
+        let mut s = state.write().await;
+        if s.active_generation.is_some() {
+            let count = s.generation_cancels.len().max(1);
+            for cancel in s.generation_cancels.values() {
+                cancel.cancel();
+            }
+            s.generation_cancel.cancel();
+            s.cumulative_metrics.total_cancellations += count as u64;
+            tracing::info!(
+                count,
+                "Cancelled active inference before llama-server update"
+            );
+        }
+        for cancel in s.generation_cancels.values() {
+            cancel.cancel();
+        }
+        s.generation_cancels.clear();
+        s.generation_cancel.cancel();
+        s.active_generation = None;
+        s.process.begin_shutdown()
+        // lock released here
+    };
+
+    if let Some(shutdown) = pending {
+        shutdown.complete().await;
+    }
+
+    {
+        let mut s = state.write().await;
+        s.process.mark_idle_if_no_child();
+        clear_runtime_after_backend_exit(&mut s, None);
+    }
+
+    if let Some(model) = &loaded_model {
+        tracing::info!(model = %model, "Stopped loaded model before llama-server binary update");
+    }
+
+    Ok(loaded_model)
 }
 
 #[tauri::command]
@@ -2536,9 +3202,32 @@ pub async fn check_llama_server(
 }
 
 #[tauri::command]
-pub async fn update_llama_server(app: tauri::AppHandle) -> Result<String, String> {
+pub async fn update_llama_server(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedState>,
+) -> Result<String, String> {
     match download::check_for_update().await {
         Ok(Some((tag, url, size))) => {
+            let load_mutex = {
+                let s = state.read().await;
+                s.model_load_mutex.clone()
+            };
+            let _load_guard = load_mutex.lock().await;
+
+            let stopped_model = stop_model_for_binary_update(state.inner().clone()).await?;
+            if let Some(model) = stopped_model {
+                emit_load_progress_payload(
+                    &Some(app.clone()),
+                    &crate::state::LoadProgress {
+                        stage: "downloading".to_string(),
+                        message: format!("Stopped {model} before updating llama-server"),
+                        progress: 0.02,
+                        done: false,
+                        error: None,
+                    },
+                );
+            }
+
             match download::download_llama_server(&app, &url, &tag, size).await {
                 Ok(path) => {
                     emit_load_progress_payload(

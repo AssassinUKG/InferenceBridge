@@ -256,7 +256,7 @@ export function ContextPanel({ status, processStatus, gpuStats }: Props) {
   }
 
   return (
-    <div className="mx-auto flex h-full max-w-none flex-col gap-3 overflow-y-auto p-3 xl:max-w-7xl">
+    <div className="mx-auto flex h-full max-w-none flex-col gap-2 overflow-y-auto p-3 xl:max-w-7xl">
       <section
         className="rounded px-3 py-3"
         style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
@@ -444,17 +444,6 @@ export function ContextPanel({ status, processStatus, gpuStats }: Props) {
 
       <section className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
         <StatCard
-          label="Active Source"
-          value={activeGeneration?.source ?? "idle"}
-          detail={activeGeneration?.status ?? "no active request"}
-          tone={activeGeneration ? "good" : "neutral"}
-        />
-        <StatCard
-          label="Last Request"
-          value={last?.source ?? "n/a"}
-          detail={`finished ${formatTime(last?.finished_at)}`}
-        />
-        <StatCard
           label="Model Load"
           value={processStatus?.model_load_state ?? "n/a"}
           detail={`startup ${formatDuration(processStatus?.startup_duration_ms)}`}
@@ -463,6 +452,11 @@ export function ContextPanel({ status, processStatus, gpuStats }: Props) {
           label="Launch Context"
           value={formatNumber(processStatus?.last_launch_preview?.context_size)}
           detail={`${processStatus?.last_launch_preview?.parallel_slots ?? "n/a"} parallel slots`}
+        />
+        <StatCard
+          label="Last Request"
+          value={last?.source ?? "n/a"}
+          detail={`finished ${formatTime(last?.finished_at)}`}
         />
       </section>
 

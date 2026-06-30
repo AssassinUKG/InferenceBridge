@@ -51,6 +51,7 @@ export interface LaunchPreview {
   ctxcp: number | null;
   use_jinja: boolean;
   reasoning_mode: string | null;
+  reasoning_preserve: boolean;
   template_mode: string;
   template_source: string | null;
   template_path: string | null;
@@ -139,6 +140,8 @@ export interface ProcessStatusInfo {
   live_streams: LiveStreamSnapshot[];
 }
 
+export type ApiServerAction = "starting" | "stopping" | null;
+
 export interface ApiPortOwnerInfo {
   pid: number;
   name: string | null;
@@ -215,6 +218,7 @@ export interface AppSettings {
   ctxcp: number | null;
   use_jinja: boolean;
   reasoning_mode: string;
+  reasoning_preserve: boolean;
   template_mode: string;
   template_name: string | null;
   custom_template_path: string | null;
@@ -236,6 +240,10 @@ export interface AppSettings {
   lm_studio_enabled: boolean;
   lm_studio_base_url: string;
   lm_studio_api_key: string | null;
+  sglang_enabled: boolean;
+  sglang_base_url: string;
+  sglang_api_key: string | null;
+  hf_api_key: string | null;
 }
 
 export interface ApiAccessInfo {
@@ -253,6 +261,14 @@ export interface GpuStats {
   system_ram_mb: number;
 }
 
+export interface LlamaFlagSupport {
+  checked: boolean;
+  binary_path: string | null;
+  supported_flags: string[];
+  missing_critical_flags: string[];
+  error: string | null;
+}
+
 export interface LlamaServerInfo {
   version: string | null;
   binary_path: string | null;
@@ -260,6 +276,57 @@ export interface LlamaServerInfo {
   managed_dir: string;
   latest_version: string | null;
   update_available: boolean;
+  flag_support: LlamaFlagSupport;
+}
+
+export interface RuntimePackInfo {
+  id: string;
+  name: string;
+  description: string;
+  backend: string;
+  installed_version: string | null;
+  latest_version: string | null;
+  update_available: boolean;
+  size_bytes: number | null;
+  available: boolean;
+  error: string | null;
+}
+
+export interface HubAccessStatus {
+  configured: boolean;
+  reachable: boolean;
+  user: string | null;
+  error: string | null;
+}
+
+export interface HfSidecarSyncFile {
+  repo_id: string;
+  path: string;
+  cached_path: string | null;
+  status: string;
+  message: string | null;
+}
+
+export interface HfSidecarSyncSummary {
+  models_checked: number;
+  repos_checked: number;
+  files_cached: number;
+  files_skipped: number;
+  files_failed: number;
+  hf_token_configured: boolean;
+  cache_root: string;
+  results: HfSidecarSyncFile[];
+}
+
+export interface HfSidecarCacheStatus {
+  filename: string;
+  repo_id: string | null;
+  template_path: string | null;
+  template_cached: boolean;
+  template_cache_path: string | null;
+  sidecar_cached_count: number;
+  sidecar_expected_count: number;
+  sidecar_cache_dir: string | null;
 }
 
 export interface LogEntry {
@@ -336,6 +403,16 @@ export interface RuntimeDoctorReport {
   summary: RuntimeDoctorSummary;
 }
 
+export interface TemplateDryRunReport {
+  model_name: string;
+  family: string;
+  renderer: string;
+  tool_format: string;
+  prompt: string;
+  checks: string[];
+  warnings: string[];
+}
+
 export interface RuntimeDoctorSummary {
   reachable_providers: number;
   total_providers: number;
@@ -363,6 +440,7 @@ export type ProviderType =
   | "managed_llama_cpp"
   | "external_llama_cpp"
   | "lm_studio"
+  | "sg_lang"
   | "ollama"
   | "open_ai_compatible";
 

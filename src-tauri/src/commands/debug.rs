@@ -233,3 +233,181 @@ pub async fn get_runtime_doctor(
 ) -> Result<crate::providers::RuntimeDoctorReport, String> {
     Ok(crate::providers::collect_runtime_doctor(state.inner().clone()).await)
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateDryRunRequest {
+    pub model_name: Option<String>,
+    pub use_jinja: bool,
+    pub template_mode: String,
+    pub template_name: Option<String>,
+    pub custom_template_path: Option<String>,
+    pub chat_template_kwargs_json: Option<String>,
+    pub reasoning_mode: String,
+    pub parallel_slots: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TemplateDryRunReport {
+    pub model_name: String,
+    pub family: String,
+    pub renderer: String,
+    pub tool_format: String,
+    pub prompt: String,
+    pub checks: Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn template_dry_run(
+    state: tauri::State<'_, SharedState>,
+    request: TemplateDryRunRequest,
+) -> Result<TemplateDryRunReport, String> {
+    let model_name = match request
+        .model_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(name) => name.to_string(),
+        None => {
+            let s = state.read().await;
+            s.loaded_model
+                .clone()
+                .or_else(|| {
+                    s.last_launch_preview.as_ref().and_then(|preview| {
+                        std::path::Path::new(&preview.model_path)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().to_string())
+                    })
+                })
+                .unwrap_or_else(|| "Qwen3.6-27B-GGUF".to_string())
+        }
+    };
+
+    let profile = crate::models::profiles::ModelProfile::detect(&model_name);
+    let messages = vec![
+        crate::templates::engine::ChatMessage {
+            role: "system".to_string(),
+            content: "You are InferenceBridge's template dry run. Use tools only when needed."
+                .to_string(),
+        },
+        crate::templates::engine::ChatMessage {
+            role: "user".to_string(),
+            content:
+                "Use the get_weather tool for London in celsius. Return exactly one tool call."
+                    .to_string(),
+        },
+    ];
+    let prompt = crate::templates::engine::render_prompt_with_tools(&messages, &profile, true);
+
+    let mut checks = Vec::new();
+    let mut warnings = Vec::new();
+    let lower = model_name.to_ascii_lowercase();
+    let is_qwen = lower.contains("qwen");
+    let is_gemma = lower.contains("gemma");
+    let template_mode = request.template_mode.trim().to_ascii_lowercase();
+
+    if request.use_jinja {
+        checks.push("Jinja rendering is enabled for llama.cpp launch.".to_string());
+    } else if is_qwen || is_gemma {
+        warnings.push(format!(
+            "{model_name} looks template-sensitive but Use Jinja is disabled."
+        ));
+    }
+
+    match template_mode.as_str() {
+        "repo" => checks.push("Template mode is repo.".to_string()),
+        "builtin" => checks.push(format!(
+            "Template mode is builtin{}.",
+            request
+                .template_name
+                .as_deref()
+                .map(|name| format!(" ({name})"))
+                .unwrap_or_default()
+        )),
+        "custom" => {
+            if let Some(path) = request
+                .custom_template_path
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                if std::path::Path::new(path).exists() {
+                    checks.push(format!("Custom template exists: {path}."));
+                } else {
+                    warnings.push(format!("Custom template path does not exist: {path}."));
+                }
+            } else {
+                warnings.push(
+                    "Template mode is custom but no custom template path is set.".to_string(),
+                );
+            }
+        }
+        "" => {
+            warnings.push("Template mode is blank; launch will fall back to defaults.".to_string())
+        }
+        other => warnings.push(format!(
+            "Template mode {other:?} is not one of repo/custom/builtin."
+        )),
+    }
+
+    if is_qwen {
+        let reasoning = request.reasoning_mode.trim();
+        if reasoning.is_empty() {
+            warnings.push("Qwen launch has no explicit reasoning mode.".to_string());
+        } else {
+            checks.push(format!("Qwen reasoning mode is {reasoning}."));
+        }
+
+        if request.parallel_slots > 1 {
+            warnings.push(format!(
+                "Qwen tool reliability is usually best with one slot; current setting is {}.",
+                request.parallel_slots
+            ));
+        } else {
+            checks.push("Parallel slots set to 1 for Qwen tool reliability.".to_string());
+        }
+
+        let kwargs = request
+            .chat_template_kwargs_json
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("");
+        if kwargs.is_empty() {
+            warnings.push(
+                "Qwen launch has no chat_template_kwargs_json; thinking/tool behavior may depend on template defaults."
+                    .to_string(),
+            );
+        } else if serde_json::from_str::<serde_json::Value>(kwargs).is_ok() {
+            checks.push("Template kwargs JSON parses successfully.".to_string());
+        } else {
+            warnings.push("Template kwargs JSON is not valid JSON.".to_string());
+        }
+    }
+
+    if prompt.contains("<|im_start|>system") || prompt.contains("<|turn>system") {
+        checks.push("Rendered prompt contains a system turn marker.".to_string());
+    } else {
+        warnings
+            .push("Rendered prompt did not include a recognizable system turn marker.".to_string());
+    }
+    if prompt.contains("<|im_start|>assistant") || prompt.contains("<|turn>model") {
+        checks.push("Rendered prompt contains an assistant generation marker.".to_string());
+    } else {
+        warnings.push(
+            "Rendered prompt did not include a recognizable assistant generation marker."
+                .to_string(),
+        );
+    }
+
+    Ok(TemplateDryRunReport {
+        model_name,
+        family: format!("{:?}", profile.family),
+        renderer: format!("{:?}", profile.renderer_type),
+        tool_format: format!("{:?}", profile.tool_call_format),
+        prompt,
+        checks,
+        warnings,
+    })
+}

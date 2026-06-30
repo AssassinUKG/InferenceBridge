@@ -10,6 +10,7 @@ pub struct AppConfig {
     pub models: ModelsConfig,
     pub process: ProcessConfig,
     pub providers: ProvidersConfig,
+    pub hub: HubConfig,
     pub ui: UiConfig,
 }
 
@@ -46,9 +47,11 @@ pub struct ModelsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProvidersConfig {
-    /// Active runtime provider. Supported now: "managed_llamacpp", "lm_studio".
+    /// Active runtime provider. Supported now: "managed_llamacpp", "lm_studio", "sglang".
     pub active: String,
     pub lm_studio: ExternalProviderConfig,
+    #[serde(default = "default_sglang_provider")]
+    pub sglang: ExternalProviderConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +61,13 @@ pub struct ExternalProviderConfig {
     /// OpenAI-compatible base URL, normally ending in /v1.
     pub base_url: String,
     pub api_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HubConfig {
+    /// Optional Hugging Face access token used for search, gated metadata, and downloads.
+    pub hf_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,6 +117,8 @@ pub struct ProcessConfig {
     pub use_jinja: bool,
     /// Reasoning mode passed to llama-server (--reasoning). Empty = unset.
     pub reasoning_mode: String,
+    /// Preserve reasoning in llama.cpp Jinja output when supported (--reasoning-preserve).
+    pub reasoning_preserve: bool,
     /// Template selection mode: "builtin", "repo", or "custom".
     pub template_mode: String,
     /// Optional built-in chat template name when using bridge/builtin templates.
@@ -179,6 +191,7 @@ impl Default for AppConfig {
             models: ModelsConfig::default(),
             process: ProcessConfig::default(),
             providers: ProvidersConfig::default(),
+            hub: HubConfig::default(),
             ui: UiConfig::default(),
         }
     }
@@ -216,7 +229,26 @@ impl Default for ProvidersConfig {
                 base_url: "http://127.0.0.1:1234/v1".to_string(),
                 api_key: None,
             },
+            sglang: ExternalProviderConfig {
+                enabled: false,
+                base_url: "http://127.0.0.1:30000/v1".to_string(),
+                api_key: None,
+            },
         }
+    }
+}
+
+fn default_sglang_provider() -> ExternalProviderConfig {
+    ExternalProviderConfig {
+        enabled: false,
+        base_url: "http://127.0.0.1:30000/v1".to_string(),
+        api_key: None,
+    }
+}
+
+impl Default for HubConfig {
+    fn default() -> Self {
+        Self { hf_api_key: None }
     }
 }
 
@@ -255,6 +287,7 @@ impl Default for ProcessConfig {
             ctxcp: None,
             use_jinja: false,
             reasoning_mode: String::new(),
+            reasoning_preserve: false,
             template_mode: "repo".to_string(),
             template_name: None,
             custom_template_path: None,
@@ -331,9 +364,13 @@ fn directory_is_writable(path: &PathBuf) -> bool {
 }
 
 impl AppConfig {
-    /// Load config, checking multiple locations in priority order:
-    /// 1. `./inference-bridge.toml` (current working directory / project root)
-    /// 2. app support directory config file
+    /// Load config from the stable app support location first.
+    ///
+    /// Working-directory config files are still accepted as legacy fallbacks, but
+    /// they must not override the persisted desktop settings. Release builds can
+    /// start with different current directories depending on how the exe is
+    /// launched, so prioritising `./inference-bridge.toml` makes saved network
+    /// settings appear to vanish after restart.
     ///
     /// If no config file is found anywhere, falls back to defaults with
     /// auto-detected LM Studio model cache as a scan directory.
@@ -395,7 +432,7 @@ impl AppConfig {
         config
     }
 
-    /// Save config to disk.
+    /// Save config to the stable app support location.
     pub fn save(&self) -> anyhow::Result<()> {
         let path = Self::appdata_config_path();
         if let Some(parent) = path.parent() {
@@ -408,19 +445,42 @@ impl AppConfig {
 
     fn config_candidates() -> Vec<PathBuf> {
         let mut candidates = Vec::new();
-        candidates.push(PathBuf::from("inference-bridge.toml"));
+
+        let appdata = Self::appdata_config_path();
+        candidates.push(appdata.clone());
+
+        if let Some(data) = dirs::data_dir() {
+            let roaming = data.join("InferenceBridge").join("inference-bridge.toml");
+            if !candidates.contains(&roaming) {
+                candidates.push(roaming);
+            }
+        }
+        if let Some(config) = dirs::config_dir() {
+            let config_path = config.join("InferenceBridge").join("inference-bridge.toml");
+            if !candidates.contains(&config_path) {
+                candidates.push(config_path);
+            }
+        }
+
+        let relative = PathBuf::from("inference-bridge.toml");
+        if !candidates.contains(&relative) {
+            candidates.push(relative);
+        }
         if let Ok(cwd) = std::env::current_dir() {
             let cwd_path = cwd.join("inference-bridge.toml");
             if !candidates.contains(&cwd_path) {
                 candidates.push(cwd_path);
             }
         }
-        candidates.push(Self::appdata_config_path());
         candidates
     }
 
     fn appdata_config_path() -> PathBuf {
         app_support_dir().join("inference-bridge.toml")
+    }
+
+    pub fn config_file_path() -> PathBuf {
+        Self::appdata_config_path()
     }
 
     fn detect_model_dirs() -> Vec<PathBuf> {

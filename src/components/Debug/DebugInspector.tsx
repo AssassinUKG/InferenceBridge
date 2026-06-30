@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
 import type {
+  ApiServerAction,
   DebugApiResponse,
   EffectiveProfileInfo,
   LoadProgress,
@@ -26,6 +27,7 @@ interface Props {
   loadProgress: LoadProgress | null;
   models: ModelInfo[];
   onSetApiServerRunning: (running: boolean) => Promise<void> | void;
+  apiAction?: ApiServerAction;
   onOpenSettings: () => void;
 }
 
@@ -212,6 +214,149 @@ function prettyJson(value: string) {
   }
 }
 
+type NormalizedTraceEvent = {
+  kind?: string;
+  text?: string | null;
+  raw_span?: string | null;
+  parser_stage?: string;
+  decision?: string;
+  tool_call?: {
+    id?: string;
+    namespace?: string | null;
+    name?: string;
+    arguments?: unknown;
+    raw_span?: string | null;
+    target_channel?: string | null;
+  } | null;
+};
+
+type ParsedTrace = {
+  parser_type?: string;
+  tool_call_format?: string;
+  think_tag_style?: string;
+  visible_text?: string;
+  reasoning_text?: string;
+  normalized?: {
+    events?: NormalizedTraceEvent[];
+    decisions?: string[];
+    visible_text?: string;
+    reasoning_text?: string;
+    tool_calls?: unknown[];
+    parser_type?: string;
+  };
+};
+
+function parseTraceJson(trace: string): ParsedTrace | null {
+  if (!trace.trim()) return null;
+  try {
+    const parsed = JSON.parse(trace);
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function stageTone(stage?: string) {
+  if (stage === "strict_profile") return "#34d399";
+  if (stage === "recovery") return "#fbbf24";
+  if (stage === "fallback") return "#f87171";
+  return "var(--text-2)";
+}
+
+function ParseTraceSummary({ trace }: { trace: ParsedTrace | null }) {
+  const events = trace?.normalized?.events ?? [];
+  const decisions = trace?.normalized?.decisions ?? [];
+  const counts = events.reduce<Record<string, number>>((acc, event) => {
+    const kind = event.kind ?? "unknown";
+    acc[kind] = (acc[kind] ?? 0) + 1;
+    return acc;
+  }, {});
+
+  if (!trace?.normalized) {
+    return (
+      <div className="rounded px-3 py-3 text-sm" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}>
+        No normalized parser events captured yet.
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="grid gap-2 md:grid-cols-4">
+        <Metric label="Parser" value={trace.normalized.parser_type ?? trace.parser_type ?? "Unknown"} />
+        <Metric label="Events" value={String(events.length)} />
+        <Metric label="Tools" value={String(trace.normalized.tool_calls?.length ?? 0)} />
+        <Metric label="Reasoning" value={trace.normalized.reasoning_text?.trim() ? "Captured" : "None"} />
+      </div>
+
+      {Object.keys(counts).length > 0 && (
+        <div className="flex flex-wrap gap-2">
+          {Object.entries(counts).map(([kind, count]) => (
+            <span key={kind} className="rounded px-2 py-1 text-xs" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}>
+              {kind}: {count}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {decisions.length > 0 && (
+        <div className="rounded px-3 py-3" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
+          <div className="mb-2 text-[11px] font-semibold uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
+            Parser Decisions
+          </div>
+          <div className="space-y-1 text-xs" style={{ color: "var(--text-1)" }}>
+            {decisions.map((decision, index) => (
+              <div key={`${decision}-${index}`}>{decision}</div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="overflow-hidden rounded" style={{ border: "1px solid var(--border)" }}>
+        {events.length === 0 ? (
+          <div className="px-3 py-4 text-sm" style={{ color: "var(--text-2)" }}>No normalized events.</div>
+        ) : (
+          events.map((event, index) => (
+            <div key={`${event.kind}-${index}`} className="px-3 py-3" style={{ borderTop: index === 0 ? "none" : "1px solid var(--border)" }}>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs font-semibold uppercase tracking-[0.12em]" style={{ color: "var(--text-0)" }}>{event.kind ?? "unknown"}</span>
+                <span className="rounded px-2 py-0.5 text-[10px] font-semibold" style={{ background: "rgba(255,255,255,0.08)", color: stageTone(event.parser_stage) }}>
+                  {event.parser_stage ?? "unlabeled"}
+                </span>
+                <span className="text-xs" style={{ color: "var(--text-2)" }}>{event.decision}</span>
+              </div>
+              {event.tool_call ? (
+                <CompactCode
+                  value={JSON.stringify(
+                    {
+                      namespace: event.tool_call.namespace,
+                      name: event.tool_call.name,
+                      arguments: event.tool_call.arguments,
+                      target_channel: event.tool_call.target_channel,
+                    },
+                    null,
+                    2
+                  )}
+                />
+              ) : event.text ? (
+                <div className="mt-2 whitespace-pre-wrap rounded px-3 py-2 text-xs leading-5" style={{ background: "var(--surface-2)", color: "var(--text-1)" }}>
+                  {event.text}
+                </div>
+              ) : null}
+              {event.raw_span && (
+                <details className="mt-2">
+                  <summary className="cursor-pointer text-xs" style={{ color: "var(--text-2)" }}>Raw span</summary>
+                  <CompactCode value={event.raw_span} />
+                </details>
+              )}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
 function parseHeaders(input: string): Record<string, string> {
   if (!input.trim()) return {};
   const parsed = JSON.parse(input);
@@ -249,7 +394,7 @@ function exampleList(activeModel: string | null, selectedModel: string | null): 
     { label: "Model Stats", method: "POST", path: "/v1/models/stats", body: JSON.stringify({ model: modelName }, null, 2), description: "Poll load progress and backend stats for one model." },
     { label: "Context", method: "GET", path: "/v1/context/status", description: "See KV usage, context pressure, and compaction state." },
     { label: "Runtime", method: "GET", path: "/v1/runtime/status", description: "Inspect backend, launch, startup, and slot status." },
-    { label: "Doctor", method: "GET", path: "/v1/runtime/doctor", description: "Probe managed llama.cpp, LM Studio, Ollama, and external local providers." },
+    { label: "Doctor", method: "GET", path: "/v1/runtime/doctor", description: "Probe managed llama.cpp, OpenAI-compatible providers, Ollama, and external local providers." },
     { label: "Profile", method: "GET", path: `/v1/debug/profile?model=${encodeURIComponent(modelName)}`, description: "Show the effective profile after detection and overrides." },
     { label: "Load Model", method: "POST", path: "/v1/models/load", body: JSON.stringify({ model: modelName }, null, 2), description: "Start loading a model in the background." },
     { label: "Unload", method: "POST", path: "/v1/models/unload", body: "{}", description: "Unload the active backend model." },
@@ -263,6 +408,7 @@ export function DebugInspector({
   loadProgress,
   models,
   onSetApiServerRunning,
+  apiAction = null,
   onOpenSettings,
 }: Props) {
   const [activeTab, setActiveTab] = useState<DebugTab>("api");
@@ -298,11 +444,15 @@ export function DebugInspector({
     ["Starting", "Stopping"].includes(processStatus?.state ?? "Idle") ||
     ["Loading", "Swapping", "Unloading"].includes(
       processStatus?.model_load_state ?? "Idle"
-    );
-  const serveRunning = serveState === "Running" && serveReachable;
-  const serveStarting = serveState === "Starting";
+  );
+  const serveStopping = apiAction === "stopping" || serveState === "Stopping";
+  const serveStarting = apiAction === "starting" || serveState === "Starting";
+  const serveRunning = (serveState === "Running" && serveReachable) || (serveState === "Running" && !serveStopping);
+  const serveActive = serveRunning || serveStarting || serveStopping || serveReachable;
+  const serveBusy = serveStarting || serveStopping;
   const selectedModel = selectedProfileModel || activeModel || models[0]?.filename || null;
   const examples = useMemo(() => exampleList(activeModel, selectedModel), [activeModel, selectedModel]);
+  const parsedTrace = useMemo(() => parseTraceJson(parseTrace), [parseTrace]);
 
   useEffect(() => {
     if (!selectedProfileModel && (activeModel || models[0]?.filename)) {
@@ -488,8 +638,9 @@ export function DebugInspector({
               <ActionButton label="Copy URL" onClick={() => navigator.clipboard.writeText(apiUrl)} />
               <ActionButton label="Server Settings" onClick={onOpenSettings} />
               <ActionButton
-                label={serveRunning || serveStarting ? "Stop API" : serveState === "Error" ? "Retry API" : "Start API"}
-                onClick={() => onSetApiServerRunning(serveRunning || serveStarting ? false : true)}
+                label={serveStopping ? "Stopping API..." : serveStarting ? "Starting API..." : serveActive ? "Stop API" : serveState === "Error" ? "Retry API" : "Start API"}
+                onClick={() => onSetApiServerRunning(!serveActive)}
+                disabled={serveBusy}
                 primary
               />
             </div>
@@ -497,11 +648,13 @@ export function DebugInspector({
         >
           <div className="grid gap-3 px-4 py-3 lg:grid-cols-4">
             <div>
-              <div className="flex items-center gap-2 text-sm font-semibold" style={{ color: serveRunning ? "#34d399" : serveStarting || modelTransitionActive ? "#fde68a" : serveState === "Error" ? "#f87171" : "var(--text-0)" }}>
-                <StatusDot running={serveRunning} starting={serveStarting || modelTransitionActive} error={serveState === "Error" && !modelTransitionActive} />
+              <div className="flex items-center gap-2 text-sm font-semibold" style={{ color: serveRunning ? "#34d399" : serveStarting || serveStopping || modelTransitionActive ? "#fde68a" : serveState === "Error" ? "#f87171" : "var(--text-0)" }}>
+                <StatusDot running={serveRunning} starting={serveStarting || serveStopping || modelTransitionActive} error={serveState === "Error" && !modelTransitionActive} />
                 <span>
                   {serveRunning
                     ? "Running"
+                    : serveStopping
+                      ? "Stopping"
                     : modelTransitionActive
                       ? processStatus?.model_load_state ?? "Loading"
                       : serveStarting
@@ -516,6 +669,8 @@ export function DebugInspector({
                   ? modelTransition?.message ?? "Model transition in progress."
                   : serveRunning
                   ? "Public API is reachable for external tools."
+                  : serveStopping
+                    ? "Public API is stopping. Waiting for the server task and port release."
                   : serveStarting
                     ? "Public API is starting up."
                     : serveState === "Error"
@@ -781,7 +936,7 @@ export function DebugInspector({
               </div>
             </Panel>
 
-            <Panel title="Provider Probes" description="Managed llama.cpp, standalone llama.cpp, Ollama, and LM Studio probes.">
+            <Panel title="Provider Probes" description="Managed llama.cpp, standalone llama.cpp, Ollama, and OpenAI-compatible provider probes.">
               {!runtimeDoctor ? (
                 <div className="px-4 py-4 text-sm" style={{ color: "var(--text-1)" }}>
                   Run doctor to probe local providers.
@@ -793,20 +948,34 @@ export function DebugInspector({
                       <div className="grid gap-3 px-4 py-3 xl:grid-cols-[minmax(0,1fr)_220px_220px]">
                         <div className="min-w-0">
                           <div className="flex flex-wrap items-center gap-2">
-                            <StatusDot running={provider.reachable} error={!provider.reachable && provider.status !== "idle"} />
-                            <span className="text-sm font-semibold" style={{ color: "var(--text-0)" }}>
-                              {provider.name}
-                            </span>
-                            <span
-                              className="rounded px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.12em]"
-                              style={{
-                                background: provider.reachable ? "rgba(52,211,153,0.1)" : "rgba(107,114,128,0.12)",
-                                border: provider.reachable ? "1px solid rgba(52,211,153,0.22)" : "1px solid var(--border)",
-                                color: provider.reachable ? "#34d399" : "var(--text-2)",
-                              }}
-                            >
-                              {provider.status}
-                            </span>
+                            {(() => {
+                              const warning = provider.status === "warn";
+                              const badgeStyle = warning
+                                ? {
+                                    background: "rgba(251,191,36,0.10)",
+                                    border: "1px solid rgba(251,191,36,0.24)",
+                                    color: "#fbbf24",
+                                  }
+                                : {
+                                    background: provider.reachable ? "rgba(52,211,153,0.1)" : "rgba(107,114,128,0.12)",
+                                    border: provider.reachable ? "1px solid rgba(52,211,153,0.22)" : "1px solid var(--border)",
+                                    color: provider.reachable ? "#34d399" : "var(--text-2)",
+                                  };
+                              return (
+                                <>
+                                  <StatusDot running={provider.reachable && !warning} error={!provider.reachable && provider.status !== "idle"} />
+                                  <span className="text-sm font-semibold" style={{ color: "var(--text-0)" }}>
+                                    {provider.name}
+                                  </span>
+                                  <span
+                                    className="rounded px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.12em]"
+                                    style={badgeStyle}
+                                  >
+                                    {provider.status}
+                                  </span>
+                                </>
+                              );
+                            })()}
                           </div>
                           <div className="mt-2 font-mono text-xs break-all" style={{ color: "var(--text-2)" }}>
                             {provider.base_url}
@@ -1048,7 +1217,8 @@ export function DebugInspector({
 
         {activeTab === "trace" && (
           <Panel title="Parse Trace" description="Last normalization / parsing trace captured during generation." actions={<ActionButton label="Refresh" onClick={refreshTrace} />}>
-            <div className="px-4 py-3">
+            <div className="space-y-3 px-4 py-3">
+              {parseTrace && <ParseTraceSummary trace={parsedTrace} />}
               <CompactCode value={parseTrace} emptyLabel="No parse trace captured yet." />
             </div>
           </Panel>

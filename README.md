@@ -159,11 +159,13 @@ InferenceBridge stores configuration in:
 
 | OS | Path |
 | --- | --- |
-| Windows | `%APPDATA%\InferenceBridge\inference-bridge.toml` |
+| Windows | `%LOCALAPPDATA%\InferenceBridge\inference-bridge.toml` |
 | macOS | `~/Library/Application Support/InferenceBridge/inference-bridge.toml` |
-| Linux | `~/.config/InferenceBridge/inference-bridge.toml` |
+| Linux | `~/.local/share/InferenceBridge/inference-bridge.toml` |
 
-Example:
+Copy [inference-bridge.example.toml](inference-bridge.example.toml) for a complete secret-free template.
+
+Minimal example:
 
 ```toml
 [server]

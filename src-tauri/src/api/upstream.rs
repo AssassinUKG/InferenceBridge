@@ -4,27 +4,47 @@ use axum::response::Response;
 use futures_util::StreamExt;
 
 use crate::api::errors::ApiErrorResponse;
+use crate::config::ProvidersConfig;
 use crate::state::SharedState;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
+    pub id: String,
     pub name: String,
     pub base_url: String,
     pub api_key: Option<String>,
+    pub provider_type: String,
+    pub enabled: bool,
+}
+
+pub fn configured_openai_providers(config: &ProvidersConfig) -> Vec<OpenAiProvider> {
+    vec![
+        OpenAiProvider {
+            id: "lm_studio".to_string(),
+            name: "LM Studio".to_string(),
+            base_url: crate::providers::normalize_openai_base_url(&config.lm_studio.base_url),
+            api_key: config.lm_studio.api_key.clone(),
+            provider_type: "lm_studio".to_string(),
+            enabled: config.lm_studio.enabled,
+        },
+        OpenAiProvider {
+            id: "sglang".to_string(),
+            name: "SGLang".to_string(),
+            base_url: crate::providers::normalize_openai_base_url(&config.sglang.base_url),
+            api_key: config.sglang.api_key.clone(),
+            provider_type: "sglang".to_string(),
+            enabled: config.sglang.enabled,
+        },
+    ]
 }
 
 pub async fn active_openai_provider(state: &SharedState) -> Option<OpenAiProvider> {
     let s = state.read().await;
-    match s.config.providers.active.as_str() {
-        "lm_studio" if s.config.providers.lm_studio.enabled => Some(OpenAiProvider {
-            name: "LM Studio".to_string(),
-            base_url: crate::providers::normalize_openai_base_url(
-                &s.config.providers.lm_studio.base_url,
-            ),
-            api_key: s.config.providers.lm_studio.api_key.clone(),
-        }),
-        _ => None,
-    }
+    let active = s.config.providers.active.clone();
+
+    configured_openai_providers(&s.config.providers)
+        .into_iter()
+        .find(|provider| provider.enabled && provider.id == active)
 }
 
 pub async fn proxy_json_to_openai_provider(

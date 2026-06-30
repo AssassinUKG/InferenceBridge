@@ -8,15 +8,22 @@ import type {
   DebugApiResponse,
   EffectiveProfileInfo,
   GpuStats,
+  HubAccessStatus,
+  HfSidecarCacheStatus,
+  HfSidecarSyncSummary,
   LlamaServerInfo,
   LogEntry,
   MessageInfo,
   ModelInfo,
   ProcessStatusInfo,
+  RuntimePackInfo,
   RuntimeDoctorReport,
   ServerInfo,
   SessionInfo,
+  TemplateDryRunReport,
 } from "./types";
+
+export type { HubAccessStatus, HfSidecarCacheStatus, HfSidecarSyncSummary } from "./types";
 
 function isTauriRuntime() {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
@@ -52,6 +59,7 @@ export interface LoadModelOptions {
   ctxcp?: number | null;
   useJinja?: boolean;
   reasoningMode?: string;
+  reasoningPreserve?: boolean;
   templateMode?: string;
   templateName?: string | null;
   customTemplatePath?: string | null;
@@ -77,6 +85,7 @@ export const loadModel = (modelName: string, options?: LoadModelOptions) =>
       ctxcp: options?.ctxcp ?? null,
       useJinja: options?.useJinja,
       reasoningMode: options?.reasoningMode,
+      reasoningPreserve: options?.reasoningPreserve,
       templateMode: options?.templateMode,
       templateName: options?.templateName ?? null,
       customTemplatePath: options?.customTemplatePath ?? null,
@@ -105,6 +114,7 @@ export const swapModel = (modelName?: string, options?: LoadModelOptions) =>
       ctxcp: options?.ctxcp ?? null,
       useJinja: options?.useJinja,
       reasoningMode: options?.reasoningMode,
+      reasoningPreserve: options?.reasoningPreserve,
       templateMode: options?.templateMode,
       templateName: options?.templateName ?? null,
       customTemplatePath: options?.customTemplatePath ?? null,
@@ -137,6 +147,9 @@ export const updateLlamaServer = () =>
 export const getLlamaInfo = () =>
   invoke<LlamaServerInfo>("get_llama_info");
 
+export const listRuntimePacks = () =>
+  invoke<RuntimePackInfo[]>("list_runtime_packs");
+
 export const downloadLlamaBuild = (backend: string) =>
   invoke<string>("download_llama_build", { backend });
 
@@ -145,6 +158,8 @@ export const downloadLlamaBuild = (backend: string) =>
 export const getSettings = () => invoke<AppSettings>("get_settings");
 
 export const getApiAccessInfo = () => invoke<ApiAccessInfo>("get_api_access_info");
+
+export const getConfigFilePath = () => invoke<string>("get_config_file_path");
 
 export const updateSettings = (settings: AppSettings) =>
   invoke<void>("update_settings", { settings });
@@ -215,6 +230,17 @@ export const getEffectiveProfile = (modelName?: string) =>
 export const getRuntimeDoctor = () =>
   invoke<RuntimeDoctorReport>("get_runtime_doctor");
 
+export const templateDryRun = (request: {
+  modelName?: string | null;
+  useJinja: boolean;
+  templateMode: string;
+  templateName?: string | null;
+  customTemplatePath?: string | null;
+  chatTemplateKwargsJson?: string | null;
+  reasoningMode: string;
+  parallelSlots: number;
+}) => invoke<TemplateDryRunReport>("template_dry_run", { request });
+
 export const getLogs = (limit?: number) =>
   invoke<LogEntry[]>("get_logs", { limit });
 
@@ -247,6 +273,9 @@ export interface HubModel {
   description: string;
   tags: string[];
   supports_vision: boolean;
+  downloads: number;
+  likes: number;
+  last_modified: string | null;
   quants: HubQuant[];
 }
 
@@ -254,6 +283,8 @@ export interface DownloadProgress {
   id: string;
   filename: string;
   dest_path: string | null;
+  supports_vision?: boolean | null;
+  repo_id?: string | null;
   downloaded_bytes: number;
   total_bytes: number;
   percent: number;
@@ -268,8 +299,8 @@ export interface MetadataSyncSummary {
   updated_models: number;
 }
 
-export const searchHubModels = (query: string, offset: number = 0) =>
-  invoke<HubModel[]>("search_hub_models", { query, offset });
+export const searchHubModels = (query: string, offset: number = 0, sort?: string) =>
+  invoke<HubModel[]>("search_hub_models", { query, offset, sort });
 
 export const showInFolder = (path: string) =>
   invoke<void>("show_in_folder", { path });
@@ -292,11 +323,74 @@ export const listDownloads = () =>
 export const cancelDownload = (id: string) =>
   invoke<void>("cancel_download", { id });
 
+export const pauseDownload = (id: string) =>
+  invoke<void>("pause_download", { id });
+
 export const clearCompletedDownloads = () =>
   invoke<void>("clear_completed_downloads");
+
+export const getHubAccessStatus = () =>
+  invoke<HubAccessStatus>("get_hub_access_status");
 
 export const syncLocalModelMetadata = () =>
   invoke<MetadataSyncSummary>("sync_local_model_metadata");
 
+export const getHfSidecarCacheStatus = () =>
+  invoke<HfSidecarCacheStatus[]>("get_hf_sidecar_cache_status");
+
+export const syncHfSidecarCache = (modelNames?: string[]) =>
+  invoke<HfSidecarSyncSummary>("sync_hf_sidecar_cache", {
+    modelNames: modelNames ?? null,
+  });
+
 export const deleteModelFile = (path: string) =>
-  invoke<void>("delete_model_file", { path });
+  invoke<string>("delete_model_file", { path });
+
+// Benchmarks
+
+export interface ModelTestStats {
+  model: string;
+  context_size: number;
+  prompt: string;
+  response: string;
+  tool_calls: Array<{
+    id: string;
+    name: string;
+    arguments: unknown;
+    raw_text: string | null;
+  }>;
+  tool_remaining_text: string;
+  load_ms: number | null;
+  load_reused: boolean;
+  ttft_ms: number | null;
+  elapsed_ms: number;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  total_tokens: number | null;
+  prompt_tokens_per_second: number | null;
+  decode_tokens_per_second: number | null;
+  end_to_end_tokens_per_second: number | null;
+  prefill_ms: number | null;
+  decode_ms: number | null;
+}
+
+export const runModelTest = (request: {
+  modelName: string;
+  contextSize: number;
+  prompt: string;
+  maxTokens: number;
+  temperature?: number | null;
+  topP?: number | null;
+  topK?: number | null;
+  seed?: number | null;
+}) =>
+  invoke<ModelTestStats>("run_model_test", {
+    modelName: request.modelName,
+    contextSize: request.contextSize,
+    prompt: request.prompt,
+    maxTokens: request.maxTokens,
+    temperature: request.temperature ?? null,
+    topP: request.topP ?? null,
+    topK: request.topK ?? null,
+    seed: request.seed ?? null,
+  });

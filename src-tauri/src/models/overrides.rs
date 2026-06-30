@@ -29,7 +29,6 @@ pub struct ModelProfileOverride {
     pub default_top_k: Option<Option<i32>>,
     pub default_min_p: Option<Option<f32>>,
     pub disable_thinking_for_tools: Option<bool>,
-    pub split_tool_calling: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -102,9 +101,6 @@ impl ModelProfileOverride {
         }
         if let Some(value) = self.disable_thinking_for_tools {
             profile.disable_thinking_for_tools = value;
-        }
-        if let Some(value) = self.split_tool_calling {
-            profile.split_tool_calling = value;
         }
     }
 }

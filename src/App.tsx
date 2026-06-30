@@ -13,16 +13,18 @@ import { SettingsPanel } from "./components/Model/SettingsPanel";
 import { ContextPanel } from "./components/Context/ContextPanel";
 import { DebugInspector } from "./components/Debug/DebugInspector";
 import { ModelBrowser } from "./components/Model/ModelBrowser";
+import { BenchmarkPanel } from "./components/Benchmark/BenchmarkPanel";
 import type { AppSettings, LiveStreamDelta, LiveStreamSnapshot, LoadProgress } from "./lib/types";
 import * as api from "./lib/tauri";
 import type { DownloadProgress } from "./lib/tauri";
 
-type Tab = "chat" | "models" | "browse" | "context" | "logs" | "debug" | "settings";
+type Tab = "chat" | "models" | "browse" | "benchmark" | "context" | "logs" | "debug" | "settings";
 
 const TAB_LABELS: Record<Tab, string> = {
   chat: "Chat",
   models: "Models",
   browse: "Browse",
+  benchmark: "Benchmark",
   context: "Context",
   logs: "Logs",
   debug: "API",
@@ -299,6 +301,8 @@ function LiveStreamFeedV2({
   );
   const [mode, setMode] = useState<"full" | "visible" | "reasoning" | "events" | "json">("full");
   const [showHistory, setShowHistory] = useState(true);
+  const [query, setQuery] = useState("");
+  const [expandOverride, setExpandOverride] = useState<Record<string, boolean>>({});
   const outputRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
@@ -343,8 +347,24 @@ function LiveStreamFeedV2({
 
   const latest = streams[streams.length - 1] ?? null;
   const isRunning = latest?.status === "running";
-  const visibleStreams = showHistory ? streams : latest ? [latest] : [];
+  const historyStreams = showHistory ? streams : latest ? [latest] : [];
+  const q = query.trim().toLowerCase();
+  const visibleStreams = q
+    ? historyStreams.filter((stream) =>
+        `${stream.source} ${stream.model} ${stream.request_id} ${liveToolSummary(stream)}`
+          .toLowerCase()
+          .includes(q)
+      )
+    : historyStreams;
   const copyOutput = visibleStreams.map((stream) => liveStreamBlock(stream, mode)).join("\n\n");
+  const isExpanded = (stream: LiveStreamSnapshot) =>
+    expandOverride[stream.request_id] ??
+    (stream.request_id === latest?.request_id || stream.status === "running");
+  const toggleExpanded = (stream: LiveStreamSnapshot) =>
+    setExpandOverride((current) => ({
+      ...current,
+      [stream.request_id]: !isExpanded(stream),
+    }));
 
   return (
     <section className="flex h-full min-h-0 flex-col" style={{ background: "var(--surface-1)" }}>
@@ -366,6 +386,14 @@ function LiveStreamFeedV2({
               : "Waiting for the next generation."}
           </div>
         </div>
+        <input
+          type="text"
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          placeholder="Filter streams..."
+          className="w-[150px] rounded px-2 py-1 text-xs outline-none"
+          style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-0)" }}
+        />
         <button
           onClick={() => setShowHistory((value) => !value)}
           className="rounded px-2 py-1 text-xs"
@@ -410,7 +438,9 @@ function LiveStreamFeedV2({
       <div ref={outputRef} className="min-h-0 flex-1 overflow-auto px-3 py-3" style={{ background: "var(--bg)" }}>
         {visibleStreams.length === 0 ? (
           <div className="font-mono text-xs leading-5" style={{ color: "var(--text-2)" }}>
-            No stream output captured yet. Start a chat/API completion and this pane will fill live.
+            {q
+              ? "No streams match the filter."
+              : "No stream output captured yet. Start a chat/API completion and this pane will fill live."}
           </div>
         ) : (
           <div className="space-y-3">
@@ -418,6 +448,7 @@ function LiveStreamFeedV2({
               const output = liveStreamOutput(stream, mode);
               const running = stream.status === "running";
               const completedAt = liveCompletedAt(stream);
+              const expanded = isExpanded(stream);
               return (
                 <article
                   key={stream.request_id}
@@ -425,9 +456,11 @@ function LiveStreamFeedV2({
                   style={{ border: "1px solid var(--border)", background: "var(--surface-1)" }}
                 >
                   <div
-                    className="flex flex-wrap items-center gap-2 px-3 py-2 text-xs"
-                    style={{ borderBottom: "1px solid var(--border)", color: "var(--text-1)" }}
+                    onClick={() => toggleExpanded(stream)}
+                    className="flex cursor-pointer flex-wrap items-center gap-2 px-3 py-2 text-xs"
+                    style={{ borderBottom: expanded ? "1px solid var(--border)" : "none", color: "var(--text-1)" }}
                   >
+                    <span className="select-none" style={{ color: "var(--text-2)" }}>{expanded ? "▾" : "▸"}</span>
                     <span
                       className={`h-2 w-2 rounded-full ${running ? "animate-pulse" : ""}`}
                       style={{ background: running ? "#34d399" : stream.status === "error" ? "#f87171" : "#64748b" }}
@@ -439,12 +472,14 @@ function LiveStreamFeedV2({
                     <span className="ml-auto">started {formatLiveDateTime(stream.started_at)}</span>
                     {completedAt && <span>done {formatLiveDateTime(completedAt)}</span>}
                   </div>
-                  <pre
-                    className="max-h-[420px] overflow-auto whitespace-pre-wrap break-words px-3 py-3 font-mono text-xs leading-5"
-                    style={{ color: output ? "var(--text-0)" : "var(--text-2)", background: "var(--bg)" }}
-                  >
-                    {output || emptyLiveStreamMessage(mode)}
-                  </pre>
+                  {expanded && (
+                    <pre
+                      className="max-h-[420px] overflow-auto whitespace-pre-wrap break-words px-3 py-3 font-mono text-xs leading-5"
+                      style={{ color: output ? "var(--text-0)" : "var(--text-2)", background: "var(--bg)" }}
+                    >
+                      {output || emptyLiveStreamMessage(mode)}
+                    </pre>
+                  )}
                 </article>
               );
             })}
@@ -509,6 +544,18 @@ function liveCompletedAt(stream: LiveStreamSnapshot) {
 function formatLiveDateTime(value: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
+  const now = new Date();
+  const sameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate();
+  if (sameDay) {
+    return date.toLocaleTimeString(undefined, {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  }
   return date.toLocaleString(undefined, {
     year: "numeric",
     month: "2-digit",
@@ -584,25 +631,7 @@ function LogsWorkspace({
 }) {
   return (
     <div className="flex h-full min-h-0 flex-col overflow-hidden">
-      <div
-        className="flex h-12 shrink-0 items-center justify-between gap-3 px-4"
-        style={{ borderBottom: "1px solid var(--border)", background: "var(--surface-1)" }}
-      >
-        <div className="min-w-0">
-          <div className="truncate text-sm font-semibold" style={{ color: "var(--text-0)" }}>
-            Logs
-          </div>
-          <div className="truncate text-xs" style={{ color: "var(--text-2)" }}>
-            Live LLM streams, raw transport, visible text, reasoning, events, and JSON snapshots.
-          </div>
-        </div>
-        <div className="shrink-0 text-xs" style={{ color: "var(--text-1)" }}>
-          {snapshot ? `${snapshot.source} - ${snapshot.status}` : "No active stream"}
-        </div>
-      </div>
-      <div className="min-h-0 flex-1">
-        <LiveStreamFeedV2 snapshot={snapshot} snapshots={snapshots} />
-      </div>
+      <LiveStreamFeedV2 snapshot={snapshot} snapshots={snapshots} />
     </div>
   );
 }
@@ -714,8 +743,11 @@ function App() {
       : null;
   const apiState = model.processStatus?.api_state ?? "Idle";
   const apiReachable = model.processStatus?.api_reachable ?? false;
-  const apiRunning = apiState === "Running" && apiReachable;
-  const apiStarting = apiState === "Starting";
+  const apiStopping = model.apiAction === "stopping" || apiState === "Stopping";
+  const apiStarting = model.apiAction === "starting" || apiState === "Starting";
+  const apiRunning = (apiState === "Running" && apiReachable) || (apiState === "Running" && !apiStopping);
+  const apiActive = apiRunning || apiStarting || apiStopping || apiReachable;
+  const apiBusy = apiStarting || apiStopping;
   const apiPortOwner = model.processStatus?.api_port_owner ?? null;
   const configuredApiPort = settings?.server_port ?? 8800;
 
@@ -746,7 +778,7 @@ function App() {
     }
   }, [hasModel, session.sessions.length, session.activeId]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const tabs: Tab[] = ["chat", "models", "browse", "context", "logs", "debug", "settings"];
+  const tabs: Tab[] = ["chat", "models", "browse", "benchmark", "context", "logs", "debug", "settings"];
 
   return (
     <div className="flex h-screen flex-col" style={{ background: "var(--bg)", color: "var(--text-0)" }}>
@@ -788,9 +820,10 @@ function App() {
               onClick={() => setActiveTab(tab)}
               className="rounded px-3 py-1 text-sm transition"
               style={{
-                background: activeTab === tab ? "rgba(255,255,255,0.1)" : "transparent",
-                color: activeTab === tab ? "var(--text-0)" : "var(--text-1)",
-                border: "none",
+                background: activeTab === tab ? "rgba(34,211,238,0.14)" : "transparent",
+                color: activeTab === tab ? "#a5f3fc" : "var(--text-1)",
+                border: activeTab === tab ? "1px solid rgba(34,211,238,0.26)" : "1px solid transparent",
+                boxShadow: activeTab === tab ? "inset 0 -2px 0 rgba(34,211,238,0.65)" : "none",
                 cursor: "pointer",
               }}
               onMouseEnter={(e) => {
@@ -823,26 +856,28 @@ function App() {
             }}
           >
             <span
-              className={`h-2 w-2 rounded-full ${apiState === "Starting" ? "animate-pulse" : ""}`}
+              className={`h-2 w-2 rounded-full ${apiStarting || apiStopping ? "animate-pulse" : ""}`}
               style={{
                 background:
-                  apiRunning ? "#34d399" : apiStarting ? "#fde68a" : apiState === "Error" ? "#f87171" : "#6b7280",
+                  apiRunning ? "#34d399" : apiStarting || apiStopping ? "#fde68a" : apiState === "Error" ? "#f87171" : "#6b7280",
               }}
             />
-            <span>{apiRunning ? "Serve Running" : apiStarting ? "Serve Starting" : apiState === "Error" ? "Serve Unreachable" : "Serve Off"}</span>
+            <span>{apiRunning ? "Serve Running" : apiStopping ? "Serve Stopping" : apiStarting ? "Serve Starting" : apiState === "Error" ? "Serve Unreachable" : "Serve Off"}</span>
           </button>
 
           <button
-            onClick={() => model.setApiServerRunning(apiRunning || apiStarting ? false : true)}
+            onClick={() => model.setApiServerRunning(!apiActive)}
+            disabled={apiBusy}
             className="rounded px-3 py-1 text-xs font-medium transition"
             style={{
               background: "#22d3ee",
               color: "#0a0a0a",
               border: "none",
-              cursor: "pointer",
+              cursor: apiBusy ? "wait" : "pointer",
+              opacity: apiBusy ? 0.7 : 1,
             }}
           >
-            {apiRunning || apiStarting ? "Stop API" : apiState === "Error" ? "Retry API" : "Start API"}
+            {apiStopping ? "Stopping API..." : apiStarting ? "Starting API..." : apiActive ? "Stop API" : apiState === "Error" ? "Retry API" : "Start API"}
           </button>
 
           {chat.isStreaming && (
@@ -992,8 +1027,12 @@ function App() {
             />
           </div>
 
-          <div className={`h-full overflow-y-auto ${activeTab === "models" ? "block" : "hidden"}`}>
-            <div className="p-3">
+          <div className={`h-full min-h-0 overflow-hidden ${activeTab === "benchmark" ? "block" : "hidden"}`}>
+            <BenchmarkPanel models={model.models} processStatus={model.processStatus} />
+          </div>
+
+          <div className={`h-full min-h-0 overflow-hidden ${activeTab === "models" ? "block" : "hidden"}`}>
+            <div className="box-border h-full min-h-0 p-3">
               <ModelSelector
                 models={model.models}
                 loadedModel={model.processStatus?.model ?? null}
@@ -1007,6 +1046,7 @@ function App() {
                 onUnload={model.unloadModel}
                 onSwap={model.swapModel}
                 onSetApiServerRunning={model.setApiServerRunning}
+                apiAction={model.apiAction}
                 onScan={model.scanModels}
                 onOpenSettings={() => setActiveTab("settings")}
               />
@@ -1035,6 +1075,7 @@ function App() {
               loadProgress={model.loadProgress}
               models={model.models}
               onSetApiServerRunning={model.setApiServerRunning}
+              apiAction={model.apiAction}
               onOpenSettings={() => setActiveTab("settings")}
             />
           </div>
@@ -1044,6 +1085,7 @@ function App() {
               onSaved={setSettings}
               processStatus={model.processStatus}
               loadProgress={model.loadProgress}
+              apiAction={model.apiAction}
               onSetApiServerRunning={model.setApiServerRunning}
             />
           </div>

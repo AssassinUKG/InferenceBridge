@@ -68,7 +68,6 @@ pub struct ModelProfile {
     pub default_top_k: Option<i32>,
     pub default_min_p: Option<f32>,
     pub disable_thinking_for_tools: bool,
-    pub split_tool_calling: bool,
 }
 
 impl ModelProfile {
@@ -222,7 +221,6 @@ impl ModelProfile {
             default_top_k: Some(20),
             default_min_p: Some(0.05),
             disable_thinking_for_tools: true,
-            split_tool_calling: true,
         }
     }
 
@@ -230,7 +228,7 @@ impl ModelProfile {
         Self {
             family: ModelFamily::Qwen3,
             tool_call_format: ToolCallFormat::QwenXml,
-            think_tag_style: ThinkTagStyle::Standard,
+            think_tag_style: ThinkTagStyle::Qwen,
             interleaved_think_tool: true,
             supports_parallel_tools: model_name.contains("14b")
                 || model_name.contains("27b")
@@ -256,7 +254,6 @@ impl ModelProfile {
             default_top_k: Some(20),
             default_min_p: Some(0.0),
             disable_thinking_for_tools: true,
-            split_tool_calling: true,
         }
     }
 
@@ -281,7 +278,6 @@ impl ModelProfile {
             default_top_k: Some(20),
             default_min_p: None,
             disable_thinking_for_tools: false,
-            split_tool_calling: false,
         }
     }
 
@@ -306,7 +302,6 @@ impl ModelProfile {
             default_top_k: Some(-1),
             default_min_p: Some(0.0),
             disable_thinking_for_tools: false,
-            split_tool_calling: false,
         }
     }
 
@@ -331,7 +326,6 @@ impl ModelProfile {
             default_top_k: Some(-1),
             default_min_p: None,
             disable_thinking_for_tools: false,
-            split_tool_calling: false,
         }
     }
 
@@ -356,7 +350,6 @@ impl ModelProfile {
             default_top_k: Some(-1),
             default_min_p: None,
             disable_thinking_for_tools: false,
-            split_tool_calling: true,
         }
     }
 
@@ -381,7 +374,6 @@ impl ModelProfile {
             default_top_k: Some(-1),
             default_min_p: None,
             disable_thinking_for_tools: false,
-            split_tool_calling: false,
         }
     }
 
@@ -406,7 +398,6 @@ impl ModelProfile {
             default_top_k: Some(-1),
             default_min_p: None,
             disable_thinking_for_tools: false,
-            split_tool_calling: false,
         }
     }
 
@@ -437,7 +428,6 @@ impl ModelProfile {
             default_top_k: Some(64),
             default_min_p: Some(0.0),
             disable_thinking_for_tools: true,
-            split_tool_calling: false,
         }
     }
 
@@ -468,7 +458,6 @@ impl ModelProfile {
             default_top_k: Some(64),
             default_min_p: Some(0.0),
             disable_thinking_for_tools: true,
-            split_tool_calling: false,
         }
     }
 
@@ -493,7 +482,6 @@ impl ModelProfile {
             default_top_k: Some(-1),
             default_min_p: None,
             disable_thinking_for_tools: false,
-            split_tool_calling: false,
         }
     }
 

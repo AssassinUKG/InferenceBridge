@@ -126,7 +126,7 @@ pub fn extract_tool_calls_for_profile(
             // Safety net: if llama-server didn't inject the Qwen chat template, the model may
             // fall back to text-format tool calls instead of <function=...> XML.
             // Try both known fallback formats in order.
-            if calls.is_empty() {
+            if calls.is_empty() && profile.allow_fallback_extraction {
                 if extract_square_bracket_tool_calls(&mut remaining, &mut calls) {
                     tracing::info!(
                         "qwen safety-net: [tool_name]{{...}} format detected - \
@@ -1008,7 +1008,6 @@ mod tests {
             default_top_k: None,
             default_min_p: None,
             disable_thinking_for_tools: true,
-            split_tool_calling: true,
         }
     }
 

@@ -1,8 +1,9 @@
 //! Model benchmarking and test utilities
 
 use crate::engine::client::{CompletionRequest, LlamaClient, Timings};
-use crate::engine::process::LaunchConfig;
-use crate::state::SharedState;
+use crate::engine::streaming::{self, StreamEvent};
+use crate::state::{begin_live_generation, finish_api_generation_for_request, SharedState};
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ModelTestStats {
@@ -10,7 +11,12 @@ pub struct ModelTestStats {
     pub context_size: u32,
     pub prompt: String,
     pub response: String,
+    pub tool_calls: Vec<crate::normalize::tool_extract::ToolCall>,
+    pub tool_remaining_text: String,
     pub timings: Option<Timings>,
+    pub load_ms: Option<u128>,
+    pub load_reused: bool,
+    pub ttft_ms: Option<u128>,
     pub elapsed_ms: u128,
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
@@ -27,6 +33,8 @@ pub async fn test_model(
     shared_state: SharedState,
     model_name: &str,
     context_size: u32,
+    load_ms: Option<u128>,
+    load_reused: bool,
     prompt: &str,
     max_tokens: u32,
     temperature: Option<f32>,
@@ -35,78 +43,14 @@ pub async fn test_model(
     seed: Option<i64>,
 ) -> anyhow::Result<ModelTestStats> {
     // 1. Find model in registry
-    let (model, profile, model_path): (
-        crate::models::scanner::ScannedModel,
-        crate::models::profiles::ModelProfile,
-        std::path::PathBuf,
-    ) = {
+    let profile = {
         let state = shared_state.read().await;
         let model = state
             .model_registry
             .find_by_name(model_name)
             .ok_or_else(|| anyhow::anyhow!("Model not found: {}", model_name))?;
-        (model.clone(), model.profile.clone(), model.path.clone())
+        model.profile.clone()
     };
-
-    // 2. Launch model (if not already loaded)
-    {
-        let mut state = shared_state.write().await;
-        let config = LaunchConfig {
-            model_path: model_path.clone(),
-            hf_repo: None,
-            hf_file: model
-                .hf_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.file.clone()),
-            context_size: Some(context_size),
-            gpu_layers: state.config.process.gpu_layers,
-            threads: state.config.process.threads,
-            threads_batch: state.config.process.threads_batch,
-            port: state.process.port(),
-            backend_preference: state.config.process.backend_preference.clone(),
-            batch_size: state.config.process.batch_size,
-            ubatch_size: state.config.process.ubatch_size,
-            flash_attn: state.config.process.flash_attn,
-            use_mmap: state.config.process.use_mmap,
-            use_mlock: state.config.process.use_mlock,
-            cont_batching: state.config.process.cont_batching,
-            parallel_slots: state.config.process.parallel_slots,
-            main_gpu: state.config.process.main_gpu,
-            defrag_thold: state.config.process.defrag_thold,
-            rope_freq_scale: state.config.process.rope_freq_scale,
-            fit_mode: Some(state.config.process.fit_mode.clone())
-                .filter(|value| !value.trim().is_empty()),
-            cache_ram_mb: state.config.process.cache_ram_mb,
-            ctxcp: state.config.process.ctxcp,
-            use_jinja: state.config.process.use_jinja,
-            reasoning_mode: Some(state.config.process.reasoning_mode.clone())
-                .filter(|value| !value.trim().is_empty()),
-            template_mode: state.config.process.template_mode.clone(),
-            template_source: None,
-            template_file: None,
-            template_name: state.config.process.template_name.clone(),
-            chat_template_kwargs_json: state.config.process.chat_template_kwargs_json.clone(),
-            extra_args: state.config.process.extra_args.clone(),
-            cache_type_k: state.config.process.cache_type_k.clone(),
-            cache_type_v: state.config.process.cache_type_v.clone(),
-            kv_unified: state.config.process.kv_unified,
-            no_warmup: state.config.process.no_warmup,
-            ctx_shift: state.config.process.ctx_shift,
-            tensor_split: state.config.process.tensor_split.clone(),
-            draft_model_path: state.config.process.draft_model_path.clone(),
-            spec_type: state.config.process.spec_type.clone(),
-            spec_draft_n_max: state.config.process.spec_draft_n_max,
-            draft_max_tokens: state.config.process.draft_max_tokens,
-            draft_min_tokens: state.config.process.draft_min_tokens,
-            draft_p_min: state.config.process.draft_p_min,
-            diffusion_n_predict: state.config.process.diffusion_n_predict,
-            diffusion_kv_cache: state.config.process.diffusion_kv_cache.clone(),
-            diffusion_visual: state.config.process.diffusion_visual,
-            diffusion_extra_args: state.config.process.diffusion_extra_args.clone(),
-        };
-        state.process.launch(config).await?;
-        state.loaded_model = Some(model.filename.clone());
-    }
 
     // 3. Prepare prompt
     let rendered = crate::templates::engine::render_prompt(
@@ -127,7 +71,7 @@ pub async fn test_model(
         frequency_penalty: None,
         repeat_penalty: None,
         seed,
-        stream: false,
+        stream: true,
         stop: profile.stop_markers.clone(),
         special: true,
         image_data: vec![],
@@ -139,26 +83,115 @@ pub async fn test_model(
     };
     let client = LlamaClient::new(port);
     let start = std::time::Instant::now();
-    let resp = client.complete(&request).await?;
+    let response = client.complete_stream(&request).await?;
+    let (tx, mut rx) = mpsc::channel::<StreamEvent>(128);
+    let generation =
+        begin_live_generation(&shared_state, "benchmark", None, model_name.to_string()).await;
+    let request_id = generation.request_id.clone();
+    let cancel = generation.cancel;
+    let stream_task = tokio::spawn(streaming::consume_sse_stream_with_timeouts(
+        response,
+        tx,
+        cancel.clone(),
+        900,
+        300,
+    ));
+    let mut ttft_ms = None;
+    let mut raw_response = String::new();
+    let mut tokens_predicted = 0_u32;
+    let mut tokens_evaluated = 0_u32;
+    let mut decode_tokens_per_second = None;
+    let mut prompt_tokens_per_second = None;
+    let mut stream_error = None;
+    let mut cancelled = false;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            StreamEvent::RawDelta(delta) => {
+                if ttft_ms.is_none() && !delta.is_empty() {
+                    ttft_ms = Some(start.elapsed().as_millis());
+                }
+            }
+            StreamEvent::Done {
+                full_text,
+                tokens_predicted: predicted,
+                tokens_evaluated: evaluated,
+                decode_tokens_per_second: decode_tps,
+                prompt_tokens_per_second: prompt_tps,
+                ..
+            } => {
+                raw_response = full_text;
+                tokens_predicted = predicted;
+                tokens_evaluated = evaluated;
+                if decode_tps > 0.0 {
+                    decode_tokens_per_second = Some(decode_tps);
+                }
+                prompt_tokens_per_second = prompt_tps;
+            }
+            StreamEvent::Error(error) => {
+                if cancel.is_cancelled() {
+                    cancelled = true;
+                }
+                stream_error = Some(error);
+            }
+            StreamEvent::Token(_) | StreamEvent::ReasoningDelta(_) => {}
+        }
+    }
+
+    let consumed_text = match stream_task.await {
+        Ok(Ok(text)) => text,
+        Ok(Err(error)) => {
+            let status = if cancel.is_cancelled() {
+                "cancelled"
+            } else {
+                "error"
+            };
+            finish_api_generation_for_request(&shared_state, &request_id, status).await;
+            return Err(error.into());
+        }
+        Err(error) => {
+            let status = if cancel.is_cancelled() {
+                "cancelled"
+            } else {
+                "error"
+            };
+            finish_api_generation_for_request(&shared_state, &request_id, status).await;
+            return Err(anyhow::anyhow!("benchmark stream task failed: {error}"));
+        }
+    };
+    if cancel.is_cancelled() {
+        cancelled = true;
+    }
+    if raw_response.is_empty() {
+        raw_response = consumed_text;
+    }
+    if cancelled {
+        finish_api_generation_for_request(&shared_state, &request_id, "cancelled").await;
+        anyhow::bail!("Benchmark cancelled");
+    }
+    if let Some(error) = stream_error {
+        if raw_response.trim().is_empty() {
+            finish_api_generation_for_request(&shared_state, &request_id, "error").await;
+            anyhow::bail!(error);
+        }
+    }
     let elapsed = start.elapsed().as_millis();
     let response_text = crate::normalize::think_strip::strip_think_tags_with_style(
-        &resp.content,
+        &raw_response,
         profile.think_tag_style,
     );
-    let prompt_tokens = resp.tokens_evaluated;
-    let completion_tokens = resp.tokens_predicted;
+    let (tool_calls, tool_remaining_text) =
+        crate::normalize::tool_extract::extract_tool_calls_for_profile(&response_text, &profile);
+    let prompt_tokens = Some(tokens_evaluated);
+    let completion_tokens = Some(tokens_predicted);
     let total_tokens = match (prompt_tokens, completion_tokens) {
         (Some(prompt_tokens), Some(completion_tokens)) => Some(prompt_tokens + completion_tokens),
         _ => None,
     };
-    let prompt_tokens_per_second = resp
-        .timings
-        .as_ref()
-        .and_then(|timings| timings.prompt_per_second);
-    let decode_tokens_per_second = resp
-        .timings
-        .as_ref()
-        .and_then(|timings| timings.predicted_per_second);
+    let timings = Some(Timings {
+        predicted_per_second: decode_tokens_per_second,
+        prompt_per_second: prompt_tokens_per_second,
+    });
     let prefill_ms = match (prompt_tokens, prompt_tokens_per_second) {
         (Some(tokens), Some(tokens_per_second)) if tokens_per_second > 0.0 => {
             Some((tokens as f64 / tokens_per_second) * 1000.0)
@@ -171,6 +204,7 @@ pub async fn test_model(
         }
         _ => None,
     };
+    finish_api_generation_for_request(&shared_state, &request_id, "done").await;
     let elapsed_secs = elapsed as f64 / 1000.0;
     let end_to_end_tokens_per_second = match (completion_tokens, elapsed_secs) {
         (Some(tokens), elapsed_secs) if elapsed_secs > 0.0 => Some(tokens as f64 / elapsed_secs),
@@ -181,7 +215,12 @@ pub async fn test_model(
         context_size,
         prompt: prompt.to_string(),
         response: response_text,
-        timings: resp.timings,
+        tool_calls,
+        tool_remaining_text,
+        timings,
+        load_ms,
+        load_reused,
+        ttft_ms,
         elapsed_ms: elapsed,
         prompt_tokens,
         completion_tokens,

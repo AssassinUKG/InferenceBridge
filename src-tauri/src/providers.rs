@@ -63,6 +63,7 @@ pub enum ProviderType {
     ManagedLlamaCpp,
     ExternalLlamaCpp,
     LmStudio,
+    SgLang,
     Ollama,
     OpenAiCompatible,
 }
@@ -137,6 +138,7 @@ pub async fn collect_runtime_doctor(state: SharedState) -> RuntimeDoctorReport {
         let api_url =
             crate::api::server::reachable_api_url(&s.config.server.host, s.config.server.port);
         let detected_backend = s.process.detected_backend();
+        let server_binary = s.process.find_server_binary();
         (
             format!("{:?}", s.api_server_state),
             api_url,
@@ -146,12 +148,13 @@ pub async fn collect_runtime_doctor(state: SharedState) -> RuntimeDoctorReport {
             s.process.port(),
             s.process.state(),
             s.last_launch_preview.clone(),
-            s.process.find_server_binary().is_some(),
+            server_binary.clone(),
+            server_binary.is_some(),
             detected_backend,
         )
     };
 
-    let backend = snapshot.9.lock().await.clone();
+    let backend = snapshot.10.lock().await.clone();
     let app_api_reachable = probe_ok(&format!("{}/health", snapshot.1.trim_end_matches('/'))).await;
     let app_api = AppApiDoctor {
         state: snapshot.0,
@@ -161,7 +164,7 @@ pub async fn collect_runtime_doctor(state: SharedState) -> RuntimeDoctorReport {
     };
 
     let active_runtime = ActiveRuntimeDoctor {
-        managed: snapshot.8,
+        managed: snapshot.9,
         state: format!("{:?}", snapshot.6),
         model: snapshot.4.clone(),
         port: (snapshot.5 > 0).then_some(snapshot.5),
@@ -175,7 +178,8 @@ pub async fn collect_runtime_doctor(state: SharedState) -> RuntimeDoctorReport {
             active_runtime.port,
             snapshot.4.clone(),
             snapshot.7.as_ref().and_then(|preview| preview.context_size),
-            snapshot.8,
+            snapshot.7.clone(),
+            snapshot.9,
         )
         .await,
     );
@@ -191,51 +195,47 @@ pub async fn collect_runtime_doctor(state: SharedState) -> RuntimeDoctorReport {
         .await,
     );
     providers.push(probe_ollama_endpoint().await);
-    let configured_lm_studio = {
+    let configured_openai_providers = {
         let s = state.read().await;
-        (
-            s.config.providers.lm_studio.enabled,
-            s.config.providers.lm_studio.base_url.clone(),
-        )
+        crate::api::upstream::configured_openai_providers(&s.config.providers)
     };
 
-    if configured_lm_studio.0 {
-        providers.push(
-            probe_openai_compatible_endpoint(
-                "lm-studio-configured",
-                ProviderType::LmStudio,
-                "LM Studio configured",
-                &configured_lm_studio.1,
-            )
-            .await,
-        );
+    for provider in configured_openai_providers
+        .iter()
+        .filter(|provider| provider.enabled)
+    {
+        providers.push(probe_openai_provider_config(provider, "configured").await);
     }
 
-    providers.push(
-        probe_openai_compatible_endpoint(
+    for (id, provider_type, name, base_url) in [
+        (
             "lm-studio-1234",
             ProviderType::LmStudio,
             "LM Studio",
             "http://127.0.0.1:1234",
-        )
-        .await,
-    );
-    providers.push(
-        probe_openai_compatible_endpoint(
+        ),
+        (
             "lm-studio-1235",
             ProviderType::LmStudio,
             "LM Studio alternate",
             "http://127.0.0.1:1235",
-        )
-        .await,
-    );
+        ),
+        (
+            "sglang-30000",
+            ProviderType::SgLang,
+            "SGLang",
+            "http://127.0.0.1:30000",
+        ),
+    ] {
+        providers.push(probe_openai_compatible_endpoint(id, provider_type, name, base_url).await);
+    }
 
     let reachable_providers = providers
         .iter()
         .filter(|provider| provider.reachable)
         .count();
     let preferred_next_step = if reachable_providers == 0 {
-        "Start InferenceBridge managed llama.cpp, LM Studio, Ollama, or a standalone llama-server."
+        "Start InferenceBridge managed llama.cpp, an external OpenAI-compatible provider, Ollama, or a standalone llama-server."
             .to_string()
     } else if active_runtime.model.is_none() {
         "Select or load a model, then re-run doctor to confirm context and endpoint support."
@@ -258,10 +258,33 @@ pub async fn collect_runtime_doctor(state: SharedState) -> RuntimeDoctorReport {
     }
 }
 
+async fn probe_openai_provider_config(
+    provider: &crate::api::upstream::OpenAiProvider,
+    suffix: &str,
+) -> ProviderProbe {
+    let provider_type = provider_type_from_key(&provider.provider_type);
+    probe_openai_compatible_endpoint(
+        &format!("{}-{suffix}", provider.id.replace('_', "-")),
+        provider_type,
+        &format!("{} configured", provider.name),
+        &provider.base_url,
+    )
+    .await
+}
+
+fn provider_type_from_key(key: &str) -> ProviderType {
+    match key {
+        "lm_studio" => ProviderType::LmStudio,
+        "sglang" => ProviderType::SgLang,
+        _ => ProviderType::OpenAiCompatible,
+    }
+}
+
 async fn probe_managed_provider(
     port: Option<u16>,
     loaded_model: Option<String>,
     context_limit: Option<u32>,
+    launch_preview: Option<crate::engine::process::LaunchPreview>,
     has_binary: bool,
 ) -> ProviderProbe {
     let Some(port) = port else {
@@ -313,9 +336,9 @@ async fn probe_managed_provider(
     .await;
     probe.managed = true;
     if probe.models.is_empty() {
-        if let Some(id) = loaded_model {
+        if let Some(id) = loaded_model.as_deref() {
             probe.models.push(ProviderModelInfo {
-                id,
+                id: id.to_string(),
                 name: None,
                 context_limit,
                 output_limit: None,
@@ -326,7 +349,182 @@ async fn probe_managed_provider(
     if probe.context_limit.is_none() {
         probe.context_limit = context_limit;
     }
+    apply_managed_llamacpp_known_good_checks(
+        &mut probe,
+        loaded_model.as_deref(),
+        launch_preview.as_ref(),
+    );
     probe
+}
+
+fn apply_managed_llamacpp_known_good_checks(
+    probe: &mut ProviderProbe,
+    loaded_model: Option<&str>,
+    launch_preview: Option<&crate::engine::process::LaunchPreview>,
+) {
+    let mut warnings = Vec::new();
+    let mut checks = Vec::new();
+
+    let Some(preview) = launch_preview else {
+        if probe.reachable {
+            warnings.push("WARN: Managed llama.cpp is reachable but no launch preview is available, so template/context settings cannot be verified.".to_string());
+            mark_probe_warn(probe);
+        }
+        probe.hints.extend(warnings);
+        return;
+    };
+
+    let model_label = loaded_model
+        .or_else(|| {
+            std::path::Path::new(&preview.model_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+        })
+        .unwrap_or("");
+    let model_lower = model_label.to_ascii_lowercase();
+    let is_qwen = model_lower.contains("qwen");
+    let is_gemma = model_lower.contains("gemma");
+    let template_sensitive = is_qwen || is_gemma;
+
+    if let (Some(requested), Some(actual)) = (preview.context_size, probe.context_limit) {
+        if actual < requested {
+            warnings.push(format!(
+                "WARN: llama.cpp reports n_ctx={actual}, below requested context {requested}."
+            ));
+        } else {
+            checks.push(format!("OK: context loaded at n_ctx={actual}."));
+        }
+    } else if preview.context_size.is_some() && probe.context_limit.is_none() {
+        warnings.push(
+            "WARN: requested context is set, but /props did not report actual n_ctx.".to_string(),
+        );
+    }
+
+    if template_sensitive && !preview.use_jinja {
+        warnings.push(format!(
+            "WARN: {model_label} looks template-sensitive but launched without --jinja."
+        ));
+    } else if preview.use_jinja {
+        checks.push("OK: llama.cpp Jinja template mode is enabled.".to_string());
+    }
+
+    let template_source = preview
+        .template_source
+        .as_deref()
+        .or(preview.template_path.as_deref())
+        .or(preview.template_name.as_deref());
+    if preview.use_jinja && template_source.is_none() {
+        warnings.push(
+            "WARN: Jinja mode is enabled but Doctor cannot identify the active template source."
+                .to_string(),
+        );
+    } else if let Some(source) = template_source {
+        checks.push(format!("OK: template source is {source}."));
+    }
+
+    if is_qwen
+        && preview
+            .reasoning_mode
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+    {
+        warnings.push(
+            "WARN: Qwen model launched without an explicit llama.cpp --reasoning mode.".to_string(),
+        );
+    } else if let Some(reasoning) = preview.reasoning_mode.as_deref() {
+        if !reasoning.trim().is_empty() {
+            checks.push(format!("OK: reasoning mode is {reasoning}."));
+        }
+    }
+
+    if is_qwen
+        && preview.use_jinja
+        && preview
+            .chat_template_kwargs_json
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+    {
+        warnings.push(
+            "WARN: Qwen Jinja launch has no chat_template_kwargs_json; thinking/tool behavior may depend on template defaults."
+                .to_string(),
+        );
+    }
+
+    if is_qwen && preview.parallel_slots > 1 {
+        warnings.push(format!(
+            "WARN: Qwen tool reliability is usually best with one slot; launched with {} parallel slots.",
+            preview.parallel_slots
+        ));
+    } else {
+        checks.push(format!("OK: parallel slots = {}.", preview.parallel_slots));
+    }
+
+    if has_arg_value(&preview.args, "--cache-type-k", "q8_0")
+        && has_arg_value(&preview.args, "--cache-type-v", "q8_0")
+    {
+        checks.push("OK: KV cache uses q8_0 for keys and values.".to_string());
+    } else if preview
+        .args
+        .iter()
+        .any(|arg| arg == "--cache-type-k" || arg == "--cache-type-v")
+    {
+        warnings.push(
+            "WARN: KV cache quantization differs from the q8_0 24GB-friendly default.".to_string(),
+        );
+    }
+
+    if preview.args.iter().any(|arg| arg == "--kv-unified") {
+        checks.push("OK: unified KV cache is enabled.".to_string());
+    }
+
+    let flag_support = crate::engine::process::detect_llama_flag_support(Some(
+        std::path::Path::new(&preview.server_path),
+    ));
+    let unsupported_launch_flags =
+        crate::engine::process::unsupported_detected_launch_flags(&preview.args, &flag_support);
+    if !unsupported_launch_flags.is_empty() {
+        warnings.push(format!(
+            "WARN: installed llama-server help does not advertise launched flag(s): {}.",
+            unsupported_launch_flags.join(", ")
+        ));
+    } else if flag_support.checked {
+        checks.push(format!(
+            "OK: installed llama-server advertises all {} detected reliability flags used by this launch.",
+            preview
+                .args
+                .iter()
+                .filter(|arg| flag_support.supported_flags.iter().any(|flag| flag == *arg))
+                .count()
+        ));
+    } else if let Some(error) = flag_support.error {
+        warnings.push(format!("WARN: {error}."));
+    }
+
+    if warnings.is_empty() && probe.reachable {
+        probe.hints.push(
+            "Known-good check: managed llama.cpp launch settings match the current reliability expectations."
+                .to_string(),
+        );
+    } else if !warnings.is_empty() {
+        mark_probe_warn(probe);
+    }
+    probe.hints.extend(warnings);
+    probe.hints.extend(checks);
+}
+
+fn has_arg_value(args: &[String], flag: &str, expected: &str) -> bool {
+    args.windows(2)
+        .any(|pair| pair[0] == flag && pair[1].eq_ignore_ascii_case(expected))
+}
+
+fn mark_probe_warn(probe: &mut ProviderProbe) {
+    if probe.reachable {
+        probe.status = "warn".to_string();
+    }
 }
 
 async fn probe_llamacpp_endpoint(

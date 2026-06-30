@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect } from "react";
 import { listen } from "@tauri-apps/api/event";
-import type { ModelInfo, ProcessStatusInfo, LoadProgress } from "../lib/types";
+import type { ApiServerAction, ModelInfo, ProcessStatusInfo, LoadProgress } from "../lib/types";
 import * as api from "../lib/tauri";
 import type { LoadModelOptions } from "../lib/tauri";
 
@@ -11,6 +11,7 @@ interface ModelState {
   processStatus: ProcessStatusInfo | null;
   isLoading: boolean;
   loadProgress: LoadProgress | null;
+  apiAction: ApiServerAction;
   error: string | null;
 }
 
@@ -97,6 +98,7 @@ export function useModel() {
     processStatus: null,
     isLoading: false,
     loadProgress: null,
+    apiAction: null,
     error: null,
   });
 
@@ -299,11 +301,32 @@ export function useModel() {
 
   const setApiServerRunning = useCallback(
     async (running: boolean) => {
+      const apiAction: ApiServerAction = running ? "starting" : "stopping";
+      setState((s) => ({
+        ...s,
+        apiAction,
+        error: null,
+        processStatus: s.processStatus
+          ? {
+              ...s.processStatus,
+              api_state: running ? "Starting" : "Stopping",
+              api_error: null,
+              api_reachable: running ? s.processStatus.api_reachable : false,
+            }
+          : s.processStatus,
+      }));
       try {
         await api.setApiServerRunning(running);
         await refresh();
       } catch (err) {
+        try {
+          await refresh();
+        } catch {
+          // Preserve the original API action error below.
+        }
         setState((s) => ({ ...s, error: String(err) }));
+      } finally {
+        setState((s) => ({ ...s, apiAction: null }));
       }
     },
     [refresh]

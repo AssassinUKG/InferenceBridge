@@ -1,5 +1,5 @@
 use crate::engine::download;
-use crate::engine::process::LlamaProcess;
+use crate::engine::process::{detect_llama_flag_support, LlamaFlagSupport, LlamaProcess};
 use crate::engine::scheduler::RequestScheduler;
 use crate::state::SharedState;
 use serde::{Deserialize, Serialize};
@@ -36,6 +36,7 @@ pub struct AppSettings {
     pub ctxcp: Option<u32>,
     pub use_jinja: bool,
     pub reasoning_mode: String,
+    pub reasoning_preserve: bool,
     pub template_mode: String,
     pub template_name: Option<String>,
     pub custom_template_path: Option<String>,
@@ -58,6 +59,10 @@ pub struct AppSettings {
     pub lm_studio_enabled: bool,
     pub lm_studio_base_url: String,
     pub lm_studio_api_key: Option<String>,
+    pub sglang_enabled: bool,
+    pub sglang_base_url: String,
+    pub sglang_api_key: Option<String>,
+    pub hf_api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -66,6 +71,20 @@ pub struct ApiAccessInfo {
     pub loopback_url: String,
     pub lan_host: Option<String>,
     pub lan_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuntimePackInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub backend: String,
+    pub installed_version: Option<String>,
+    pub latest_version: Option<String>,
+    pub update_available: bool,
+    pub size_bytes: Option<u64>,
+    pub available: bool,
+    pub error: Option<String>,
 }
 
 #[tauri::command]
@@ -103,6 +122,7 @@ pub async fn get_settings(state: tauri::State<'_, SharedState>) -> Result<AppSet
         ctxcp: s.config.process.ctxcp,
         use_jinja: s.config.process.use_jinja,
         reasoning_mode: s.config.process.reasoning_mode.clone(),
+        reasoning_preserve: s.config.process.reasoning_preserve,
         template_mode: s.config.process.template_mode.clone(),
         template_name: s.config.process.template_name.clone(),
         custom_template_path: s.config.process.custom_template_path.clone(),
@@ -124,6 +144,10 @@ pub async fn get_settings(state: tauri::State<'_, SharedState>) -> Result<AppSet
         lm_studio_enabled: s.config.providers.lm_studio.enabled,
         lm_studio_base_url: s.config.providers.lm_studio.base_url.clone(),
         lm_studio_api_key: s.config.providers.lm_studio.api_key.clone(),
+        sglang_enabled: s.config.providers.sglang.enabled,
+        sglang_base_url: s.config.providers.sglang.base_url.clone(),
+        sglang_api_key: s.config.providers.sglang.api_key.clone(),
+        hf_api_key: s.config.hub.hf_api_key.clone(),
     })
 }
 
@@ -149,6 +173,13 @@ pub async fn get_api_access_info(
 }
 
 #[tauri::command]
+pub async fn get_config_file_path() -> Result<String, String> {
+    Ok(crate::config::AppConfig::config_file_path()
+        .to_string_lossy()
+        .to_string())
+}
+
+#[tauri::command]
 pub async fn update_settings(
     state: tauri::State<'_, SharedState>,
     settings: AppSettings,
@@ -158,6 +189,7 @@ pub async fn update_settings(
     let normalized_api_key = settings.api_key.clone().filter(|k| !k.trim().is_empty());
     let active_provider = match settings.active_provider.trim() {
         "lm_studio" if settings.lm_studio_enabled => "lm_studio".to_string(),
+        "sglang" if settings.sglang_enabled => "sglang".to_string(),
         _ => "managed_llamacpp".to_string(),
     };
     let lm_studio_base_url =
@@ -166,11 +198,32 @@ pub async fn update_settings(
         .lm_studio_api_key
         .clone()
         .filter(|key| !key.trim().is_empty());
-    let (should_restart_api, should_start_api, previous_host, previous_port, previous_api_key) = {
+    let sglang_base_url = crate::providers::normalize_openai_base_url(&settings.sglang_base_url);
+    let sglang_api_key = settings
+        .sglang_api_key
+        .clone()
+        .filter(|key| !key.trim().is_empty());
+    let hf_api_key = settings
+        .hf_api_key
+        .clone()
+        .filter(|key| !key.trim().is_empty());
+    let (
+        should_restart_api,
+        should_start_api,
+        previous_host,
+        previous_port,
+        previous_api_key,
+        previous_lm_studio_api_key,
+        previous_sglang_api_key,
+        previous_hf_api_key,
+    ) = {
         let mut s = shared.write().await;
         let previous_host = s.config.server.host.clone();
         let previous_port = s.config.server.port;
         let previous_api_key = s.config.server.api_key.clone();
+        let previous_lm_studio_api_key = s.config.providers.lm_studio.api_key.clone();
+        let previous_sglang_api_key = s.config.providers.sglang.api_key.clone();
+        let previous_hf_api_key = s.config.hub.hf_api_key.clone();
         let previous_autostart = s.config.server.autostart;
         let previous_api_state = s.api_server_state.clone();
 
@@ -214,6 +267,7 @@ pub async fn update_settings(
         s.config.process.ctxcp = settings.ctxcp.filter(|value| *value > 0);
         s.config.process.use_jinja = settings.use_jinja;
         s.config.process.reasoning_mode = settings.reasoning_mode.trim().to_string();
+        s.config.process.reasoning_preserve = settings.reasoning_preserve;
         s.config.process.template_mode = settings.template_mode.trim().to_lowercase();
         s.config.process.template_name = settings
             .template_name
@@ -266,6 +320,10 @@ pub async fn update_settings(
         s.config.providers.lm_studio.enabled = settings.lm_studio_enabled;
         s.config.providers.lm_studio.base_url = lm_studio_base_url.clone();
         s.config.providers.lm_studio.api_key = lm_studio_api_key.clone();
+        s.config.providers.sglang.enabled = settings.sglang_enabled;
+        s.config.providers.sglang.base_url = sglang_base_url.clone();
+        s.config.providers.sglang.api_key = sglang_api_key.clone();
+        s.config.hub.hf_api_key = hf_api_key.clone();
 
         // Persist to disk.
         s.config
@@ -285,6 +343,9 @@ pub async fn update_settings(
             previous_host,
             previous_port,
             previous_api_key,
+            previous_lm_studio_api_key,
+            previous_sglang_api_key,
+            previous_hf_api_key,
         )
     };
 
@@ -315,6 +376,9 @@ pub async fn update_settings(
         previous_host = %previous_host,
         previous_port,
         api_key_changed = previous_api_key != normalized_api_key,
+        lm_studio_api_key_changed = previous_lm_studio_api_key != lm_studio_api_key,
+        sglang_api_key_changed = previous_sglang_api_key != sglang_api_key,
+        hf_api_key_changed = previous_hf_api_key != hf_api_key,
         "Settings updated"
     );
     Ok(())
@@ -374,6 +438,8 @@ pub struct LlamaServerInfo {
     pub latest_version: Option<String>,
     /// Whether an update is available.
     pub update_available: bool,
+    /// llama-server CLI flag support detected from --help / -h.
+    pub flag_support: LlamaFlagSupport,
 }
 
 #[tauri::command]
@@ -382,6 +448,7 @@ pub async fn get_llama_info(
 ) -> Result<LlamaServerInfo, String> {
     let s = state.read().await;
     let binary_path = s.process.find_server_binary();
+    let flag_support = detect_llama_flag_support(binary_path.as_deref());
     let managed_dir = LlamaProcess::managed_binary_dir();
     let has_managed = managed_dir.join("llama-server.exe").exists();
     let version = download::current_version();
@@ -400,7 +467,61 @@ pub async fn get_llama_info(
         managed_dir: managed_dir.to_string_lossy().to_string(),
         latest_version,
         update_available,
+        flag_support,
     })
+}
+
+#[tauri::command]
+pub async fn list_runtime_packs() -> Result<Vec<RuntimePackInfo>, String> {
+    let installed_version = download::current_version();
+    let mut packs = Vec::new();
+
+    for (backend, name, description) in [
+        (
+            "cuda",
+            "CUDA llama.cpp (Windows)",
+            "NVIDIA CUDA accelerated llama.cpp engine",
+        ),
+        (
+            "cpu",
+            "CPU llama.cpp (Windows)",
+            "CPU-only llama.cpp engine",
+        ),
+    ] {
+        let pattern = download::asset_pattern_for(backend);
+        let result = download::find_release_asset(&pattern).await;
+        match result {
+            Ok((tag, _url, size)) => {
+                let update_available = installed_version.as_deref() != Some(tag.as_str());
+                packs.push(RuntimePackInfo {
+                    id: backend.to_string(),
+                    name: name.to_string(),
+                    description: description.to_string(),
+                    backend: backend.to_string(),
+                    installed_version: installed_version.clone(),
+                    latest_version: Some(tag),
+                    update_available,
+                    size_bytes: Some(size),
+                    available: true,
+                    error: None,
+                });
+            }
+            Err(error) => packs.push(RuntimePackInfo {
+                id: backend.to_string(),
+                name: name.to_string(),
+                description: description.to_string(),
+                backend: backend.to_string(),
+                installed_version: installed_version.clone(),
+                latest_version: None,
+                update_available: false,
+                size_bytes: None,
+                available: false,
+                error: Some(error.to_string()),
+            }),
+        }
+    }
+
+    Ok(packs)
 }
 
 /// Download a specific backend build of llama-server.
@@ -428,6 +549,27 @@ pub async fn download_llama_build(
         version = %tag,
         "Downloading llama-server build"
     );
+
+    let load_mutex = {
+        let s = state.read().await;
+        s.model_load_mutex.clone()
+    };
+    let _load_guard = load_mutex.lock().await;
+
+    let stopped_model =
+        crate::commands::model::stop_model_for_binary_update(state.inner().clone()).await?;
+    if let Some(model) = stopped_model {
+        let _ = app.emit(
+            "model-load-progress",
+            crate::state::LoadProgress {
+                stage: "downloading".to_string(),
+                message: format!("Stopped {model} before installing llama-server {tag}"),
+                progress: 0.02,
+                done: false,
+                error: None,
+            },
+        );
+    }
 
     let server_path = download::download_llama_server(&app, &url, &tag, size)
         .await

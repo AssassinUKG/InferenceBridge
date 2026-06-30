@@ -1,4 +1,7 @@
 use std::collections::VecDeque;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use chrono::Utc;
@@ -13,6 +16,7 @@ use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::{EnvFilter, Registry};
 
 const LOG_CAPACITY: usize = 2000;
+const LOG_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Serialize)]
 pub struct LogEntry {
@@ -24,6 +28,7 @@ pub struct LogEntry {
 
 struct LogBuffer {
     entries: Mutex<VecDeque<LogEntry>>,
+    file: Mutex<Option<File>>,
 }
 
 static LOG_BUFFER: OnceLock<LogBuffer> = OnceLock::new();
@@ -31,7 +36,52 @@ static LOG_BUFFER: OnceLock<LogBuffer> = OnceLock::new();
 fn buffer() -> &'static LogBuffer {
     LOG_BUFFER.get_or_init(|| LogBuffer {
         entries: Mutex::new(VecDeque::with_capacity(LOG_CAPACITY)),
+        file: Mutex::new(open_log_file()),
     })
+}
+
+pub fn log_dir() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("InferenceBridge")
+        .join("logs")
+}
+
+pub fn log_file_path() -> PathBuf {
+    log_dir().join("inference-bridge.log")
+}
+
+pub fn crash_report_path() -> PathBuf {
+    log_dir().join("last-llama-crash.log")
+}
+
+fn open_log_file() -> Option<File> {
+    let dir = log_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path = log_file_path();
+    if path
+        .metadata()
+        .map(|metadata| metadata.len() > LOG_FILE_MAX_BYTES)
+        .unwrap_or(false)
+    {
+        let rotated = dir.join("inference-bridge.previous.log");
+        let _ = std::fs::rename(&path, rotated);
+    }
+    OpenOptions::new().create(true).append(true).open(path).ok()
+}
+
+pub fn write_llama_crash_report(report: &str) -> Option<PathBuf> {
+    let path = crash_report_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(&path, report) {
+        Ok(_) => Some(path),
+        Err(error) => {
+            tracing::warn!(%error, path = %path.display(), "Failed to write llama crash report");
+            None
+        }
+    }
 }
 
 pub fn list(limit: usize) -> Vec<LogEntry> {
@@ -114,6 +164,22 @@ where
             guard.pop_front();
         }
         guard.push_back(entry);
+
+        if let Ok(mut file_guard) = log_buffer.file.lock() {
+            if file_guard.is_none() {
+                *file_guard = open_log_file();
+            }
+            if let Some(file) = file_guard.as_mut() {
+                let _ = writeln!(
+                    file,
+                    "{} [{}] {} {}",
+                    guard.back().map(|e| e.timestamp.as_str()).unwrap_or(""),
+                    guard.back().map(|e| e.level.as_str()).unwrap_or(""),
+                    guard.back().map(|e| e.target.as_str()).unwrap_or(""),
+                    guard.back().map(|e| e.message.as_str()).unwrap_or("")
+                );
+            }
+        }
     }
 }
 

@@ -13,7 +13,7 @@ use crate::engine::client::{
 use crate::engine::process::{LaunchPreview, ProcessState};
 use crate::engine::scheduler::RequestPermit;
 use crate::engine::streaming::{self, StreamEvent};
-use crate::models::profiles::{ModelProfile, ToolCallFormat};
+use crate::models::profiles::{ModelProfile, RendererType, ToolCallFormat};
 use crate::normalize::images::normalize_image_payload as normalize_image_payload_shared;
 use crate::normalize::think_strip::{
     extract_reasoning_content_with_style, strip_think_tags_with_style,
@@ -229,6 +229,7 @@ const CACHE_RAM_KEYS: &[&str] = &["cache_ram_mb", "cacheRamMb", "cache_ram", "ca
 const CTXCP_KEYS: &[&str] = &["ctxcp", "ctx_cp"];
 const JINJA_KEYS: &[&str] = &["use_jinja", "useJinja", "jinja"];
 const REASONING_MODE_KEYS: &[&str] = &["reasoning_mode", "reasoningMode"];
+const REASONING_PRESERVE_KEYS: &[&str] = &["reasoning_preserve", "reasoningPreserve"];
 const TEMPLATE_MODE_KEYS: &[&str] = &["template_mode", "templateMode"];
 const TEMPLATE_NAME_KEYS: &[&str] = &["template_name", "templateName", "chat_template"];
 const CUSTOM_TEMPLATE_PATH_KEYS: &[&str] = &[
@@ -414,6 +415,9 @@ pub(crate) fn extract_runtime_load_overrides(
         reasoning_mode: lookup(REASONING_MODE_KEYS)
             .as_ref()
             .and_then(parse_string_value),
+        reasoning_preserve: lookup(REASONING_PRESERVE_KEYS)
+            .as_ref()
+            .and_then(parse_bool_value),
         template_mode: lookup(TEMPLATE_MODE_KEYS)
             .as_ref()
             .and_then(parse_string_value),
@@ -443,6 +447,8 @@ pub(crate) fn extract_runtime_load_overrides(
         extra_args: lookup(EXTRA_ARGS_KEYS)
             .as_ref()
             .and_then(parse_string_array),
+        attach_mmproj: None,
+        force_reload: false,
     }
 }
 
@@ -454,6 +460,7 @@ fn has_runtime_load_overrides(overrides: &RuntimeLoadOverrides) -> bool {
         || overrides.ctxcp.is_some()
         || overrides.use_jinja.is_some()
         || overrides.reasoning_mode.is_some()
+        || overrides.reasoning_preserve.is_some()
         || overrides.template_mode.is_some()
         || overrides.template_name.is_some()
         || overrides.custom_template_path.is_some()
@@ -464,6 +471,8 @@ fn has_runtime_load_overrides(overrides: &RuntimeLoadOverrides) -> bool {
         || overrides.draft_max_tokens.is_some()
         || overrides.draft_min_tokens.is_some()
         || overrides.draft_p_min.is_some()
+        || overrides.attach_mmproj.is_some()
+        || overrides.force_reload
         || overrides
             .extra_args
             .as_ref()
@@ -789,6 +798,10 @@ fn api_overrides_match_preview(overrides: &RuntimeLoadOverrides, preview: &Launc
         && optional_override_matches(
             overrides.reasoning_mode.as_deref(),
             preview.reasoning_mode.as_deref(),
+        )
+        && optional_override_matches(
+            overrides.reasoning_preserve,
+            Some(preview.reasoning_preserve),
         )
         && optional_override_matches(
             overrides.template_mode.as_deref(),
@@ -1152,8 +1165,18 @@ pub(crate) async fn normalize_api_messages(
             }
         }
 
+        // Qwen models expect tool results inside a `user` turn (the training format uses
+        // <|im_start|>user\n<tool_response>...</tool_response>). The `tool` role has no
+        // special meaning in the ChatML renderer and would produce an unrecognised
+        // <|im_start|>tool token. Llama 3 uses its own `tool` header and is left as-is.
+        let effective_role =
+            if message.role == "tool" && profile.renderer_type == RendererType::QwenChat {
+                "user".to_string()
+            } else {
+                message.role.clone()
+            };
         normalized.push(crate::templates::engine::ChatMessage {
-            role: message.role.clone(),
+            role: effective_role,
             content: content_parts.join("\n"),
         });
     }
@@ -1337,7 +1360,7 @@ fn prepend_tool_schema_message(
             "If a tool is needed, reply with exactly one Gemma 4 native tool call and no prose:\n<|tool_call>call:TOOL_NAME{PARAM_NAME:<|\"|>VALUE<|\"|>}<tool_call|>"
         }
         ToolCallFormat::NativeApi => {
-            "If a tool is needed, reply using the tool-calling format appropriate for your model family."
+            "If a tool is needed, reply with a Hermes-style JSON tool call wrapped in <tool_call> tags and no prose:\n<tool_call>{\"name\":\"TOOL_NAME\",\"arguments\":{\"PARAM_NAME\":\"VALUE\"}}</tool_call>"
         }
     };
     let schema_guidance =
@@ -1703,6 +1726,7 @@ pub(crate) async fn build_chat_request(
     let requested_top_k = req.requested_top_k();
     let thinking_disabled = req.requested_thinking_disabled();
     let (mut messages, image_data) = normalize_api_messages(&req.messages, profile).await?;
+    let has_tools = req.tools.as_ref().map_or(false, |t| !t.is_empty());
     prepend_tool_schema_message(&mut messages, profile, req.tools.as_ref());
     prepend_reasoning_guidance_message(
         &mut messages,
@@ -1726,7 +1750,9 @@ pub(crate) async fn build_chat_request(
 
     Ok((
         CompletionRequest {
-            prompt: crate::templates::engine::render_prompt(&messages, profile),
+            prompt: crate::templates::engine::render_prompt_with_tools(
+                &messages, profile, has_tools,
+            ),
             n_predict,
             temperature: req
                 .temperature
@@ -2859,6 +2885,7 @@ mod tests {
             ctxcp: None,
             use_jinja: false,
             reasoning_mode: None,
+            reasoning_preserve: false,
             template_mode: String::new(),
             template_source: None,
             template_path: None,

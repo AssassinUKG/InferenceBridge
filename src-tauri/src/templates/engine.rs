@@ -7,18 +7,26 @@ pub struct ChatMessage {
 }
 
 pub fn render_prompt(messages: &[ChatMessage], profile: &ModelProfile) -> String {
+    render_prompt_with_tools(messages, profile, false)
+}
+
+pub fn render_prompt_with_tools(
+    messages: &[ChatMessage],
+    profile: &ModelProfile,
+    has_tools: bool,
+) -> String {
     let rendered = match profile.renderer_type {
-        RendererType::ChatML => render_chatml(messages, profile),
-        RendererType::QwenChat => render_qwen_chat(messages, profile),
+        RendererType::ChatML => render_chatml(messages),
+        RendererType::QwenChat => render_chatml(messages),
         RendererType::Llama3Chat => render_llama3_chat(messages),
         RendererType::GemmaChat => render_gemma_chat(messages),
         RendererType::Gemma4Chat => render_gemma4_chat(messages),
     };
 
-    super::patches::apply_patches(&rendered, profile)
+    super::patches::apply_patches(&rendered, profile, has_tools)
 }
 
-fn render_chatml(messages: &[ChatMessage], profile: &ModelProfile) -> String {
+fn render_chatml(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
     for msg in messages {
         prompt.push_str(&format!(
@@ -26,22 +34,8 @@ fn render_chatml(messages: &[ChatMessage], profile: &ModelProfile) -> String {
             msg.role, msg.content
         ));
     }
-
-    if let Some(suffix) = profile.think_guidance_suffix() {
-        if let Some(pos) = prompt.rfind("<|im_start|>system\n") {
-            if let Some(end) = prompt[pos..].find("<|im_end|>") {
-                let insert_pos = pos + end;
-                prompt.insert_str(insert_pos, suffix);
-            }
-        }
-    }
-
     prompt.push_str("<|im_start|>assistant\n");
     prompt
-}
-
-fn render_qwen_chat(messages: &[ChatMessage], profile: &ModelProfile) -> String {
-    render_chatml(messages, profile)
 }
 
 fn render_llama3_chat(messages: &[ChatMessage]) -> String {

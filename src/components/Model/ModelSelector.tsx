@@ -1,5 +1,6 @@
 ﻿import { useEffect, useState, type ReactNode } from "react";
 import type {
+  ApiServerAction,
   AppSettings,
   LoadProgress,
   ModelInfo,
@@ -23,6 +24,7 @@ interface Props {
   onUnload: () => void;
   onSwap: (modelName?: string, options?: LoadModelOptions) => void;
   onSetApiServerRunning: (running: boolean) => void;
+  apiAction?: ApiServerAction;
   onScan: () => void;
   onOpenSettings: () => void;
 }
@@ -356,6 +358,7 @@ export function ModelSelector({
   onUnload,
   onSwap,
   onSetApiServerRunning,
+  apiAction = null,
   onScan,
   onOpenSettings,
 }: Props) {
@@ -368,14 +371,38 @@ export function ModelSelector({
   const [quantFilter, setQuantFilter] = useState("");
   const [copied, setCopied] = useState(false);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [sidecarSyncing, setSidecarSyncing] = useState(false);
+  const [sidecarSyncingModel, setSidecarSyncingModel] = useState<string | null>(null);
+  const [sidecarSyncMessage, setSidecarSyncMessage] = useState<string | null>(null);
+  const [sidecarStatuses, setSidecarStatuses] = useState<Record<string, api.HfSidecarCacheStatus>>({});
   const serverUrl = buildServerUrl(settings);
   const gpuStats = useGpuStats();
+  const modelFingerprint = models.map((model) => model.filename).join("\n");
 
   useEffect(() => {
     if (!copied) return;
     const t = window.setTimeout(() => setCopied(false), 1500);
     return () => window.clearTimeout(t);
   }, [copied]);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (models.length === 0) {
+      setSidecarStatuses({});
+      return;
+    }
+    void api.getHfSidecarCacheStatus()
+      .then((statuses) => {
+        if (cancelled) return;
+        setSidecarStatuses(Object.fromEntries(statuses.map((status) => [status.filename, status])));
+      })
+      .catch(() => {
+        if (!cancelled) setSidecarStatuses({});
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [models.length, modelFingerprint]);
 
   const filteredModels = models.filter((m) => {
     const q = query.trim().toLowerCase();
@@ -454,9 +481,54 @@ export function ModelSelector({
     }
   };
 
+  const handleSyncSidecars = async () => {
+    if (sidecarSyncing) return;
+    setSidecarSyncing(true);
+    setSidecarSyncMessage(null);
+    try {
+      const localModelNames = models
+        .filter((model) => model.provider_managed && model.hf_repo)
+        .map((model) => model.filename);
+      const summary = await api.syncHfSidecarCache(localModelNames);
+      const tokenHint = summary.hf_token_configured ? "HF token used" : "public access";
+      setSidecarSyncMessage(
+        `HF sidecars synced: ${summary.files_cached} cached, ${summary.files_skipped} skipped, ${summary.files_failed} failed across ${summary.repos_checked} repos (${tokenHint}).`
+      );
+      const statuses = await api.getHfSidecarCacheStatus();
+      setSidecarStatuses(Object.fromEntries(statuses.map((status) => [status.filename, status])));
+    } catch (error) {
+      setSidecarSyncMessage(`HF sidecar sync failed: ${String(error)}`);
+    } finally {
+      setSidecarSyncing(false);
+    }
+  };
+
+  const handleSyncModelSidecars = async (model: ModelInfo) => {
+    if (sidecarSyncingModel || !model.hf_repo) return;
+    setSidecarSyncingModel(model.filename);
+    setSidecarSyncMessage(null);
+    try {
+      const summary = await api.syncHfSidecarCache([model.filename]);
+      const failed = summary.files_failed > 0 ? `, ${summary.files_failed} failed` : "";
+      setSidecarSyncMessage(
+        `${shortModelName(model)} HF files synced: ${summary.files_cached} cached, ${summary.files_skipped} skipped${failed}.`
+      );
+      const statuses = await api.getHfSidecarCacheStatus();
+      setSidecarStatuses(Object.fromEntries(statuses.map((status) => [status.filename, status])));
+    } catch (error) {
+      setSidecarSyncMessage(`HF sidecar sync failed for ${shortModelName(model)}: ${String(error)}`);
+    } finally {
+      setSidecarSyncingModel(null);
+    }
+  };
+
   const state = processStatus?.state ?? "Idle";
   const apiState = processStatus?.api_state ?? "Idle";
-  const apiRunning = apiState === "Running" || apiState === "Starting";
+  const apiStopping = apiAction === "stopping" || apiState === "Stopping";
+  const apiStarting = apiAction === "starting" || apiState === "Starting";
+  const apiRunning = apiState === "Running" || apiStarting || apiStopping || !!processStatus?.api_reachable;
+  const apiBusy = apiStarting || apiStopping;
+  const apiButtonState = apiStopping ? "Stopping..." : apiStarting ? "Starting..." : apiRunning ? apiState === "Running" ? "Running" : "On" : "Off";
 
   return (
     <div className="flex h-full min-h-0 overflow-hidden" style={{ background: "var(--bg)" }}>
@@ -470,8 +542,10 @@ export function ModelSelector({
                 onClick={() => setFilter(key)}
                 className="flex w-full items-center justify-between rounded-md px-3 py-2 text-left text-sm transition"
                 style={{
-                  background: filter === key ? "rgba(99,102,241,0.55)" : "transparent",
-                  color: filter === key ? "#fff" : "var(--text-1)",
+                  background: filter === key ? "rgba(99,102,241,0.16)" : "transparent",
+                  color: filter === key ? "var(--text-0)" : "var(--text-1)",
+                  fontWeight: filter === key ? 600 : 400,
+                  boxShadow: filter === key ? "inset 2px 0 0 #6366f1" : "none",
                   border: "none",
                   cursor: "pointer",
                 }}
@@ -492,13 +566,9 @@ export function ModelSelector({
             ))}
           </div>
         </div>
-        <div className="absolute bottom-0 hidden w-[172px] border-t px-4 py-3 text-xs md:block" style={{ borderColor: "var(--border)", color: "var(--text-2)" }}>
-          {models.length} local models<br />
-          {localDiskGb.toFixed(2)} GB on disk
-        </div>
       </aside>
 
-      <section className="flex min-w-0 flex-1 flex-col border-r" style={{ borderColor: "var(--border)" }}>
+      <section className="flex min-h-0 min-w-0 flex-1 flex-col border-r" style={{ borderColor: "var(--border)" }}>
         <div className="flex h-11 shrink-0 items-center gap-2 border-b px-4" style={{ borderColor: "var(--border)", background: "var(--surface-1)" }}>
           <h2 className="text-sm font-semibold" style={{ color: "var(--text-0)" }}>My Models</h2>
           <div className="ml-auto flex min-w-0 items-center gap-2">
@@ -517,6 +587,14 @@ export function ModelSelector({
             </label>
             <ToolBtn onClick={onOpenSettings} icon={<GearIcon />} label="Settings" />
             <button
+              onClick={() => void handleSyncSidecars()}
+              disabled={sidecarSyncing || models.length === 0}
+              className="rounded-md px-3 py-1.5 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-50"
+              style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "#22d3ee" }}
+            >
+              {sidecarSyncing ? "Syncing..." : "Sync HF files"}
+            </button>
+            <button
               onClick={onScan}
               disabled={isLoading}
               className="flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-50"
@@ -530,9 +608,24 @@ export function ModelSelector({
 
         {(error || loadProgress) && (
           <div className="shrink-0 border-b" style={{ borderColor: "var(--border)" }}>
-            {error && <div className="px-4 py-2 text-sm" style={{ background: "rgba(239,68,68,0.08)", color: "#fca5a5" }}>{error}</div>}
+            {error && (
+              <>
+                <div className="px-4 py-2 text-sm" style={{ background: "rgba(239,68,68,0.08)", color: "#fca5a5" }}>{error}</div>
+                <LoadErrorHint message={error} />
+              </>
+            )}
             {loadProgress && !loadProgress.done && <LoadingBar progress={loadProgress} />}
-            {loadProgress?.error && <div className="px-4 py-2 text-sm" style={{ background: "rgba(239,68,68,0.08)", color: "#fca5a5" }}>{loadProgress.error}</div>}
+            {loadProgress?.error && (
+              <>
+                <div className="px-4 py-2 text-sm" style={{ background: "rgba(239,68,68,0.08)", color: "#fca5a5" }}>{loadProgress.error}</div>
+                <LoadErrorHint message={loadProgress.error} />
+              </>
+            )}
+          </div>
+        )}
+        {sidecarSyncMessage && (
+          <div className="shrink-0 border-b px-4 py-2 text-xs" style={{ borderColor: "var(--border)", background: "rgba(34,211,238,0.07)", color: "#67e8f9" }}>
+            {sidecarSyncMessage} Only small allowlisted template/config files are fetched; model weights are blocked.
           </div>
         )}
 
@@ -568,11 +661,11 @@ export function ModelSelector({
 
         <div className="min-h-0 flex-1 overflow-y-auto">
           {models.length === 0 ? (
-            <EmptyMsg title="No models discovered yet" body="Set model directories in Settings then scan to populate the library." />
+            <EmptyMsg fill title="No models discovered yet" body="Set model directories in Settings then scan to populate the library." />
           ) : filter === "loaded" && !activeModel ? (
-            <EmptyMsg title="No model loaded" body="Load a model to see it here." />
+            <EmptyMsg fill title="No model loaded" body="Load a model to see it here." />
           ) : filteredModels.length === 0 ? (
-            <EmptyMsg title="No matches" body="Clear the search or change the capability filter." />
+            <EmptyMsg fill title="No matches" body="Clear the search or change the capability filter." />
           ) : (
             filteredModels.map((m) => (
               <DenseModelRow
@@ -582,9 +675,12 @@ export function ModelSelector({
                 loaded={m.filename === loadedModel}
                 isLoading={isLoading}
                 showSwap={!!loadedModel && m.filename !== loadedModel}
+                sidecarStatus={sidecarStatuses[m.filename]}
+                sidecarSyncing={sidecarSyncingModel === m.filename}
                 onSelect={() => setSelectedPath(m.path)}
                 onLoad={() => onLoad(m.filename)}
                 onSwap={() => onSwap(m.filename)}
+                onSyncSidecars={() => void handleSyncModelSidecars(m)}
               />
             ))
           )}
@@ -596,17 +692,24 @@ export function ModelSelector({
         </div>
       </section>
 
-      <aside className="flex w-[360px] shrink-0 flex-col" style={{ background: "var(--surface-1)" }}>
+      <aside className="flex min-h-0 w-[360px] shrink-0 flex-col" style={{ background: "var(--surface-1)" }}>
         <div className="border-b px-4 py-3" style={{ borderColor: "var(--border)" }}>
           <div className="flex items-center gap-2">
             <StatusPill state={state} />
             <button
               onClick={() => onSetApiServerRunning(!apiRunning)}
+              disabled={apiBusy}
               className="ml-auto flex items-center gap-2 rounded-md px-3 py-1.5 text-xs transition"
-              style={{ background: "var(--surface-2)", color: "var(--text-0)", border: "1px solid var(--border)" }}
+              style={{
+                background: "var(--surface-2)",
+                color: "var(--text-0)",
+                border: "1px solid var(--border)",
+                cursor: apiBusy ? "wait" : "pointer",
+                opacity: apiBusy ? 0.7 : 1,
+              }}
             >
               <span>Serve</span>
-              <span style={{ color: apiRunning ? "#34d399" : "var(--text-1)", fontWeight: 600 }}>{apiRunning ? apiState : "Off"}</span>
+              <span style={{ color: apiRunning ? "#34d399" : "var(--text-1)", fontWeight: 600 }}>{apiButtonState}</span>
             </button>
             <ToolBtn onClick={handleCopyUrl} icon={<CopyIcon />} label={copied ? "Copied!" : "URL"} />
           </div>
@@ -622,11 +725,14 @@ export function ModelSelector({
           loadedModel={loadedModel}
           previousModel={previousModel}
           processStatus={processStatus}
+          sidecarStatus={selectedModel ? sidecarStatuses[selectedModel.filename] : undefined}
+          sidecarSyncing={selectedModel ? sidecarSyncingModel === selectedModel.filename : false}
           isLoading={isLoading}
           onLoad={onLoad}
           onSwap={onSwap}
           onUnload={onUnload}
           onSwapBack={() => onSwap()}
+          onSyncSidecars={(model) => void handleSyncModelSidecars(model)}
         />
       </aside>
     </div>
@@ -652,24 +758,36 @@ function shortModelName(model: ModelInfo) {
   return model.hf_repo ?? model.filename.replace(/\.gguf$/i, "");
 }
 
+function hfCacheSummary(status: api.HfSidecarCacheStatus | undefined) {
+  if (!status?.repo_id) return "No HF repo";
+  const template = status.template_cached ? "template cached" : "template missing";
+  return `${template}, ${status.sidecar_cached_count}/${status.sidecar_expected_count} sidecars`;
+}
+
 function DenseModelRow({
   model,
   selected,
   loaded,
   isLoading,
   showSwap,
+  sidecarStatus,
+  sidecarSyncing,
   onSelect,
   onLoad,
   onSwap,
+  onSyncSidecars,
 }: {
   model: ModelInfo;
   selected: boolean;
   loaded: boolean;
   isLoading: boolean;
   showSwap: boolean;
+  sidecarStatus?: api.HfSidecarCacheStatus;
+  sidecarSyncing: boolean;
   onSelect: () => void;
   onLoad: () => void;
   onSwap: () => void;
+  onSyncSidecars: () => void;
 }) {
   return (
     <div
@@ -677,24 +795,25 @@ function DenseModelRow({
       className="grid min-h-[45px] grid-cols-[120px_110px_minmax(220px,1fr)_130px_88px_116px] items-center border-b px-5 text-xs transition"
       style={{
         borderColor: "var(--border)",
-        background: selected ? "rgba(79,70,229,0.58)" : loaded ? "rgba(34,211,238,0.08)" : "transparent",
-        color: selected ? "#fff" : "var(--text-1)",
+        background: selected ? "rgba(99,102,241,0.14)" : loaded ? "rgba(34,211,238,0.08)" : "transparent",
+        color: "var(--text-1)",
+        boxShadow: selected ? "inset 3px 0 0 #6366f1" : loaded ? "inset 2px 0 0 rgba(34,211,238,0.5)" : "none",
         cursor: "pointer",
       }}
     >
       <div className="min-w-0">
-        <span className="rounded px-1.5 py-0.5 font-mono text-[10px]" style={{ border: "1px solid rgba(255,255,255,0.22)", color: selected ? "#fff" : "var(--text-0)" }}>
+        <span className="rounded px-1.5 py-0.5 font-mono text-[10px]" style={{ border: "1px solid var(--border)", color: "var(--text-0)" }}>
           {model.family || model.gguf_architecture || "gguf"}
         </span>
       </div>
       <div>
-        <span className="rounded px-1.5 py-0.5 font-mono text-[10px]" style={{ border: "1px solid var(--border)", color: selected ? "#fff" : "var(--text-0)" }}>
+        <span className="rounded px-1.5 py-0.5 font-mono text-[10px]" style={{ border: "1px solid var(--border)", color: "var(--text-0)" }}>
           {modelParamsLabel(model)}
         </span>
       </div>
       <div className="min-w-0">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="truncate font-mono text-xs font-semibold" style={{ color: selected ? "#fff" : "var(--text-0)" }}>
+          <span className="truncate font-mono text-xs font-semibold" style={{ color: "var(--text-0)" }}>
             {shortModelName(model)}
           </span>
           {loaded && <span className="h-2 w-2 shrink-0 rounded-full bg-emerald-400" />}
@@ -703,17 +822,34 @@ function DenseModelRow({
           {model.supports_reasoning && <MiniCap label="Reasoning" tone="#facc15" />}
           {model.supports_tools && <MiniCap label="Tools" tone="#34d399" />}
           {model.supports_vision && <MiniCap label="Vision" tone="#c4b5fd" />}
-          {formatContext(model.context_window, model.max_context_window) && <span className="text-[10px]" style={{ color: selected ? "rgba(255,255,255,0.72)" : "var(--text-2)" }}>{formatContext(model.context_window, model.max_context_window)}</span>}
+          {sidecarStatus?.repo_id && (
+            <MiniCap
+              label={sidecarStatus.template_cached ? `HF ${sidecarStatus.sidecar_cached_count}/${sidecarStatus.sidecar_expected_count}` : "HF missing"}
+              tone={sidecarStatus.template_cached ? "#67e8f9" : "#94a3b8"}
+            />
+          )}
+          {formatContext(model.context_window, model.max_context_window) && <span className="text-[10px]" style={{ color: "var(--text-2)" }}>{formatContext(model.context_window, model.max_context_window)}</span>}
         </div>
       </div>
       <span className="truncate font-mono text-[11px]" title={modelPublisher(model)}>{modelPublisher(model)}</span>
-      <span className="font-mono text-[11px]" style={{ color: selected ? "#fff" : "#fbbf24" }}>{model.quant ?? "-"}</span>
+      <span className="font-mono text-[11px]" style={{ color: "#fbbf24" }}>{model.quant ?? "-"}</span>
       <div className="flex justify-end gap-1.5">
+        {model.hf_repo && (
+          <button
+            onClick={(e) => { e.stopPropagation(); onSyncSidecars(); }}
+            disabled={isLoading || sidecarSyncing}
+            className="rounded-md px-2 py-1 text-[11px] font-semibold disabled:opacity-45"
+            title={hfCacheSummary(sidecarStatus)}
+            style={{ background: "var(--surface-2)", color: "#67e8f9", border: "1px solid var(--border)" }}
+          >
+            {sidecarSyncing ? "..." : "HF"}
+          </button>
+        )}
         <button
           onClick={(e) => { e.stopPropagation(); showSwap ? onSwap() : onLoad(); }}
           disabled={isLoading || !model.provider_managed || loaded}
           className="rounded-md px-2 py-1 text-[11px] font-semibold disabled:opacity-45"
-          style={{ background: selected ? "rgba(255,255,255,0.16)" : "#22d3ee", color: selected ? "#fff" : "#061014", border: "none" }}
+          style={{ background: "#22d3ee", color: "#061014", border: "none" }}
         >
           {loaded ? "Loaded" : showSwap ? "Swap" : "Load"}
         </button>
@@ -727,21 +863,27 @@ function ModelInspector({
   loadedModel,
   previousModel,
   processStatus,
+  sidecarStatus,
+  sidecarSyncing,
   isLoading,
   onLoad,
   onSwap,
   onUnload,
   onSwapBack,
+  onSyncSidecars,
 }: {
   model: ModelInfo | null;
   loadedModel: string | null;
   previousModel: string | null;
   processStatus: ProcessStatusInfo | null;
+  sidecarStatus?: api.HfSidecarCacheStatus;
+  sidecarSyncing: boolean;
   isLoading: boolean;
   onLoad: (modelName: string, options?: LoadModelOptions) => void;
   onSwap: (modelName: string, options?: LoadModelOptions) => void;
   onUnload: () => void;
   onSwapBack: () => void;
+  onSyncSidecars: (model: ModelInfo) => void;
 }) {
   const [activeInspectorTab, setActiveInspectorTab] = useState<"info" | "load" | "inference">("info");
   const defaultContext = model?.context_window ?? model?.max_context_window ?? 8192;
@@ -794,7 +936,11 @@ function ModelInspector({
   };
 
   if (!model) {
-    return <EmptyMsg title="No model selected" body="Select a model to inspect details and launch controls." />;
+    return (
+      <div className="min-h-0 flex-1">
+        <EmptyMsg fill title="No model selected" body="Select a model to inspect details and launch controls." />
+      </div>
+    );
   }
 
   const kvBytesPerToken =
@@ -844,6 +990,7 @@ function ModelInspector({
     specDraftNMax,
     extraArgs: mergedExtraArgs,
   };
+  const canOpenHfCache = !!(sidecarStatus?.sidecar_cache_dir || sidecarStatus?.template_cache_path);
 
   return (
     <div className="min-h-0 flex-1 overflow-y-auto">
@@ -858,6 +1005,11 @@ function ModelInspector({
         <div className="mt-3 grid grid-cols-2 gap-2">
           <ActionBtn label={loaded ? "Unload Model" : "Load Model"} disabled={isLoading || !model.provider_managed} variant={loaded ? "ghost" : "primary"} onClick={() => loaded ? onUnload() : onLoad(model.filename, loadOptions)} />
           <ActionBtn label="Swap In" disabled={isLoading || loaded || !loadedModel || !model.provider_managed} variant="indigo" onClick={() => onSwap(model.filename, loadOptions)} />
+          <ActionBtn label={sidecarSyncing ? "Syncing HF..." : "Sync HF Files"} disabled={isLoading || sidecarSyncing || !model.hf_repo} variant="ghost" onClick={() => onSyncSidecars(model)} />
+          <ActionBtn label="Open HF Cache" disabled={!canOpenHfCache} variant="ghost" onClick={() => {
+            const path = sidecarStatus?.sidecar_cache_dir || sidecarStatus?.template_cache_path;
+            if (path) void api.showInFolder(path);
+          }} />
           {previousModel && previousModel !== model.filename && (
             <button
               onClick={onSwapBack}
@@ -912,6 +1064,8 @@ function ModelInspector({
           <InfoRow label="Context" value={liveContext ? `${fmtNum(liveContext)} live` : model.max_context_window ? `${fmtNum(model.max_context_window)} tokens` : "-"} />
           <InfoRow label="Size on disk" value={model.size_gb ? `${model.size_gb.toFixed(2)} GB` : "-"} />
           <InfoRow label="Provider" value={model.provider_name} />
+          <InfoRow label="HF Repo" value={sidecarStatus?.repo_id ?? model.hf_repo ?? "-"} />
+          <InfoRow label="HF Cache" value={hfCacheSummary(sidecarStatus)} />
         </section>
       )}
 
@@ -922,6 +1076,8 @@ function ModelInspector({
           <InfoRow label="Context" value={launchPreview?.context_size ? `${fmtNum(launchPreview.context_size)} tokens` : model.max_context_window ? `${fmtNum(model.max_context_window)} max` : "Model default"} />
           <InfoRow label="Template" value={launchPreview?.template_source ?? model.template_source ?? model.template_mode ?? "-"} />
           <InfoRow label="Chat Template" value={model.has_chat_template ? "Embedded (uses --jinja)" : "Built-in fallback"} />
+          <InfoRow label="Template Cache" value={sidecarStatus?.template_cached ? "Cached locally" : sidecarStatus?.repo_id ? "Missing locally" : "No HF repo"} />
+          <InfoRow label="HF Sidecars" value={sidecarStatus?.repo_id ? `${sidecarStatus.sidecar_cached_count}/${sidecarStatus.sidecar_expected_count} cached` : "-"} />
           <InfoRow label="MMProj" value={launchPreview?.mmproj_path ? "Attached" : model.supports_vision ? "Not attached" : "Not required"} />
           <InfoRow label="Draft" value={launchPreview?.draft_model_path ? "Enabled" : "Disabled"} />
           {launchPreview?.draft_model_path && (
@@ -1236,6 +1392,28 @@ function LoadingBar({ progress }: { progress: LoadProgress }) {
           }}
         />
       </div>
+    </div>
+  );
+}
+
+function LoadErrorHint({ message }: { message: string }) {
+  const lower = message.toLowerCase();
+  let hint: string | null = null;
+  if (lower.includes("chat_template.jinja") && lower.includes("404")) {
+    hint = "That repo does not expose a standalone chat_template.jinja. InferenceBridge will fall back to the embedded GGUF template when available.";
+  } else if (
+    lower.includes("huggingface.co") &&
+    (lower.includes("401") || lower.includes("403") || lower.includes("unauthorized") || lower.includes("forbidden"))
+  ) {
+    hint = "This Hugging Face repo may be gated or private. Add an HF access token in Settings > Hugging Face, then retry.";
+  } else if (lower.includes("template")) {
+    hint = "Try Template: builtin with Jinja enabled, or add an HF token if the template lives in a gated repo.";
+  }
+
+  if (!hint) return null;
+  return (
+    <div className="px-4 pb-2 text-xs" style={{ background: "rgba(239,68,68,0.08)", color: "#fecaca" }}>
+      {hint}
     </div>
   );
 }
@@ -1944,9 +2122,9 @@ function ModelRow({
 
 // Empty state
 
-function EmptyMsg({ title, body }: { title: string; body: string }) {
+function EmptyMsg({ title, body, fill = false }: { title: string; body: string; fill?: boolean }) {
   return (
-    <div className="px-4 py-12 text-center">
+    <div className={fill ? "flex h-full min-h-0 flex-col items-center justify-center px-4 py-8 text-center" : "px-4 py-12 text-center"}>
       <p className="text-sm font-medium" style={{ color: "var(--text-0)" }}>
         {title}
       </p>

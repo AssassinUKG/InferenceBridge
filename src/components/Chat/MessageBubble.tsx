@@ -80,6 +80,7 @@ function ThinkBlock({ text }: { text: string }) {
 
 export function MessageBubble({ message }: Props) {
   const isUser = message.role === "user";
+  const isSystem = message.role === "system";
   const content = message.content ?? "";
   const imageSrc =
     message.image_base64 ??
@@ -100,17 +101,27 @@ export function MessageBubble({ message }: Props) {
     .join("")
     .trim();
 
-  return (
-    <div className={`group flex gap-3 px-4 py-3 ${isUser ? "" : "bg-gray-800/30"}`}>
-      <div
-        className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs ${
-          isUser ? "bg-blue-600/30 text-blue-300" : "bg-purple-600/30 text-purple-300"
-        }`}
-      >
-        {isUser ? "U" : "AI"}
-      </div>
+  const roleLabel = isSystem ? "SYSTEM" : isUser ? "USER" : "ASSISTANT";
 
-      <div className="min-w-0 flex-1">
+  return (
+    <div className={`group flex min-w-0 gap-3 px-4 py-3 ${isUser ? "" : isSystem ? "bg-gray-950/20" : "bg-gray-800/30"}`}>
+      {!isSystem && (
+        <div
+          className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs ${
+            isUser ? "bg-blue-600/30 text-blue-300" : "bg-purple-600/30 text-purple-300"
+          }`}
+        >
+          {isUser ? "U" : "AI"}
+        </div>
+      )}
+
+      <div className="min-w-0 flex-1 overflow-visible">
+        <div
+          className="mb-1 text-[11px] font-semibold uppercase tracking-[0.14em]"
+          style={{ color: isSystem ? "#f87171" : isUser ? "#60a5fa" : "#34d399" }}
+        >
+          {roleLabel}
+        </div>
         {hasImage && (
           <img
             src={imageSrc ?? undefined}
@@ -130,7 +141,7 @@ export function MessageBubble({ message }: Props) {
             )}
           </div>
         ) : textContent && isUser ? (
-          <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-gray-300">
+          <p className="min-w-0 whitespace-pre-wrap break-words text-sm leading-relaxed text-gray-300">
             {textContent}
           </p>
         ) : textContent ? (

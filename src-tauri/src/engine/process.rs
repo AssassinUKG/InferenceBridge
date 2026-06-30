@@ -22,6 +22,154 @@ fn system_command(program: &str) -> std::process::Command {
     cmd
 }
 
+fn binary_command(program: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    cmd
+}
+
+pub const LLAMA_FLAG_DETECTION_TARGETS: &[&str] = &[
+    "--jinja",
+    "--reasoning",
+    "--reasoning-preserve",
+    "--chat-template",
+    "--chat-template-file",
+    "--chat-template-kwargs",
+    "--parallel",
+    "--slots",
+    "--ctx-size",
+    "--mmproj",
+    "--fit",
+    "--cache-ram",
+    "-ctxcp",
+    "--flash-attn",
+    "--cont-batching",
+    "--cache-type-k",
+    "--cache-type-v",
+    "--kv-unified",
+    "--no-warmup",
+    "--ctx-shift",
+    "--tensor-split",
+    "-md",
+    "--spec-type",
+    "--spec-draft-n-max",
+    "--draft-max",
+    "--draft-min",
+    "--draft-p-min",
+];
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LlamaFlagSupport {
+    pub checked: bool,
+    pub binary_path: Option<String>,
+    pub supported_flags: Vec<String>,
+    pub missing_critical_flags: Vec<String>,
+    pub error: Option<String>,
+}
+
+pub fn detect_llama_flag_support(binary_path: Option<&Path>) -> LlamaFlagSupport {
+    let Some(binary_path) = binary_path else {
+        return LlamaFlagSupport {
+            checked: false,
+            binary_path: None,
+            supported_flags: Vec::new(),
+            missing_critical_flags: LLAMA_FLAG_DETECTION_TARGETS
+                .iter()
+                .map(|flag| (*flag).to_string())
+                .collect(),
+            error: Some("llama-server binary not found".to_string()),
+        };
+    };
+
+    let mut last_error = None;
+    let help_text = ["--help", "-h"].into_iter().find_map(|help_arg| {
+        match binary_command(binary_path).arg(help_arg).output() {
+            Ok(output)
+                if output.status.success()
+                    || !output.stdout.is_empty()
+                    || !output.stderr.is_empty() =>
+            {
+                let mut text = String::from_utf8_lossy(&output.stdout).to_string();
+                text.push_str(&String::from_utf8_lossy(&output.stderr));
+                Some(text)
+            }
+            Ok(output) => {
+                last_error = Some(format!("{help_arg} exited with {}", output.status));
+                None
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+                None
+            }
+        }
+    });
+
+    match help_text {
+        Some(text) => {
+            let (supported_flags, missing_critical_flags) =
+                llama_flags_from_help_text(&text, LLAMA_FLAG_DETECTION_TARGETS);
+            LlamaFlagSupport {
+                checked: true,
+                binary_path: Some(binary_path.to_string_lossy().to_string()),
+                supported_flags,
+                missing_critical_flags,
+                error: None,
+            }
+        }
+        None => LlamaFlagSupport {
+            checked: false,
+            binary_path: Some(binary_path.to_string_lossy().to_string()),
+            supported_flags: Vec::new(),
+            missing_critical_flags: Vec::new(),
+            error: Some(format!(
+                "Unable to inspect llama-server flags{}",
+                last_error
+                    .map(|error| format!(": {error}"))
+                    .unwrap_or_default()
+            )),
+        },
+    }
+}
+
+pub fn unsupported_detected_launch_flags(
+    args: &[String],
+    support: &LlamaFlagSupport,
+) -> Vec<String> {
+    if !support.checked || support.missing_critical_flags.is_empty() {
+        return Vec::new();
+    }
+    let missing = support
+        .missing_critical_flags
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::HashSet<_>>();
+    let mut unsupported = args
+        .iter()
+        .filter(|arg| missing.contains(arg.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    unsupported.sort();
+    unsupported.dedup();
+    unsupported
+}
+
+fn llama_flags_from_help_text(help_text: &str, flags: &[&str]) -> (Vec<String>, Vec<String>) {
+    let mut supported = Vec::new();
+    let mut missing = Vec::new();
+    for flag in flags {
+        if help_text.contains(flag) {
+            supported.push((*flag).to_string());
+        } else {
+            missing.push((*flag).to_string());
+        }
+    }
+    (supported, missing)
+}
+
 fn filename_supports_vision(path: &Path) -> bool {
     let name = path
         .file_name()
@@ -157,7 +305,7 @@ fn find_mmproj_for_model(model_path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        filename_supports_vision, find_mmproj_for_model,
+        filename_supports_vision, find_mmproj_for_model, llama_flags_from_help_text,
         normalize_chat_template_kwargs_for_profile, parse_llama_load_progress, LaunchConfig,
         LlamaProcess,
     };
@@ -168,6 +316,21 @@ mod tests {
         assert!(filename_supports_vision(std::path::Path::new(
             "gemma-4-12B-it-Q4_K_M.gguf"
         )));
+    }
+
+    #[test]
+    fn detects_missing_llama_flags_from_help_text() {
+        let help = r#"
+            --jinja
+            --reasoning MODE
+            --chat-template-kwargs JSON
+            --cache-type-k TYPE
+        "#;
+        let (supported, missing) =
+            llama_flags_from_help_text(help, &["--jinja", "--reasoning", "--kv-unified"]);
+
+        assert_eq!(supported, vec!["--jinja", "--reasoning"]);
+        assert_eq!(missing, vec!["--kv-unified"]);
     }
 
     #[test]
@@ -318,6 +481,7 @@ mod tests {
                 ctxcp: None,
                 use_jinja: false,
                 reasoning_mode: None,
+                reasoning_preserve: false,
                 template_mode: "repo".to_string(),
                 template_source: None,
                 template_file: None,
@@ -340,6 +504,7 @@ mod tests {
                 diffusion_kv_cache: "auto".to_string(),
                 diffusion_visual: true,
                 diffusion_extra_args: vec!["--diffusion-max-steps".to_string(), "48".to_string()],
+                attach_mmproj: true,
             })
             .expect("build diffusion preview");
 
@@ -398,6 +563,7 @@ mod tests {
             ctxcp: None,
             use_jinja: false,
             reasoning_mode: None,
+            reasoning_preserve: false,
             template_mode: "repo".to_string(),
             template_source: None,
             template_file: None,
@@ -420,6 +586,7 @@ mod tests {
             diffusion_kv_cache: "auto".to_string(),
             diffusion_visual: true,
             diffusion_extra_args: vec![],
+            attach_mmproj: true,
         }
     }
 
@@ -444,6 +611,165 @@ mod tests {
 
         assert!(error.contains("Draft model file does not exist"));
         assert!(error.contains("missing-draft.gguf"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn self_mtp_emits_spec_type_without_draft_model() {
+        // A single MTP GGUF (no separate -md draft model) must still produce
+        // --spec-type / --spec-draft-n-max, otherwise self-MTP never activates.
+        let dir = std::env::temp_dir().join(format!(
+            "inference-bridge-self-mtp-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let model = dir.join("Qwen3.6-27B-MTP-UD-Q4_K_XL.gguf");
+        std::fs::write(&model, b"").expect("write model placeholder");
+        let server = dir.join("llama-server.exe");
+        std::fs::write(&server, b"").expect("write server placeholder");
+
+        let mut process = LlamaProcess::new();
+        process.set_server_path(server.clone());
+
+        let mut config = test_launch_config(model);
+        config.spec_type = "draft-mtp".to_string();
+        config.spec_draft_n_max = 3;
+        // draft_model_path intentionally left empty (self-MTP).
+
+        let preview = process
+            .build_args_preview(&config)
+            .expect("build self-MTP preview");
+
+        assert!(
+            preview
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--spec-type" && pair[1] == "draft-mtp"),
+            "expected --spec-type draft-mtp, got {:?}",
+            preview.args
+        );
+        assert!(
+            preview
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--spec-draft-n-max" && pair[1] == "3"),
+            "expected --spec-draft-n-max 3, got {:?}",
+            preview.args
+        );
+        assert!(
+            !preview.args.iter().any(|arg| arg == "-md"),
+            "self-MTP must not emit a -md draft model, got {:?}",
+            preview.args
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reasoning_preserve_emits_llama_server_flag() {
+        let dir = std::env::temp_dir().join(format!(
+            "inference-bridge-reasoning-preserve-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let model = dir.join("Qwen3.6-27B-Q4_K_M.gguf");
+        std::fs::write(&model, b"").expect("write model placeholder");
+        let server = dir.join("llama-server.exe");
+        std::fs::write(&server, b"").expect("write server placeholder");
+
+        let mut process = LlamaProcess::new();
+        process.set_server_path(server);
+
+        let mut config = test_launch_config(model);
+        config.reasoning_preserve = true;
+
+        let preview = process
+            .build_args_preview(&config)
+            .expect("build reasoning preserve preview");
+
+        assert!(
+            preview.args.contains(&"--reasoning-preserve".to_string()),
+            "expected --reasoning-preserve, got {:?}",
+            preview.args
+        );
+        assert!(preview.reasoning_preserve);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dflash_emits_spec_type_with_draft_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "inference-bridge-dflash-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let model = dir.join("Qwen3.6-27B-Q4_K_M.gguf");
+        let draft = dir.join("Qwen3.6-27B-DFlash-draft.gguf");
+        std::fs::write(&model, b"").expect("write model placeholder");
+        std::fs::write(&draft, b"").expect("write draft placeholder");
+        let server = dir.join("llama-server.exe");
+        std::fs::write(&server, b"").expect("write server placeholder");
+
+        let mut process = LlamaProcess::new();
+        process.set_server_path(server);
+
+        let mut config = test_launch_config(model);
+        config.draft_model_path = draft.to_string_lossy().to_string();
+        config.spec_type = "draft-dflash".to_string();
+        config.spec_draft_n_max = 8;
+
+        let preview = process
+            .build_args_preview(&config)
+            .expect("build DFlash preview");
+
+        assert!(
+            preview
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "-md" && pair[1] == draft.to_string_lossy()),
+            "expected -md draft model, got {:?}",
+            preview.args
+        );
+        assert!(
+            preview
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--spec-type" && pair[1] == "draft-dflash"),
+            "expected --spec-type draft-dflash, got {:?}",
+            preview.args
+        );
+        assert!(
+            preview
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--spec-draft-n-max" && pair[1] == "8"),
+            "expected --spec-draft-n-max 8, got {:?}",
+            preview.args
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dflash_requires_draft_model_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "inference-bridge-dflash-missing-draft-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let model = dir.join("Qwen3.6-27B-Q4_K_M.gguf");
+        std::fs::write(&model, b"").expect("write model placeholder");
+
+        let mut config = test_launch_config(model);
+        config.spec_type = "draft-dflash".to_string();
+
+        let error = LlamaProcess::validate_launch_config(&config)
+            .expect_err("DFlash without a draft model should fail")
+            .to_string();
+
+        assert!(error.contains("DFlash speculative decoding requires a draft model path"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -487,6 +813,7 @@ pub struct LaunchConfig {
     pub ctxcp: Option<u32>,
     pub use_jinja: bool,
     pub reasoning_mode: Option<String>,
+    pub reasoning_preserve: bool,
     pub template_mode: String,
     pub template_source: Option<String>,
     pub template_file: Option<PathBuf>,
@@ -510,6 +837,7 @@ pub struct LaunchConfig {
     pub diffusion_kv_cache: String,
     pub diffusion_visual: bool,
     pub diffusion_extra_args: Vec<String>,
+    pub attach_mmproj: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -530,6 +858,7 @@ pub struct LaunchPreview {
     pub ctxcp: Option<u32>,
     pub use_jinja: bool,
     pub reasoning_mode: Option<String>,
+    pub reasoning_preserve: bool,
     pub template_mode: String,
     pub template_source: Option<String>,
     pub template_path: Option<String>,
@@ -544,6 +873,54 @@ pub struct LaunchPreview {
     pub args: Vec<String>,
 }
 
+/// Resources extracted from a live LlamaProcess for async shutdown outside the AppState lock.
+/// Produced by `LlamaProcess::begin_shutdown()`; consumed by `PendingShutdown::complete()`.
+pub struct PendingShutdown {
+    child: Child,
+    port: u16,
+    pid: Option<u32>,
+    io_tasks: Vec<JoinHandle<()>>,
+    detected_backend: Arc<TokioMutex<Option<String>>>,
+    stderr_lines: Arc<TokioMutex<VecDeque<String>>>,
+    load_progress: Arc<TokioMutex<Option<f32>>>,
+}
+
+impl PendingShutdown {
+    /// Perform the slow async portion of shutdown (HTTP graceful stop, kill, port-release
+    /// wait) without holding the AppState write lock.
+    pub async fn complete(mut self) {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
+        let shutdown_url = format!("http://127.0.0.1:{}/shutdown", self.port);
+        let _ = client.post(&shutdown_url).send().await;
+
+        let exit = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
+        if exit.is_err() {
+            tracing::warn!("llama-server did not exit gracefully, killing");
+            let _ = self.child.kill().await;
+            let _ = self.child.wait().await;
+        } else {
+            tracing::info!("llama-server exited gracefully");
+        }
+
+        if let Some(pid) = self.pid {
+            let _ = LlamaProcess::force_kill_process_tree(pid);
+        }
+
+        *self.detected_backend.lock().await = None;
+        self.stderr_lines.lock().await.clear();
+        *self.load_progress.lock().await = None;
+
+        for handle in self.io_tasks.drain(..) {
+            handle.abort();
+        }
+
+        LlamaProcess::wait_for_port_release(self.port, Duration::from_millis(1500)).await;
+    }
+}
+
 /// Manages the llama-server child process.
 pub struct LlamaProcess {
     child: Option<Child>,
@@ -554,6 +931,7 @@ pub struct LlamaProcess {
     current_pid: Option<u32>,
     current_port: u16,
     crash_count: u32,
+    last_exit_status: Option<String>,
     state_tx: watch::Sender<ProcessState>,
     state_rx: watch::Receiver<ProcessState>,
     /// GPU backend detected from server stderr (e.g. "CUDA", "Vulkan", "CPU").
@@ -657,6 +1035,9 @@ impl LlamaProcess {
             anyhow::bail!("Model file does not exist: {}", config.model_path.display());
         }
         let draft_model_path = config.draft_model_path.trim();
+        if config.spec_type.trim() == "draft-dflash" && draft_model_path.is_empty() {
+            anyhow::bail!("DFlash speculative decoding requires a draft model path (-md)");
+        }
         if !draft_model_path.is_empty() {
             let draft_path = Path::new(draft_model_path);
             if !draft_path.exists() {
@@ -713,7 +1094,7 @@ impl LlamaProcess {
             .find_server_binary_with_preference(&config.backend_preference)
             .ok_or_else(|| anyhow::anyhow!("llama-server binary not found"))?;
 
-        let mmproj_path = if filename_supports_vision(&config.model_path) {
+        let mmproj_path = if config.attach_mmproj && filename_supports_vision(&config.model_path) {
             find_mmproj_for_model(&config.model_path)
         } else {
             None
@@ -792,6 +1173,9 @@ impl LlamaProcess {
         {
             args.push("--reasoning".to_string());
             args.push(reasoning_mode.clone());
+        }
+        if config.reasoning_preserve {
+            args.push("--reasoning-preserve".to_string());
         }
         if let Some(template_name) = config
             .template_name
@@ -890,17 +1274,28 @@ impl LlamaProcess {
                     .join(","),
             );
         }
-        if !config.draft_model_path.is_empty() {
+        // A separate draft model (-md) enables traditional, draft-model-based
+        // speculative decoding. This is OPTIONAL: self-MTP (e.g. draft-mtp on a
+        // Qwen3.6-27B-MTP GGUF) drafts from the main model's own MTP heads and
+        // needs no -md at all.
+        let has_draft_model = !config.draft_model_path.is_empty();
+        if has_draft_model {
             args.push("-md".to_string());
             args.push(config.draft_model_path.clone());
-            if !config.spec_type.trim().is_empty() {
-                args.push("--spec-type".to_string());
-                args.push(config.spec_type.clone());
-            }
+        }
+        // --spec-type drives BOTH self-MTP (no draft model) and draft-model modes.
+        // It must be emitted whenever a spec type is configured, independent of -md,
+        // otherwise self-MTP never activates. --spec-draft-n-max pairs with it.
+        if !config.spec_type.trim().is_empty() {
+            args.push("--spec-type".to_string());
+            args.push(config.spec_type.clone());
             if config.spec_draft_n_max > 0 {
                 args.push("--spec-draft-n-max".to_string());
                 args.push(config.spec_draft_n_max.to_string());
             }
+        }
+        // The remaining --draft-* knobs only apply to a separate draft model.
+        if has_draft_model {
             if config.draft_max_tokens > 0 {
                 args.push("--draft-max".to_string());
                 args.push(config.draft_max_tokens.to_string());
@@ -932,6 +1327,7 @@ impl LlamaProcess {
             ctxcp: config.ctxcp,
             use_jinja: config.use_jinja,
             reasoning_mode: config.reasoning_mode.clone(),
+            reasoning_preserve: config.reasoning_preserve,
             template_mode: config.template_mode.clone(),
             template_source: config.template_source.clone(),
             template_path: config
@@ -1007,6 +1403,7 @@ impl LlamaProcess {
             ctxcp: config.ctxcp,
             use_jinja: false,
             reasoning_mode: config.reasoning_mode.clone(),
+            reasoning_preserve: false,
             template_mode: "diffusion-cli".to_string(),
             template_source: Some("llama-diffusion-cli:-cnv".to_string()),
             template_path: None,
@@ -1239,6 +1636,7 @@ impl LlamaProcess {
             current_pid: None,
             current_port: 0,
             crash_count: 0,
+            last_exit_status: None,
             state_tx,
             state_rx,
             detected_backend: Arc::new(TokioMutex::new(None)),
@@ -1268,6 +1666,10 @@ impl LlamaProcess {
 
     pub fn state(&self) -> ProcessState {
         self.state
+    }
+
+    pub fn has_child(&self) -> bool {
+        self.child.is_some()
     }
 
     pub fn mark_idle_if_no_child(&mut self) -> bool {
@@ -1412,10 +1814,15 @@ impl LlamaProcess {
                 mmproj = %mmproj_path,
                 "Using multimodal projection sidecar for vision model"
             );
-        } else if filename_supports_vision(&config.model_path) {
+        } else if config.attach_mmproj && filename_supports_vision(&config.model_path) {
             tracing::warn!(
                 model = %config.model_path.display(),
                 "Vision-capable model detected but no mmproj sidecar was found nearby; image understanding may fail"
+            );
+        } else if !config.attach_mmproj && filename_supports_vision(&config.model_path) {
+            tracing::info!(
+                model = %config.model_path.display(),
+                "Skipping mmproj attachment for this text-only launch"
             );
         }
 
@@ -1444,6 +1851,18 @@ impl LlamaProcess {
             args = ?preview.args,
             "Launching llama-server"
         );
+        // Explicit, greppable record of the speculative-decoding mode so MTP
+        // activation (self-MTP or draft-model) is obvious in the bridge logs.
+        if !config.spec_type.trim().is_empty() {
+            tracing::info!(
+                target: "speculative",
+                spec_type = %config.spec_type,
+                spec_draft_n_max = config.spec_draft_n_max,
+                draft_model = %config.draft_model_path,
+                self_mtp = config.draft_model_path.trim().is_empty(),
+                "Speculative decoding enabled"
+            );
+        }
 
         drop(port_reservation);
         let mut child = match cmd.spawn() {
@@ -1509,11 +1928,12 @@ impl LlamaProcess {
                             *guard = Some("Metal".to_string());
                         }
                     }
-                    // Keep last 50 lines for crash diagnostics (O(1) with VecDeque)
+                    // Keep a generous stderr tail for crash diagnostics; llama
+                    // startup can emit many metadata lines before the actual error.
                     {
                         let mut buf = stderr_buf.lock().await;
                         buf.push_back(line.clone());
-                        if buf.len() > 50 {
+                        if buf.len() > 500 {
                             buf.pop_front();
                         }
                     }
@@ -1544,6 +1964,7 @@ impl LlamaProcess {
             .file_name()
             .map(|n| n.to_string_lossy().to_string());
         self.crash_count = 0;
+        self.last_exit_status = None;
 
         Ok(())
     }
@@ -1590,6 +2011,34 @@ impl LlamaProcess {
         };
         let url = format!("http://127.0.0.1:{}/health", self.current_port);
         matches!(client.get(&url).send().await, Ok(r) if r.status().is_success())
+    }
+
+    /// Extract live process resources for shutdown without holding the AppState write lock.
+    ///
+    /// Call this while holding the write lock to atomically take the child, PID, port, and
+    /// IO tasks out of LlamaProcess, then release the lock. Pass the returned
+    /// `PendingShutdown` to `complete_shutdown()` which does the slow async work (HTTP
+    /// graceful stop, kill, port-release wait) without blocking readers.
+    pub fn begin_shutdown(&mut self) -> Option<PendingShutdown> {
+        let child = self.child.take()?;
+        let port = self.current_port;
+        let pid = self.current_pid.take();
+        self.current_model = None;
+        self.current_port = 0;
+        self.set_state(ProcessState::Stopping);
+        let io_tasks = self.io_tasks.drain(..).collect();
+        let detected_backend = self.detected_backend.clone();
+        let stderr_lines = self.stderr_lines.clone();
+        let load_progress = self.load_progress.clone();
+        Some(PendingShutdown {
+            child,
+            port,
+            pid,
+            io_tasks,
+            detected_backend,
+            stderr_lines,
+            load_progress,
+        })
     }
 
     /// Gracefully shutdown the llama-server process.
@@ -1671,10 +2120,11 @@ impl LlamaProcess {
     pub fn poll_exited(&mut self) -> bool {
         if let Some(ref mut child) = self.child {
             match child.try_wait() {
-                Ok(Some(_status)) => {
+                Ok(Some(status)) => {
                     self.child = None;
                     self.current_pid = None;
                     self.crash_count += 1;
+                    self.last_exit_status = Some(status.to_string());
                     self.set_state(ProcessState::Error);
                     true
                 }
@@ -1714,6 +2164,10 @@ impl LlamaProcess {
     /// Get captured stderr lines (for crash diagnostics).
     pub async fn last_stderr(&self) -> Vec<String> {
         self.stderr_lines.lock().await.iter().cloned().collect()
+    }
+
+    pub fn last_exit_status(&self) -> Option<String> {
+        self.last_exit_status.clone()
     }
 
     pub fn crash_count(&self) -> u32 {

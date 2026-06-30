@@ -37,7 +37,7 @@ function CopyButton({ text, small = false }: { text: string; small?: boolean }) 
 function CodeBlock({ language, code }: { language: string; code: string }) {
   return (
     <div
-      className="my-2 rounded overflow-hidden"
+      className="my-2 max-w-full overflow-hidden rounded"
       style={{
         background: "#0d1117",
         border: "1px solid rgba(255,255,255,0.08)",
@@ -59,7 +59,7 @@ function CodeBlock({ language, code }: { language: string; code: string }) {
         <CopyButton text={code} small />
       </div>
       <pre
-        className="overflow-x-auto m-0 p-3 text-[12px] leading-relaxed"
+        className="m-0 max-w-full overflow-x-auto p-3 text-[12px] leading-relaxed"
         style={{ color: "#e2e8f0", fontFamily: "ui-monospace, 'Cascadia Code', Consolas, monospace" }}
       >
         <code>{code}</code>
@@ -74,7 +74,7 @@ interface Props {
 
 export function MarkdownContent({ content }: Props) {
   return (
-    <div className="markdown-body text-sm text-gray-300 break-words">
+    <div className="markdown-body min-w-0 max-w-full overflow-visible break-words text-sm text-gray-300">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{
@@ -99,27 +99,27 @@ export function MarkdownContent({ content }: Props) {
             );
           },
           h1: ({ children }) => (
-            <h1 className="text-lg font-bold mt-3 mb-1.5" style={{ color: "#f1f5f9", borderBottom: "1px solid rgba(255,255,255,0.08)", paddingBottom: "6px" }}>
+            <h1 className="mb-1.5 mt-3 break-words text-lg font-bold" style={{ color: "#f1f5f9", borderBottom: "1px solid rgba(255,255,255,0.08)", paddingBottom: "6px" }}>
               {children}
             </h1>
           ),
           h2: ({ children }) => (
-            <h2 className="text-base font-semibold mt-3 mb-1.5" style={{ color: "#f1f5f9", borderBottom: "1px solid rgba(255,255,255,0.06)", paddingBottom: "4px" }}>
+            <h2 className="mb-1.5 mt-3 break-words text-base font-semibold" style={{ color: "#f1f5f9", borderBottom: "1px solid rgba(255,255,255,0.06)", paddingBottom: "4px" }}>
               {children}
             </h2>
           ),
           h3: ({ children }) => (
-            <h3 className="text-sm font-semibold mt-2.5 mb-1" style={{ color: "#e2e8f0" }}>
+            <h3 className="mb-1 mt-2.5 break-words text-sm font-semibold" style={{ color: "#e2e8f0" }}>
               {children}
             </h3>
           ),
           h4: ({ children }) => (
-            <h4 className="text-sm font-medium mt-2 mb-0.5" style={{ color: "#cbd5e1" }}>
+            <h4 className="mb-0.5 mt-2 break-words text-sm font-medium" style={{ color: "#cbd5e1" }}>
               {children}
             </h4>
           ),
           p: ({ children }) => (
-            <p className="my-1.5 leading-relaxed">{children}</p>
+            <p className="my-1.5 break-words leading-relaxed">{children}</p>
           ),
           ul: ({ children }) => (
             <ul className="my-1.5 pl-5 space-y-0.5" style={{ listStyleType: "disc" }}>

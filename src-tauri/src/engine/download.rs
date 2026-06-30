@@ -459,6 +459,7 @@ pub async fn download_llama_server(
 
     let is_cuda_runtime = url.to_lowercase().contains("cudart");
     let extract_dest = if is_cuda_runtime {
+        wait_for_managed_binary_release(app, &dir).await?;
         dir.clone()
     } else {
         let _ = std::fs::remove_dir_all(&stage_dir);
@@ -469,6 +470,7 @@ pub async fn download_llama_server(
     let server_path = extract_archive(&complete_file, &extract_dest)?;
 
     if !is_cuda_runtime {
+        wait_for_managed_binary_release(app, &dir).await?;
         copy_dir_all(&stage_dir, &dir)?;
         let _ = std::fs::remove_dir_all(&stage_dir);
     }
@@ -504,6 +506,82 @@ pub async fn download_llama_server(
         Ok(server_path)
     } else {
         Ok(dir.join("llama-server.exe"))
+    }
+}
+
+async fn wait_for_managed_binary_release(app: &tauri::AppHandle, dir: &Path) -> anyhow::Result<()> {
+    let server_path = dir.join("llama-server.exe");
+    if !server_path.exists() {
+        return Ok(());
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut emitted_wait = false;
+
+    loop {
+        match std::fs::OpenOptions::new().write(true).open(&server_path) {
+            Ok(_) => return Ok(()),
+            Err(error) if file_is_locked(&error) && std::time::Instant::now() < deadline => {
+                if !emitted_wait {
+                    emitted_wait = true;
+                    tracing::warn!(
+                        path = %server_path.display(),
+                        "llama-server binary is still locked; waiting before install"
+                    );
+                    let _ = app.emit(
+                        "model-load-progress",
+                        crate::state::LoadProgress {
+                            stage: "downloading".to_string(),
+                            message:
+                                "Waiting for running llama-server to stop before installing..."
+                                    .to_string(),
+                            progress: 0.9,
+                            done: false,
+                            error: None,
+                        },
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(error) if file_is_locked(&error) => {
+                return Err(anyhow::anyhow!(
+                    "{} is still in use after waiting. Stop the loaded model and retry the download.",
+                    server_path.display()
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn file_is_locked(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(32) | Some(33))
+        || error.kind() == std::io::ErrorKind::PermissionDenied
+}
+
+#[cfg(test)]
+mod tests {
+    use super::file_is_locked;
+
+    #[test]
+    fn windows_sharing_violation_is_treated_as_locked_file() {
+        let error = std::io::Error::from_raw_os_error(32);
+
+        assert!(file_is_locked(&error));
+    }
+
+    #[test]
+    fn windows_lock_violation_is_treated_as_locked_file() {
+        let error = std::io::Error::from_raw_os_error(33);
+
+        assert!(file_is_locked(&error));
+    }
+
+    #[test]
+    fn unrelated_io_errors_are_not_treated_as_locked_files() {
+        let error = std::io::Error::new(std::io::ErrorKind::NotFound, "missing");
+
+        assert!(!file_is_locked(&error));
     }
 }
 
