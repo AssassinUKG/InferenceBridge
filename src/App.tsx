@@ -55,15 +55,13 @@ interface UiNotice {
 
 function NotificationCenter() {
   const [notices, setNotices] = useState<UiNotice[]>([]);
+  const [open, setOpen] = useState(false);
+  const [seenIds, setSeenIds] = useState<Set<string>>(new Set());
+  const menuRef = useRef<HTMLDivElement | null>(null);
 
   const pushNotice = (notice: Omit<UiNotice, "id">) => {
     const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    setNotices((current) => [...current, { ...notice, id }].slice(-5));
-    if (notice.tone !== "error") {
-      window.setTimeout(() => {
-        setNotices((current) => current.filter((item) => item.id !== id));
-      }, 6500);
-    }
+    setNotices((current) => [...current, { ...notice, id }].slice(-20));
   };
 
   useEffect(() => {
@@ -108,6 +106,82 @@ function NotificationCenter() {
       cleanups.forEach((cleanup) => cleanup.then((fn) => fn()));
     };
   }, []);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    setSeenIds(new Set(notices.map((notice) => notice.id)));
+    function handlePointerDown(event: MouseEvent) {
+      if (!menuRef.current?.contains(event.target as Node)) setOpen(false);
+    }
+    window.addEventListener("mousedown", handlePointerDown);
+    return () => window.removeEventListener("mousedown", handlePointerDown);
+  }, [notices, open]);
+
+  const unreadCount = notices.filter((notice) => !seenIds.has(notice.id)).length;
+
+  return (
+    <div className="relative" ref={menuRef}>
+      <button
+        onClick={() => setOpen((value) => !value)}
+        className="relative flex h-8 w-8 items-center justify-center rounded transition"
+        title="Notifications"
+        style={{
+          background: open ? "rgba(34,211,238,0.12)" : "var(--surface-2)",
+          border: open ? "1px solid rgba(34,211,238,0.26)" : "1px solid var(--border)",
+          color: open ? "#67e8f9" : "var(--text-1)",
+          cursor: "pointer",
+        }}
+      >
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M18 9A6 6 0 0 0 6 9c0 7-3 7-3 9h18c0-2-3-2-3-9Z" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+          <path d="M10 21h4" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+        </svg>
+        {unreadCount > 0 && (
+          <span className="absolute -right-1 -top-1 rounded-full px-1 text-[9px] font-bold leading-4" style={{ minWidth: 16, height: 16, background: "#22d3ee", color: "#041014" }}>
+            {unreadCount > 9 ? "9+" : unreadCount}
+          </span>
+        )}
+      </button>
+      {open && (
+        <div className="absolute right-0 top-full z-50 mt-2 w-[380px] overflow-hidden rounded" style={{ background: "var(--surface-1)", border: "1px solid var(--border)", boxShadow: "0 18px 48px rgba(0,0,0,0.42)" }}>
+          <div className="flex items-center justify-between border-b px-3 py-2" style={{ borderColor: "var(--border)" }}>
+            <div>
+              <div className="text-xs font-semibold uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>Notifications</div>
+              <div className="mt-0.5 text-xs" style={{ color: "var(--text-1)" }}>{notices.length > 0 ? `${notices.length} recent events` : "No events yet"}</div>
+            </div>
+            {notices.length > 0 && (
+              <button onClick={() => setNotices([])} className="rounded px-2 py-1 text-[11px] font-medium" style={{ background: "transparent", border: "1px solid var(--border)", color: "var(--text-1)", cursor: "pointer" }}>
+                Clear
+              </button>
+            )}
+          </div>
+          <div className="max-h-[420px] overflow-y-auto">
+            {notices.length === 0 ? (
+              <div className="px-3 py-8 text-sm" style={{ color: "var(--text-2)" }}>Downloads, API actions, and runtime events will collect here.</div>
+            ) : (
+              [...notices].reverse().map((notice) => {
+                const color = notice.tone === "error" ? "#f87171" : notice.tone === "success" ? "#34d399" : "#22d3ee";
+                return (
+                  <div key={notice.id} className="border-b px-3 py-3 last:border-b-0" style={{ borderColor: "var(--border)" }}>
+                    <div className="flex items-start gap-3">
+                      <span className="mt-1 h-2 w-2 shrink-0 rounded-full" style={{ background: color }} />
+                      <div className="min-w-0 flex-1">
+                        <div className="text-sm font-semibold" style={{ color: "var(--text-0)" }}>{notice.title}</div>
+                        <div className="mt-1 break-words text-xs leading-5" style={{ color: "var(--text-1)" }}>{notice.message}</div>
+                      </div>
+                      <button onClick={() => setNotices((current) => current.filter((item) => item.id !== notice.id))} className="rounded px-1 text-xs" style={{ color: "var(--text-2)", border: "none", background: "transparent", cursor: "pointer" }}>
+                        x
+                      </button>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 
   if (notices.length === 0) {
     return null;
@@ -782,7 +856,6 @@ function App() {
 
   return (
     <div className="flex h-screen flex-col" style={{ background: "var(--bg)", color: "var(--text-0)" }}>
-      <NotificationCenter />
       {/* Compact header */}
       <header
         className="flex shrink-0 items-center gap-4 px-4"
@@ -845,6 +918,8 @@ function App() {
         </nav>
 
         <div className="ml-auto flex items-center gap-2">
+          <NotificationCenter />
+
           <button
             onClick={() => setActiveTab("settings")}
             className="flex items-center gap-2 rounded px-3 py-1 text-xs transition"

@@ -260,6 +260,7 @@ export const getGpuStats = () => invoke<GpuStats>("get_gpu_stats");
 
 export interface HubQuant {
   quant: string;
+  size_bytes?: number | null;
   size_gb: number;
   url: string;
   filename: string;
@@ -271,6 +272,11 @@ export interface HubModel {
   family: string;
   params: string;
   description: string;
+  hf_url: string;
+  readme?: string | null;
+  license?: string | null;
+  base_model?: string | null;
+  pipeline_tag?: string | null;
   tags: string[];
   supports_vision: boolean;
   downloads: number;
@@ -283,11 +289,16 @@ export interface DownloadProgress {
   id: string;
   filename: string;
   dest_path: string | null;
+  partial_path: string | null;
   supports_vision?: boolean | null;
   repo_id?: string | null;
   downloaded_bytes: number;
   total_bytes: number;
   percent: number;
+  speed_bps?: number | null;
+  eta_seconds?: number | null;
+  resumable: boolean;
+  attempt: number;
   done: boolean;
   status: string;
   error: string | null;
@@ -299,8 +310,14 @@ export interface MetadataSyncSummary {
   updated_models: number;
 }
 
-export const searchHubModels = (query: string, offset: number = 0, sort?: string) =>
-  invoke<HubModel[]>("search_hub_models", { query, offset, sort });
+export const searchHubModels = (query: string, offset: number = 0, sort?: string, tag?: string | null) =>
+  invoke<HubModel[]>("search_hub_models", { query, offset, sort, tag: tag ?? null });
+
+export const getHubModelDetails = (repoId: string, includeReadme = false) =>
+  invoke<HubModel | null>("get_hub_model_details", { repoId, includeReadme });
+
+export const openExternalUrl = (url: string) =>
+  invoke<void>("open_external_url", { url });
 
 export const showInFolder = (path: string) =>
   invoke<void>("show_in_folder", { path });

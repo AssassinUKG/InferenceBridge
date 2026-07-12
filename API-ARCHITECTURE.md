@@ -43,6 +43,8 @@ External clients (HelixClaw, curl, etc.)
 | POST   | `/v1/chat/completions`    | `completions::chat_completions` | Chat completion (streaming + non-streaming) |
 | POST   | `/v1/completions`         | `completions::text_completions` | Text completion                      |
 | POST   | `/v1/responses`           | `responses::responses`      | OpenAI Responses API                 |
+| POST   | `/v1/embeddings`          | `embeddings::embeddings`    | OpenAI embeddings proxy to loaded llama-server |
+| POST   | `/v1/messages`            | `messages::messages`        | Anthropic Messages-compatible chat   |
 | GET    | `/v1/models`              | `models::list_models`       | List all available models            |
 | GET    | `/v1/models/:model`       | `models::get_model`         | Get model details (context, quant, capabilities) |
 | POST   | `/v1/models/load`         | `models::load_model`        | Load a model (with optional `context_size`) |
@@ -52,6 +54,11 @@ External clients (HelixClaw, curl, etc.)
 | GET    | `/v1/health`              | `health::health_check`      | Health check (model status + KV cache) |
 | GET    | `/v1/metrics`             | `metrics::get_metrics`      | Inference metrics (tokens/sec, etc.) |
 | POST   | `/v1/inference/cancel`    | `metrics::cancel_inference`  | Cancel active inference              |
+
+When `[providers].active` is `openai`, `lm_studio`, or `sglang`, matching
+OpenAI-compatible handlers short-circuit to the configured upstream provider
+before using managed llama.cpp. The `openai` provider defaults to
+`https://api.openai.com/v1` and uses the saved provider key or `OPENAI_API_KEY`.
 
 ### InferenceBridge Extensions (`/v1/...`)
 
@@ -110,6 +117,46 @@ Client POST /v1/chat/completions
   -> Translates response back to OpenAI format
   -> Returns to client
 ```
+
+### Structured Output
+
+OpenAI `response_format` is accepted on `/v1/chat/completions` and
+`/v1/completions`. `json_schema.schema` is forwarded to llama-server as
+`json_schema` so llama.cpp performs constrained decoding server-side.
+`json_object` maps to `{ "type": "object" }`.
+
+### Context Compaction
+
+When an API chat-style request would exceed the loaded context budget,
+InferenceBridge compacts the oldest evictable history into an
+`[Earlier conversation summary]` system message before sending the prompt to
+llama-server. The hot path first tries a model-generated semantic summary and
+falls back to deterministic character-safe trimming if summarization fails.
+Tool-call and tool-result turns are evicted as paired units. This can add one
+extra model round-trip, but only on requests at or over the context budget;
+requests that already fit are unchanged.
+
+### Embeddings
+
+`POST /v1/embeddings` is a transparent OpenAI-shaped proxy to the currently
+loaded llama-server `/v1/embeddings` endpoint. This requires the active model
+and launch mode to support embeddings. A dedicated second embedding runtime is
+tracked as a follow-up, not part of the single-runtime request path.
+
+### Anthropic Compatibility
+
+`POST /v1/messages` translates Anthropic Messages requests into the existing
+InferenceBridge chat pipeline and returns Anthropic message objects. It accepts
+top-level `system`, text/image content blocks, Anthropic tools, tool results,
+and streaming SSE event framing. Anthropic clients may use:
+
+```
+ANTHROPIC_BASE_URL=http://127.0.0.1:8800/v1
+ANTHROPIC_API_KEY=<same key configured in InferenceBridge>
+```
+
+The auth middleware accepts `x-api-key` as an alternative to
+`Authorization: Bearer` for Anthropic-compatible clients.
 
 ### Agent Action Validation
 

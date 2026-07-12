@@ -16,6 +16,7 @@ use crate::{models::overrides::HfModelMetadata, state::SharedState};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HubQuant {
     pub quant: String,
+    pub size_bytes: Option<u64>,
     pub size_gb: f32,
     pub url: String,
     pub filename: String,
@@ -28,6 +29,11 @@ pub struct HubModel {
     pub family: String,
     pub params: String,
     pub description: String,
+    pub hf_url: String,
+    pub readme: Option<String>,
+    pub license: Option<String>,
+    pub base_model: Option<String>,
+    pub pipeline_tag: Option<String>,
     pub tags: Vec<String>,
     pub supports_vision: bool,
     pub downloads: u64,
@@ -40,8 +46,9 @@ pub struct HubModel {
 
 #[derive(Debug, serde::Deserialize)]
 struct HfSibling {
-    rfilename: String,
     #[serde(default)]
+    rfilename: String,
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
     size: Option<u64>,
     #[serde(default)]
     lfs: Option<HfLfs>,
@@ -49,32 +56,108 @@ struct HfSibling {
 
 #[derive(Debug, serde::Deserialize)]
 struct HfLfs {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_u64")]
     size: Option<u64>,
 }
 
-#[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug)]
 struct HfApiModel {
     model_id: String,
-    #[serde(default)]
     downloads: u64,
-    #[serde(default)]
     likes: u64,
-    #[serde(default)]
     last_modified: Option<String>,
-    #[serde(default)]
     pipeline_tag: Option<String>,
-    #[serde(default)]
     tags: Vec<String>,
-    #[serde(default)]
     private: bool,
-    #[serde(default)]
     disabled: bool,
-    #[serde(default)]
     gated: Option<serde_json::Value>,
-    #[serde(default)]
     siblings: Vec<HfSibling>,
+}
+
+impl<'de> serde::Deserialize<'de> for HfApiModel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let object = value.as_object().ok_or_else(|| {
+            serde::de::Error::custom("HuggingFace model record was not an object")
+        })?;
+        let model_id = value_string(object.get("modelId"))
+            .or_else(|| value_string(object.get("id")))
+            .unwrap_or_default();
+
+        Ok(Self {
+            model_id,
+            downloads: value_u64(object.get("downloads")).unwrap_or(0),
+            likes: value_u64(object.get("likes")).unwrap_or(0),
+            last_modified: value_string(object.get("lastModified")),
+            pipeline_tag: value_string(object.get("pipeline_tag")),
+            tags: value_string_vec(object.get("tags")),
+            private: value_bool(object.get("private")),
+            disabled: value_bool(object.get("disabled")),
+            gated: object.get("gated").cloned(),
+            siblings: value_siblings(object.get("siblings")),
+        })
+    }
+}
+
+fn value_u64(value: Option<&serde_json::Value>) -> Option<u64> {
+    match value {
+        Some(serde_json::Value::Number(number)) => number.as_u64(),
+        Some(serde_json::Value::String(text)) => text.parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+fn value_string(value: Option<&serde_json::Value>) -> Option<String> {
+    match value {
+        Some(serde_json::Value::String(text)) => Some(text.clone()),
+        Some(serde_json::Value::Number(number)) => Some(number.to_string()),
+        Some(serde_json::Value::Bool(flag)) => Some(flag.to_string()),
+        _ => None,
+    }
+}
+
+fn value_string_vec(value: Option<&serde_json::Value>) -> Vec<String> {
+    match value {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn value_bool(value: Option<&serde_json::Value>) -> bool {
+    match value {
+        Some(serde_json::Value::Bool(flag)) => *flag,
+        Some(serde_json::Value::String(text)) => text.eq_ignore_ascii_case("true"),
+        Some(serde_json::Value::Number(number)) => number.as_u64().is_some_and(|value| value != 0),
+        _ => false,
+    }
+}
+
+fn value_siblings(value: Option<&serde_json::Value>) -> Vec<HfSibling> {
+    match value {
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| serde_json::from_value::<HfSibling>(item.clone()).ok())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn deserialize_optional_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::Number(number)) => number.as_u64(),
+        Some(serde_json::Value::String(text)) => text.parse::<u64>().ok(),
+        _ => None,
+    })
 }
 
 fn extract_quant(filename: &str) -> String {
@@ -111,11 +194,20 @@ fn format_downloads(downloads: u64) -> String {
     grouped.chars().rev().collect()
 }
 
-fn file_size_gb(file: &HfSibling) -> f32 {
+fn file_size_bytes(file: &HfSibling) -> Option<u64> {
     file.size
         .or_else(|| file.lfs.as_ref().and_then(|lfs| lfs.size))
+}
+
+fn file_size_gb(file: &HfSibling) -> f32 {
+    file_size_bytes(file)
         .map(|sz| sz as f32 / 1_073_741_824.0)
         .unwrap_or(0.0)
+}
+
+fn tag_value(tags: &[String], prefix: &str) -> Option<String> {
+    tags.iter()
+        .find_map(|tag| tag.strip_prefix(prefix).map(str::to_string))
 }
 
 fn is_hf_downloadable(model: &HfApiModel, authenticated: bool) -> bool {
@@ -178,7 +270,7 @@ fn hf_supports_vision(model: &HfApiModel) -> bool {
     })
 }
 
-fn hf_api_to_hub(m: HfApiModel, authenticated: bool) -> Option<HubModel> {
+fn hf_api_to_hub(m: HfApiModel, authenticated: bool, readme: Option<String>) -> Option<HubModel> {
     if !is_hf_downloadable(&m, authenticated) {
         return None;
     }
@@ -201,6 +293,7 @@ fn hf_api_to_hub(m: HfApiModel, authenticated: bool) -> Option<HubModel> {
         .iter()
         .map(|s| HubQuant {
             quant: extract_quant(&s.rfilename),
+            size_bytes: file_size_bytes(s),
             size_gb: file_size_gb(s),
             url: format!(
                 "https://huggingface.co/{}/resolve/main/{}",
@@ -209,13 +302,21 @@ fn hf_api_to_hub(m: HfApiModel, authenticated: bool) -> Option<HubModel> {
             filename: s.rfilename.clone(),
         })
         .collect();
-    quants.sort_by(|left, right| left.size_gb.total_cmp(&right.size_gb));
+    quants.sort_by(|left, right| {
+        left.size_bytes
+            .unwrap_or(u64::MAX)
+            .cmp(&right.size_bytes.unwrap_or(u64::MAX))
+    });
 
     let mut parts = m.model_id.split('/');
     let owner = parts.next().unwrap_or("HuggingFace");
     let repo_name = parts.next().unwrap_or(&m.model_id);
     let name = repo_name.replace('-', " ").replace('_', " ");
     let supports_vision = hf_supports_vision(&m);
+    let license = tag_value(&m.tags, "license:");
+    let base_model = tag_value(&m.tags, "base_model:quantized:")
+        .or_else(|| tag_value(&m.tags, "base_model:adapter:"))
+        .or_else(|| tag_value(&m.tags, "base_model:"));
 
     let mut tags: Vec<String> = m
         .tags
@@ -237,6 +338,11 @@ fn hf_api_to_hub(m: HfApiModel, authenticated: bool) -> Option<HubModel> {
             format_downloads(m.downloads),
             m.model_id
         ),
+        hf_url: format!("https://huggingface.co/{}", m.model_id),
+        readme,
+        license,
+        base_model,
+        pipeline_tag: m.pipeline_tag,
         tags,
         supports_vision,
         downloads: m.downloads,
@@ -290,9 +396,90 @@ async fn search_hf_api_models(
         return Err(format!("HuggingFace returned HTTP {}", resp.status()));
     }
 
-    resp.json::<Vec<HfApiModel>>()
+    let body = resp
+        .text()
         .await
-        .map_err(|e| format!("Failed to parse HuggingFace response: {e}"))
+        .map_err(|e| format!("Failed to read HuggingFace response: {e}"))?;
+    serde_json::from_str::<Vec<HfApiModel>>(&body).map_err(|e| {
+        let snippet: String = body.chars().take(240).collect();
+        format!("Failed to parse HuggingFace response: {e}. Body starts with: {snippet}")
+    })
+}
+
+async fn fetch_hf_model_details(
+    repo_id: &str,
+    hf_api_key: Option<&str>,
+) -> Result<HfApiModel, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("InferenceBridge/1.0")
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let url = format!("https://huggingface.co/api/models/{}", repo_id.trim());
+    let mut req = client.get(url).query(&[("blobs", "true")]);
+    if let Some(key) = hf_api_key.map(str::trim).filter(|value| !value.is_empty()) {
+        req = req.bearer_auth(key);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("HuggingFace detail request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("HuggingFace returned HTTP {}", resp.status()));
+    }
+
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read HuggingFace model details: {e}"))?;
+    serde_json::from_str::<HfApiModel>(&body).map_err(|e| {
+        let snippet: String = body.chars().take(240).collect();
+        format!("Failed to parse HuggingFace model details: {e}. Body starts with: {snippet}")
+    })
+}
+
+async fn fetch_hf_readme(
+    repo_id: &str,
+    hf_api_key: Option<&str>,
+) -> Result<Option<String>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent("InferenceBridge/1.0")
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let url = format!(
+        "https://huggingface.co/{}/raw/main/README.md",
+        repo_id.trim()
+    );
+    let mut req = client.get(url);
+    if let Some(key) = hf_api_key.map(str::trim).filter(|value| !value.is_empty()) {
+        req = req.bearer_auth(key);
+    }
+
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("HuggingFace README request failed: {e}"))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(format!(
+            "HuggingFace README returned HTTP {}",
+            resp.status()
+        ));
+    }
+
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read HuggingFace README: {e}"))?;
+    let trimmed: String = text.chars().take(16_000).collect();
+    Ok(Some(trimmed))
 }
 
 async fn fetch_hub_models(
@@ -308,10 +495,12 @@ async fn fetch_hub_models(
         .map(str::trim)
         .is_some_and(|value| !value.is_empty());
 
+    let mut seen = HashSet::new();
     Ok(models
         .into_iter()
         .filter(|model| !featured_only || is_hf_featured_candidate(model))
-        .filter_map(|model| hf_api_to_hub(model, authenticated))
+        .filter_map(|model| hf_api_to_hub(model, authenticated, None))
+        .filter(|model| seen.insert(model.id.to_lowercase()))
         .collect())
 }
 
@@ -407,20 +596,59 @@ pub async fn search_hub_models(
     query: String,
     offset: u32,
     sort: Option<String>,
+    tag: Option<String>,
 ) -> Result<Vec<HubModel>, String> {
     let hf_api_key = {
         let s = state.read().await;
         s.config.hub.hf_api_key.clone()
     };
-    fetch_hub_models(
-        Some(&query),
+    let trimmed_query = query.trim();
+    let trimmed_tag = tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let effective_query = match (trimmed_query.is_empty(), trimmed_tag) {
+        (true, Some(tag)) => tag.to_string(),
+        (false, Some(tag)) if !trimmed_query.eq_ignore_ascii_case(tag) => {
+            format!("{trimmed_query} {tag}")
+        }
+        _ => trimmed_query.to_string(),
+    };
+    let mut models = fetch_hub_models(
+        Some(&effective_query),
         offset,
-        20,
+        60,
         false,
         sort.as_deref(),
         hf_api_key.as_deref(),
     )
-    .await
+    .await?;
+    models.truncate(20);
+    Ok(models)
+}
+
+/// Fetch one HuggingFace repo with blob metadata. The search endpoint often omits file sizes.
+#[tauri::command]
+pub async fn get_hub_model_details(
+    state: tauri::State<'_, SharedState>,
+    repo_id: String,
+    include_readme: Option<bool>,
+) -> Result<Option<HubModel>, String> {
+    let hf_api_key = {
+        let s = state.read().await;
+        s.config.hub.hf_api_key.clone()
+    };
+    let authenticated = hf_api_key
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let model = fetch_hf_model_details(&repo_id, hf_api_key.as_deref()).await?;
+    let readme = if include_readme.unwrap_or(false) {
+        fetch_hf_readme(&repo_id, hf_api_key.as_deref()).await?
+    } else {
+        None
+    };
+    Ok(hf_api_to_hub(model, authenticated, readme))
 }
 
 // Download progress event payload emitted during model downloads.
@@ -430,11 +658,16 @@ pub struct DownloadProgress {
     pub id: String,
     pub filename: String,
     pub dest_path: Option<String>,
+    pub partial_path: Option<String>,
     pub supports_vision: Option<bool>,
     pub repo_id: Option<String>,
     pub downloaded_bytes: u64,
     pub total_bytes: u64,
     pub percent: f32,
+    pub speed_bps: Option<u64>,
+    pub eta_seconds: Option<u64>,
+    pub resumable: bool,
+    pub attempt: u32,
     pub done: bool,
     pub status: String,
     pub error: Option<String>,
@@ -483,6 +716,27 @@ fn path_is_inside_any_dir<P: AsRef<std::path::Path>>(path: &std::path::Path, dir
             .map(|scan_dir| path.starts_with(scan_dir))
             .unwrap_or(false)
     })
+}
+
+fn partial_path_for(dest_path: &Path) -> PathBuf {
+    let mut partial = dest_path.as_os_str().to_os_string();
+    partial.push(".part");
+    PathBuf::from(partial)
+}
+
+fn progress_percent(downloaded: u64, total: u64) -> f32 {
+    if total > 0 {
+        (downloaded as f32 / total as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn estimate_eta_seconds(downloaded: u64, total: u64, speed_bps: u64) -> Option<u64> {
+    if total == 0 || speed_bps == 0 || downloaded >= total {
+        return None;
+    }
+    Some(((total - downloaded) / speed_bps).max(1))
 }
 
 async fn upsert_download(
@@ -555,6 +809,40 @@ pub async fn show_in_folder(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub async fn open_external_url(url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("https://huggingface.co/")
+        || trimmed.starts_with("https://www.huggingface.co/"))
+    {
+        return Err("Only Hugging Face URLs can be opened from the model browser.".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", trimmed])
+            .spawn()
+            .map_err(|e| format!("Failed to open URL: {e}"))?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|e| format!("Failed to open URL: {e}"))?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(trimmed)
+            .spawn()
+            .map_err(|e| format!("Failed to open URL: {e}"))?;
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn list_downloads(
     state: tauri::State<'_, SharedState>,
 ) -> Result<Vec<DownloadProgress>, String> {
@@ -584,13 +872,22 @@ pub async fn cancel_download(
             .active_downloads
             .get_mut(&id)
             .ok_or_else(|| "Download not found.".to_string())?;
-        if entry.progress.done {
+        if entry.progress.done && !(entry.progress.status == "Failed" && entry.progress.resumable) {
             return Ok(());
         }
-        if entry.progress.status == "Paused" {
+        if entry.progress.status == "Paused"
+            || (entry.progress.status == "Failed" && entry.progress.resumable)
+        {
             entry.progress.done = true;
             entry.progress.status = "Cancelled".to_string();
-            (entry.progress.clone(), entry.progress.dest_path.clone())
+            (
+                entry.progress.clone(),
+                entry
+                    .progress
+                    .partial_path
+                    .clone()
+                    .or_else(|| entry.progress.dest_path.clone()),
+            )
         } else {
             entry.cancel_token.cancel();
             entry.progress.status = "Cancelling".to_string();
@@ -786,6 +1083,7 @@ pub async fn download_hub_model(
         .map_err(|e| format!("Cannot create {}: {e}", dest_dir.display()))?;
 
     let dest_path = dest_dir.join(&relative_path);
+    let partial_path = partial_path_for(&dest_path);
     if let Some(parent) = dest_path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -806,6 +1104,7 @@ pub async fn download_hub_model(
 
     let cancel_token = CancellationToken::new();
     let dest_path_string = dest_path.to_string_lossy().to_string();
+    let partial_path_string = partial_path.to_string_lossy().to_string();
     let resume_from = {
         let s = state.read().await;
         let can_resume = s
@@ -813,11 +1112,12 @@ pub async fn download_hub_model(
             .get(&download_id)
             .is_some_and(|entry| entry.progress.status == "Paused");
         drop(s);
-        if can_resume {
-            tokio::fs::metadata(&dest_path)
-                .await
-                .map(|metadata| metadata.len())
-                .unwrap_or(0)
+        let partial_len = tokio::fs::metadata(&partial_path)
+            .await
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if can_resume || partial_len > 0 {
+            partial_len
         } else {
             0
         }
@@ -829,11 +1129,16 @@ pub async fn download_hub_model(
             id: download_id.clone(),
             filename: filename.clone(),
             dest_path: Some(dest_path_string.clone()),
+            partial_path: Some(partial_path_string.clone()),
             supports_vision,
             repo_id: repo_id.clone(),
             downloaded_bytes: resume_from,
             total_bytes: 0,
             percent: 0.0,
+            speed_bps: None,
+            eta_seconds: None,
+            resumable: resume_from > 0,
+            attempt: 1,
             done: false,
             status: if resume_from > 0 {
                 "Resuming".to_string()
@@ -848,79 +1153,168 @@ pub async fn download_hub_model(
 
     let result: Result<String, String> = async {
         let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(20))
             .timeout(std::time::Duration::from_secs(7200)) // 2-hour ceiling for large models
+            .redirect(reqwest::redirect::Policy::limited(10))
             .user_agent("InferenceBridge/1.0")
             .build()
             .map_err(|e| e.to_string())?;
 
-        let mut request = client
-            .get(&url)
-            .header(reqwest::header::ACCEPT, "application/octet-stream");
-        if resume_from > 0 {
-            request = request.header(reqwest::header::RANGE, format!("bytes={resume_from}-"));
-        }
-        if let Some(key) = hf_api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            request = request.bearer_auth(key);
-        }
-        let resp = request
-            .send()
-            .await
-            .map_err(|e| format!("Download request failed: {e}"))?;
-
-        if !resp.status().is_success() {
-            return Err(format!(
-                "Server returned HTTP {} for {}",
-                resp.status(),
-                url
-            ));
-        }
-
-        let resumed = resume_from > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-        let mut downloaded: u64 = if resumed { resume_from } else { 0 };
-        let total_bytes = resp
-            .content_length()
-            .map(|length| length + downloaded)
-            .unwrap_or(downloaded);
-        let mut file = if resumed {
-            tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&dest_path)
-                .await
-                .map_err(|e| format!("Cannot open {}: {e}", dest_path.display()))?
-        } else {
-            tokio::fs::File::create(&dest_path)
-                .await
-                .map_err(|e| format!("Cannot create {}: {e}", dest_path.display()))?
-        };
-
-        let mut stream = resp.bytes_stream();
-        let mut last_emit = std::time::Instant::now();
+        let mut downloaded = resume_from;
+        let mut total_bytes = 0u64;
         let mut cancelled = false;
+        let mut completed = false;
+        let mut last_error: Option<String> = None;
 
-        while let Some(chunk) = tokio::select! {
-            _ = cancel_token.cancelled() => {
-                cancelled = true;
-                None
-            }
-            chunk = stream.next() => chunk
-        } {
-            let chunk = chunk.map_err(|e| format!("Download error: {e}"))?;
-            file.write_all(&chunk)
+        for attempt in 1..=5u32 {
+            let disk_resume = tokio::fs::metadata(&partial_path)
                 .await
-                .map_err(|e| format!("Write error: {e}"))?;
-            downloaded += chunk.len() as u64;
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            let mut request = client
+                .get(&url)
+                .header(reqwest::header::ACCEPT, "application/octet-stream");
+            if disk_resume > 0 {
+                request = request.header(reqwest::header::RANGE, format!("bytes={disk_resume}-"));
+            }
+            if let Some(key) = hf_api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                request = request.bearer_auth(key);
+            }
 
-            if last_emit.elapsed().as_millis() >= 250 {
-                let percent = if total_bytes > 0 {
-                    downloaded as f32 / total_bytes as f32
-                } else {
-                    0.0
+            let resp = match request.send().await {
+                Ok(resp) => resp,
+                Err(error) => {
+                    last_error = Some(format!("Download request failed: {error}"));
+                    tokio::time::sleep(std::time::Duration::from_millis(750 * attempt as u64))
+                        .await;
+                    continue;
+                }
+            };
+
+            if disk_resume > 0 && resp.status() == reqwest::StatusCode::OK {
+                tracing::warn!(
+                    url = %url,
+                    resume_from = disk_resume,
+                    "Hugging Face ignored Range resume; restarting partial model download"
+                );
+                let _ = tokio::fs::remove_file(&partial_path).await;
+            } else if !(resp.status().is_success()
+                || resp.status() == reqwest::StatusCode::PARTIAL_CONTENT)
+            {
+                last_error = Some(format!(
+                    "Server returned HTTP {} for {}",
+                    resp.status(),
+                    url
+                ));
+                tokio::time::sleep(std::time::Duration::from_millis(750 * attempt as u64)).await;
+                continue;
+            }
+
+            let resumed = disk_resume > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+            downloaded = if resumed { disk_resume } else { 0 };
+            total_bytes = resp
+                .content_length()
+                .map(|length| length + downloaded)
+                .unwrap_or(downloaded);
+            let mut file = if resumed {
+                tokio::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&partial_path)
+                    .await
+                    .map_err(|e| format!("Cannot open {}: {e}", partial_path.display()))?
+            } else {
+                tokio::fs::File::create(&partial_path)
+                    .await
+                    .map_err(|e| format!("Cannot create {}: {e}", partial_path.display()))?
+            };
+
+            let mut stream = resp.bytes_stream();
+            let mut last_emit = std::time::Instant::now();
+            let mut last_speed_sample = std::time::Instant::now();
+            let mut last_speed_bytes = downloaded;
+            let mut speed_bps = 0u64;
+            let mut attempt_failed = false;
+
+            while let Some(chunk) = tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    cancelled = true;
+                    None
+                }
+                chunk = stream.next() => chunk
+            } {
+                let chunk = match chunk {
+                    Ok(chunk) => chunk,
+                    Err(error) => {
+                        last_error = Some(format!("Download error: {error}"));
+                        attempt_failed = true;
+                        break;
+                    }
                 };
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|e| format!("Write error: {e}"))?;
+                downloaded += chunk.len() as u64;
+
+                if last_speed_sample.elapsed().as_millis() >= 1000 {
+                    let elapsed = last_speed_sample.elapsed().as_secs_f64().max(0.001);
+                    speed_bps = ((downloaded - last_speed_bytes) as f64 / elapsed).max(0.0) as u64;
+                    last_speed_bytes = downloaded;
+                    last_speed_sample = std::time::Instant::now();
+                }
+
+                if last_emit.elapsed().as_millis() >= 250 {
+                    emit_download_progress(
+                        &app,
+                        state.inner(),
+                        DownloadProgress {
+                            id: download_id.clone(),
+                            filename: filename.clone(),
+                            dest_path: Some(dest_path_string.clone()),
+                            partial_path: Some(partial_path_string.clone()),
+                            supports_vision,
+                            repo_id: repo_id.clone(),
+                            downloaded_bytes: downloaded,
+                            total_bytes,
+                            percent: progress_percent(downloaded, total_bytes),
+                            speed_bps: Some(speed_bps),
+                            eta_seconds: estimate_eta_seconds(downloaded, total_bytes, speed_bps),
+                            resumable: true,
+                            attempt,
+                            done: false,
+                            status: if attempt > 1 {
+                                "Retrying".to_string()
+                            } else {
+                                "Downloading".to_string()
+                            },
+                            error: None,
+                        },
+                        None,
+                    )
+                    .await;
+                    last_emit = std::time::Instant::now();
+                }
+            }
+
+            file.flush()
+                .await
+                .map_err(|e| format!("Flush error: {e}"))?;
+            drop(file);
+
+            if cancelled {
+                break;
+            }
+            if attempt_failed || (total_bytes > 0 && downloaded < total_bytes) {
+                if !attempt_failed {
+                    last_error = Some(format!(
+                        "Download incomplete: {} of {} bytes",
+                        downloaded, total_bytes
+                    ));
+                }
                 emit_download_progress(
                     &app,
                     state.inner(),
@@ -928,20 +1322,28 @@ pub async fn download_hub_model(
                         id: download_id.clone(),
                         filename: filename.clone(),
                         dest_path: Some(dest_path_string.clone()),
+                        partial_path: Some(partial_path_string.clone()),
                         supports_vision,
                         repo_id: repo_id.clone(),
                         downloaded_bytes: downloaded,
                         total_bytes,
-                        percent,
+                        percent: progress_percent(downloaded, total_bytes),
+                        speed_bps: Some(speed_bps),
+                        eta_seconds: estimate_eta_seconds(downloaded, total_bytes, speed_bps),
+                        resumable: true,
+                        attempt,
                         done: false,
-                        status: "Downloading".to_string(),
-                        error: None,
+                        status: "Retrying".to_string(),
+                        error: last_error.clone(),
                     },
                     None,
                 )
                 .await;
-                last_emit = std::time::Instant::now();
+                tokio::time::sleep(std::time::Duration::from_millis(750 * attempt as u64)).await;
+                continue;
             }
+            completed = true;
+            break;
         }
 
         if cancelled {
@@ -951,9 +1353,8 @@ pub async fn download_hub_model(
                     .get(&download_id)
                     .is_some_and(|entry| entry.progress.status == "Pausing")
             };
-            drop(file);
             if !paused {
-                let _ = tokio::fs::remove_file(&dest_path).await;
+                let _ = tokio::fs::remove_file(&partial_path).await;
             }
             emit_download_progress(
                 &app,
@@ -962,15 +1363,16 @@ pub async fn download_hub_model(
                     id: download_id.clone(),
                     filename: filename.clone(),
                     dest_path: Some(dest_path_string.clone()),
+                    partial_path: Some(partial_path_string.clone()),
                     supports_vision,
                     repo_id: repo_id.clone(),
                     downloaded_bytes: downloaded,
                     total_bytes,
-                    percent: if total_bytes > 0 {
-                        downloaded as f32 / total_bytes as f32
-                    } else {
-                        0.0
-                    },
+                    percent: progress_percent(downloaded, total_bytes),
+                    speed_bps: None,
+                    eta_seconds: None,
+                    resumable: paused,
+                    attempt: 1,
                     done: !paused,
                     status: if paused {
                         "Paused".to_string()
@@ -989,10 +1391,22 @@ pub async fn download_hub_model(
             });
         }
 
-        file.flush()
+        if !completed {
+            return Err(last_error.unwrap_or_else(|| "Download failed after retries".to_string()));
+        }
+
+        if total_bytes > 0 && downloaded < total_bytes {
+            return Err(last_error.unwrap_or_else(|| {
+                format!(
+                    "Download incomplete: {} of {} bytes",
+                    downloaded, total_bytes
+                )
+            }));
+        }
+
+        tokio::fs::rename(&partial_path, &dest_path)
             .await
-            .map_err(|e| format!("Flush error: {e}"))?;
-        drop(file);
+            .map_err(|e| format!("Cannot finalize {}: {e}", dest_path.display()))?;
 
         if let Some(model_filename) = relative_path
             .file_name()
@@ -1036,11 +1450,16 @@ pub async fn download_hub_model(
                 id: download_id.clone(),
                 filename: filename.clone(),
                 dest_path: Some(dest_path_string.clone()),
+                partial_path: None,
                 supports_vision,
                 repo_id: repo_id.clone(),
                 downloaded_bytes: downloaded,
                 total_bytes,
                 percent: 1.0,
+                speed_bps: None,
+                eta_seconds: None,
+                resumable: false,
+                attempt: 1,
                 done: true,
                 status: "Completed".to_string(),
                 error: None,
@@ -1055,7 +1474,6 @@ pub async fn download_hub_model(
 
     if let Err(error) = &result {
         if error != "Download cancelled" && error != "Download paused" {
-            let _ = tokio::fs::remove_file(&dest_path).await;
             emit_download_progress(
                 &app,
                 state.inner(),
@@ -1063,11 +1481,23 @@ pub async fn download_hub_model(
                     id: download_id,
                     filename,
                     dest_path: Some(dest_path_string),
+                    partial_path: Some(partial_path_string),
                     supports_vision,
                     repo_id,
-                    downloaded_bytes: 0,
+                    downloaded_bytes: tokio::fs::metadata(&partial_path)
+                        .await
+                        .map(|m| m.len())
+                        .unwrap_or(0),
                     total_bytes: 0,
                     percent: 0.0,
+                    speed_bps: None,
+                    eta_seconds: None,
+                    resumable: tokio::fs::metadata(&partial_path)
+                        .await
+                        .map(|m| m.len())
+                        .unwrap_or(0)
+                        > 0,
+                    attempt: 5,
                     done: true,
                     status: "Failed".to_string(),
                     error: Some(error.clone()),

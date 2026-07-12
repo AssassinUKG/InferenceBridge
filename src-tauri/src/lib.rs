@@ -222,6 +222,8 @@ pub fn run() {
             commands::browse::get_hub_access_status,
             commands::browse::sync_local_model_metadata,
             commands::browse::delete_model_file,
+            commands::browse::get_hub_model_details,
+            commands::browse::open_external_url,
             commands::browse::search_hub_models,
             commands::browse::show_in_folder,
         ])
@@ -446,6 +448,9 @@ pub fn run_headless(
             eprintln!("  Compatible with OpenAI API clients.");
             eprintln!("  POST /v1/chat/completions");
             eprintln!("  POST /v1/completions");
+            eprintln!("  POST /v1/responses");
+            eprintln!("  POST /v1/embeddings");
+            eprintln!("  POST /v1/messages");
             eprintln!("  GET  /v1/models");
             eprintln!("  GET  /v1/models/{{name}}");
             eprintln!("  POST /v1/models/load | /v1/models/unload");
@@ -1012,6 +1017,7 @@ pub fn run_one_shot(
             special: true,
             image_data: vec![],
             grammar: None,
+            json_schema: None,
         };
 
         let client = engine::client::LlamaClient::new(s.process.port());

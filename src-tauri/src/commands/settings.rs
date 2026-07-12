@@ -62,6 +62,9 @@ pub struct AppSettings {
     pub sglang_enabled: bool,
     pub sglang_base_url: String,
     pub sglang_api_key: Option<String>,
+    pub openai_enabled: bool,
+    pub openai_base_url: String,
+    pub openai_api_key: Option<String>,
     pub hf_api_key: Option<String>,
 }
 
@@ -147,6 +150,9 @@ pub async fn get_settings(state: tauri::State<'_, SharedState>) -> Result<AppSet
         sglang_enabled: s.config.providers.sglang.enabled,
         sglang_base_url: s.config.providers.sglang.base_url.clone(),
         sglang_api_key: s.config.providers.sglang.api_key.clone(),
+        openai_enabled: s.config.providers.openai.enabled,
+        openai_base_url: s.config.providers.openai.base_url.clone(),
+        openai_api_key: s.config.providers.openai.api_key.clone(),
         hf_api_key: s.config.hub.hf_api_key.clone(),
     })
 }
@@ -190,6 +196,7 @@ pub async fn update_settings(
     let active_provider = match settings.active_provider.trim() {
         "lm_studio" if settings.lm_studio_enabled => "lm_studio".to_string(),
         "sglang" if settings.sglang_enabled => "sglang".to_string(),
+        "openai" if settings.openai_enabled => "openai".to_string(),
         _ => "managed_llamacpp".to_string(),
     };
     let lm_studio_base_url =
@@ -201,6 +208,11 @@ pub async fn update_settings(
     let sglang_base_url = crate::providers::normalize_openai_base_url(&settings.sglang_base_url);
     let sglang_api_key = settings
         .sglang_api_key
+        .clone()
+        .filter(|key| !key.trim().is_empty());
+    let openai_base_url = crate::providers::normalize_openai_base_url(&settings.openai_base_url);
+    let openai_api_key = settings
+        .openai_api_key
         .clone()
         .filter(|key| !key.trim().is_empty());
     let hf_api_key = settings
@@ -215,6 +227,7 @@ pub async fn update_settings(
         previous_api_key,
         previous_lm_studio_api_key,
         previous_sglang_api_key,
+        previous_openai_api_key,
         previous_hf_api_key,
     ) = {
         let mut s = shared.write().await;
@@ -223,6 +236,7 @@ pub async fn update_settings(
         let previous_api_key = s.config.server.api_key.clone();
         let previous_lm_studio_api_key = s.config.providers.lm_studio.api_key.clone();
         let previous_sglang_api_key = s.config.providers.sglang.api_key.clone();
+        let previous_openai_api_key = s.config.providers.openai.api_key.clone();
         let previous_hf_api_key = s.config.hub.hf_api_key.clone();
         let previous_autostart = s.config.server.autostart;
         let previous_api_state = s.api_server_state.clone();
@@ -323,6 +337,9 @@ pub async fn update_settings(
         s.config.providers.sglang.enabled = settings.sglang_enabled;
         s.config.providers.sglang.base_url = sglang_base_url.clone();
         s.config.providers.sglang.api_key = sglang_api_key.clone();
+        s.config.providers.openai.enabled = settings.openai_enabled;
+        s.config.providers.openai.base_url = openai_base_url.clone();
+        s.config.providers.openai.api_key = openai_api_key.clone();
         s.config.hub.hf_api_key = hf_api_key.clone();
 
         // Persist to disk.
@@ -345,6 +362,7 @@ pub async fn update_settings(
             previous_api_key,
             previous_lm_studio_api_key,
             previous_sglang_api_key,
+            previous_openai_api_key,
             previous_hf_api_key,
         )
     };
@@ -378,6 +396,7 @@ pub async fn update_settings(
         api_key_changed = previous_api_key != normalized_api_key,
         lm_studio_api_key_changed = previous_lm_studio_api_key != lm_studio_api_key,
         sglang_api_key_changed = previous_sglang_api_key != sglang_api_key,
+        openai_api_key_changed = previous_openai_api_key != openai_api_key,
         hf_api_key_changed = previous_hf_api_key != hf_api_key,
         "Settings updated"
     );

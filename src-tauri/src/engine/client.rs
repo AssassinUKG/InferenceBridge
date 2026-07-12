@@ -48,6 +48,10 @@ pub struct CompletionRequest {
     /// GBNF grammar string for constrained generation (e.g. tool call enforcement).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grammar: Option<String>,
+    /// Raw JSON Schema for constrained decoding. llama-server converts it to a
+    /// grammar server-side. Mutually exclusive with `grammar`; schema wins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub json_schema: Option<Value>,
 }
 
 /// Response from llama-server's /completion endpoint (non-streaming).
@@ -203,6 +207,30 @@ impl LlamaClient {
             anyhow::bail!("llama-server returned {status}: {body}");
         }
         Ok(resp)
+    }
+
+    /// Proxy an OpenAI-shaped embeddings request to llama-server's /v1/embeddings.
+    pub async fn embeddings(&self, body: &Value) -> Result<Value> {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(NON_STREAM_HTTP_TIMEOUT_SECS),
+            async {
+                let url = format!("{}/v1/embeddings", self.base_url);
+                let resp = self.client.post(&url).json(body).send().await?;
+                if !resp.status().is_success() {
+                    let status = resp.status();
+                    let body = resp.text().await.unwrap_or_default();
+                    anyhow::bail!("llama-server /v1/embeddings returned {status}: {body}");
+                }
+                Ok(resp.json().await?)
+            },
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "llama-server embeddings request timed out after {} seconds",
+                NON_STREAM_HTTP_TIMEOUT_SECS
+            )
+        })?
     }
 
     /// Send an OpenAI-compatible chat completion request.

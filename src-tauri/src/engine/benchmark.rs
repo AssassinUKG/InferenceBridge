@@ -76,6 +76,7 @@ pub async fn test_model(
         special: true,
         image_data: vec![],
         grammar: None,
+        json_schema: None,
     };
     let port = {
         let state = shared_state.read().await;

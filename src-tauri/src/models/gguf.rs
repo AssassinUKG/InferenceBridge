@@ -4,9 +4,12 @@
 //! Parses enough to derive accurate VRAM estimates and expose the model's
 //! true training context length, layer count, and GQA configuration.
 
+use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::path::Path;
+use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::UNIX_EPOCH;
 
 /// `GGUF` as a little-endian u32
 const GGUF_MAGIC: u32 = 0x46554747;
@@ -160,17 +163,31 @@ fn skip_val<R: Read + Seek>(r: &mut R, ty: u32, v1: bool) -> Option<()> {
 
 /// Parse architecture metadata from a GGUF file header.
 ///
-/// Reads only as far as needed (exits once all six target keys are found).
+/// Memory-maps the file and parses from the mapped bytes, so header skips
+/// (including large tokenizer arrays that precede `chat_template`) are pure
+/// in-memory seeks rather than buffered reads + syscalls. mmap is lazy, so
+/// only the touched header pages are actually read from disk — never the
+/// multi-GB tensor payload.
+///
+/// Reads only as far as needed (exits once all target keys are found).
 /// Returns `None` on any I/O or format error — never panics.
 pub fn read_gguf_meta(path: &Path) -> Option<GgufMeta> {
     let file = File::open(path).ok()?;
-    let mut r = BufReader::new(file);
+    // SAFETY: the file is only read through the returned slice; we never keep
+    // the mapping past this function and tolerate concurrent truncation by
+    // treating any parse failure as `None`.
+    let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
+    let mut r = Cursor::new(&mmap[..]);
+    parse_gguf_meta(&mut r)
+}
 
-    if read_u32(&mut r)? != GGUF_MAGIC {
+/// Core GGUF header parser, generic over any seekable byte source.
+fn parse_gguf_meta<R: Read + Seek>(r: &mut R) -> Option<GgufMeta> {
+    if read_u32(r)? != GGUF_MAGIC {
         return None;
     }
 
-    let version = read_u32(&mut r)?;
+    let version = read_u32(r)?;
     if version == 0 || version > 3 {
         return None;
     }
@@ -178,11 +195,11 @@ pub fn read_gguf_meta(path: &Path) -> Option<GgufMeta> {
 
     // n_tensors (skip), then n_kv
     let n_kv = if v1 {
-        let _ = read_u32(&mut r)?;
-        read_u32(&mut r)? as u64
+        let _ = read_u32(r)?;
+        read_u32(r)? as u64
     } else {
-        let _ = read_u64(&mut r)?;
-        read_u64(&mut r)?
+        let _ = read_u64(r)?;
+        read_u64(r)?
     };
 
     let mut meta = GgufMeta::default();
@@ -193,55 +210,164 @@ pub fn read_gguf_meta(path: &Path) -> Option<GgufMeta> {
             break; // all target fields collected
         }
 
-        let key = read_str(&mut r, v1)?;
-        let ty = read_u32(&mut r)?;
+        let key = read_str(r, v1)?;
+        let ty = read_u32(r)?;
 
         // Match on key suffix so it works regardless of architecture prefix
         // (e.g. "llama.", "qwen2.", "qwen3.", "mistral.", etc.)
         match (key.as_str(), ty) {
             ("general.architecture", T_STRING) => {
-                meta.architecture = Some(read_str(&mut r, v1)?);
+                meta.architecture = Some(read_str(r, v1)?);
                 found += 1;
             }
             ("general.name", T_STRING) => {
-                meta.general_name = Some(read_str(&mut r, v1)?);
+                meta.general_name = Some(read_str(r, v1)?);
                 found += 1;
             }
             ("tokenizer.chat_template", T_STRING) => {
                 // Only record presence — the template itself can be many KB and
                 // we don't want it bloating the in-memory model registry.
                 meta.has_chat_template = true;
-                skip_val(&mut r, ty, v1)?;
+                skip_val(r, ty, v1)?;
                 found += 1;
             }
             (k, T_U32) if k.ends_with(".context_length") => {
-                meta.context_length = Some(read_u32(&mut r)?);
+                meta.context_length = Some(read_u32(r)?);
                 found += 1;
             }
             (k, T_U32) if k.ends_with(".block_count") => {
-                meta.n_layers = Some(read_u32(&mut r)?);
+                meta.n_layers = Some(read_u32(r)?);
                 found += 1;
             }
             (k, T_U32) if k.ends_with(".embedding_length") => {
-                meta.embedding_length = Some(read_u32(&mut r)?);
+                meta.embedding_length = Some(read_u32(r)?);
                 found += 1;
             }
             (k, T_U32) if k.ends_with(".attention.head_count_kv") => {
-                meta.n_kv_heads = Some(read_u32(&mut r)?);
+                meta.n_kv_heads = Some(read_u32(r)?);
                 found += 1;
             }
             (k, T_U32) if k.ends_with(".attention.head_count") => {
                 // head_count (no _kv suffix) — checked after head_count_kv
-                meta.n_heads = Some(read_u32(&mut r)?);
+                meta.n_heads = Some(read_u32(r)?);
                 found += 1;
             }
             _ => {
-                skip_val(&mut r, ty, v1)?;
+                skip_val(r, ty, v1)?;
             }
         }
     }
 
     Some(meta)
+}
+
+// ── Persistent metadata cache ────────────────────────────────────────────────
+//
+// Parsing a GGUF header still touches disk. During a rescan the vast majority
+// of files are unchanged, so we keep a `(size, mtime) → GgufMeta` cache on disk
+// keyed by absolute path. A warm rescan then avoids re-mapping every file and
+// becomes near-instant. Failed parses are cached as `None` so broken/partial
+// files aren't retried on every scan (they re-parse only when size/mtime moves).
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct GgufCacheEntry {
+    size: u64,
+    mtime: i64,
+    meta: Option<GgufMeta>,
+}
+
+struct GgufCache {
+    entries: HashMap<String, GgufCacheEntry>,
+    dirty: bool,
+}
+
+static CACHE: OnceLock<Mutex<GgufCache>> = OnceLock::new();
+
+fn cache_file_path() -> PathBuf {
+    crate::config::app_support_dir().join("gguf-meta-cache.json")
+}
+
+fn cache() -> &'static Mutex<GgufCache> {
+    CACHE.get_or_init(|| {
+        let entries = std::fs::read_to_string(cache_file_path())
+            .ok()
+            .and_then(|s| serde_json::from_str::<HashMap<String, GgufCacheEntry>>(&s).ok())
+            .unwrap_or_default();
+        Mutex::new(GgufCache {
+            entries,
+            dirty: false,
+        })
+    })
+}
+
+/// `(size, mtime_secs)` for cache validation. `None` if the file can't be stat'd.
+fn file_stat(path: &Path) -> Option<(u64, i64)> {
+    let md = std::fs::metadata(path).ok()?;
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Some((md.len(), mtime))
+}
+
+/// Cache-backed wrapper around [`read_gguf_meta`]. Returns the cached metadata
+/// when the file's size and mtime are unchanged; otherwise parses and records
+/// the result. Falls back to a direct parse if the file can't be stat'd.
+pub fn read_gguf_meta_cached(path: &Path) -> Option<GgufMeta> {
+    let Some((size, mtime)) = file_stat(path) else {
+        return read_gguf_meta(path);
+    };
+    let key = path.to_string_lossy().into_owned();
+
+    if let Ok(guard) = cache().lock() {
+        if let Some(entry) = guard.entries.get(&key) {
+            if entry.size == size && entry.mtime == mtime {
+                return entry.meta.clone();
+            }
+        }
+    }
+
+    // Parse outside the lock so parallel scans don't serialize on disk I/O.
+    let meta = read_gguf_meta(path);
+    if let Ok(mut guard) = cache().lock() {
+        guard.entries.insert(
+            key,
+            GgufCacheEntry {
+                size,
+                mtime,
+                meta: meta.clone(),
+            },
+        );
+        guard.dirty = true;
+    }
+    meta
+}
+
+/// Flush the in-memory cache to disk if it changed. Call once at the end of a
+/// scan pass. Best-effort: persistence failures are logged, not fatal.
+pub fn flush_gguf_cache() {
+    let Some(lock) = CACHE.get() else {
+        return;
+    };
+    let Ok(mut guard) = lock.lock() else {
+        return;
+    };
+    if !guard.dirty {
+        return;
+    }
+    let path = cache_file_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match serde_json::to_string(&guard.entries) {
+        Ok(json) => match std::fs::write(&path, json) {
+            Ok(()) => guard.dirty = false,
+            Err(e) => tracing::warn!(?path, error = %e, "Failed to persist GGUF metadata cache"),
+        },
+        Err(e) => tracing::warn!(error = %e, "Failed to serialize GGUF metadata cache"),
+    }
 }
 
 #[cfg(test)]

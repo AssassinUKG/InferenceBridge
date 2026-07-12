@@ -1002,8 +1002,19 @@ function ModelInspector({
           </div>
           {loaded && <span className="rounded px-2 py-0.5 text-[10px] font-bold uppercase" style={{ background: "rgba(52,211,153,0.14)", color: "#6ee7b7", border: "1px solid rgba(52,211,153,0.28)" }}>Loaded</span>}
         </div>
+        {loaded && (
+          <div className="mt-3 rounded-md px-3 py-2" style={{ background: "rgba(248,113,113,0.075)", border: "1px solid rgba(248,113,113,0.22)" }}>
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-[10px] font-bold uppercase tracking-[0.16em]" style={{ color: "#fca5a5" }}>Global runtime</div>
+                <div className="mt-0.5 text-xs" style={{ color: "var(--text-1)" }}>Unload stops the active llama-server model for API, chat, and all clients.</div>
+              </div>
+              <ActionBtn label="Unload Active Model" disabled={isLoading || !model.provider_managed} variant="danger" onClick={onUnload} />
+            </div>
+          </div>
+        )}
         <div className="mt-3 grid grid-cols-2 gap-2">
-          <ActionBtn label={loaded ? "Unload Model" : "Load Model"} disabled={isLoading || !model.provider_managed} variant={loaded ? "ghost" : "primary"} onClick={() => loaded ? onUnload() : onLoad(model.filename, loadOptions)} />
+          <ActionBtn label={loaded ? "Reload Options" : "Load Model"} disabled={isLoading || !model.provider_managed} variant="primary" onClick={() => onLoad(model.filename, loadOptions)} />
           <ActionBtn label="Swap In" disabled={isLoading || loaded || !loadedModel || !model.provider_managed} variant="indigo" onClick={() => onSwap(model.filename, loadOptions)} />
           <ActionBtn label={sidecarSyncing ? "Syncing HF..." : "Sync HF Files"} disabled={isLoading || sidecarSyncing || !model.hf_repo} variant="ghost" onClick={() => onSyncSidecars(model)} />
           <ActionBtn label="Open HF Cache" disabled={!canOpenHfCache} variant="ghost" onClick={() => {
@@ -1079,12 +1090,12 @@ function ModelInspector({
           <InfoRow label="Template Cache" value={sidecarStatus?.template_cached ? "Cached locally" : sidecarStatus?.repo_id ? "Missing locally" : "No HF repo"} />
           <InfoRow label="HF Sidecars" value={sidecarStatus?.repo_id ? `${sidecarStatus.sidecar_cached_count}/${sidecarStatus.sidecar_expected_count} cached` : "-"} />
           <InfoRow label="MMProj" value={launchPreview?.mmproj_path ? "Attached" : model.supports_vision ? "Not attached" : "Not required"} />
-          <InfoRow label="Draft" value={launchPreview?.draft_model_path ? "Enabled" : "Disabled"} />
-          {launchPreview?.draft_model_path && (
+          <InfoRow label="Draft" value={launchPreview?.spec_type ? launchPreview.draft_model_path ? "Draft GGUF" : "Self-MTP" : "Disabled"} />
+          {launchPreview?.spec_type && (
             <>
               <InfoRow label="Spec Type" value={launchPreview.spec_type || "-"} />
               <InfoRow label="Draft N" value={launchPreview.spec_draft_n_max ? String(launchPreview.spec_draft_n_max) : "-"} />
-              <InfoRow label="Draft File" value={launchPreview.draft_model_path} />
+              {launchPreview.draft_model_path && <InfoRow label="Draft File" value={launchPreview.draft_model_path} />}
             </>
           )}
           <div className="mt-4 space-y-2">
@@ -2213,7 +2224,7 @@ function ActionBtn({
   label: string;
   onClick: () => void;
   disabled: boolean;
-  variant: "primary" | "ghost" | "indigo";
+  variant: "primary" | "ghost" | "indigo" | "danger";
 }) {
   const styles: Record<string, { bg: string; border: string; color: string }> = {
     primary: {
@@ -2230,6 +2241,11 @@ function ActionBtn({
       bg: "rgba(99,102,241,0.12)",
       border: "rgba(99,102,241,0.25)",
       color: "#a5b4fc",
+    },
+    danger: {
+      bg: "rgba(248,113,113,0.16)",
+      border: "rgba(248,113,113,0.35)",
+      color: "#fca5a5",
     },
   };
   const s = styles[variant];

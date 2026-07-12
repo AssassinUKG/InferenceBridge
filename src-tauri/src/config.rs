@@ -47,11 +47,13 @@ pub struct ModelsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProvidersConfig {
-    /// Active runtime provider. Supported now: "managed_llamacpp", "lm_studio", "sglang".
+    /// Active runtime provider. Supported now: "managed_llamacpp", "lm_studio", "sglang", "openai".
     pub active: String,
     pub lm_studio: ExternalProviderConfig,
     #[serde(default = "default_sglang_provider")]
     pub sglang: ExternalProviderConfig,
+    #[serde(default = "default_openai_provider")]
+    pub openai: ExternalProviderConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -207,7 +209,7 @@ impl Default for ServerConfig {
             default_top_p: None,
             default_top_k: None,
             default_max_tokens: None,
-            default_ctx_size: Some(32768),
+            default_ctx_size: Some(40960),
             tool_argument_repair_enabled: true,
             api_key: None,
         }
@@ -234,6 +236,11 @@ impl Default for ProvidersConfig {
                 base_url: "http://127.0.0.1:30000/v1".to_string(),
                 api_key: None,
             },
+            openai: ExternalProviderConfig {
+                enabled: false,
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key: None,
+            },
         }
     }
 }
@@ -242,6 +249,14 @@ fn default_sglang_provider() -> ExternalProviderConfig {
     ExternalProviderConfig {
         enabled: false,
         base_url: "http://127.0.0.1:30000/v1".to_string(),
+        api_key: None,
+    }
+}
+
+fn default_openai_provider() -> ExternalProviderConfig {
+    ExternalProviderConfig {
+        enabled: false,
+        base_url: "https://api.openai.com/v1".to_string(),
         api_key: None,
     }
 }

@@ -73,7 +73,7 @@ Base URL:
 http://127.0.0.1:8800/v1
 ```
 
-If you set an API key in Settings, pass it as a Bearer token. If no API key is configured, the local endpoint is open.
+If you set an API key in Settings, pass it as a Bearer token. Anthropic-compatible clients may also pass the same key with `x-api-key`. If no API key is configured, the local endpoint is open.
 
 ### Core Endpoints
 
@@ -87,6 +87,9 @@ If you set an API key in Settings, pass it as a Bearer token. If no API key is c
 | `POST` | `/v1/models/stats` | Get status or load progress for a model |
 | `POST` | `/v1/chat/completions` | OpenAI-style chat completions |
 | `POST` | `/v1/completions` | Text completions |
+| `POST` | `/v1/responses` | OpenAI Responses-style completions |
+| `POST` | `/v1/embeddings` | OpenAI-style embeddings, proxied to the loaded llama-server |
+| `POST` | `/v1/messages` | Anthropic Messages-compatible chat |
 | `POST` | `/v1/reliability/agent-action/validate` | Clean, repair, and validate strict agent action JSON |
 | `GET` | `/v1/context/status` | Context and KV-cache status |
 | `GET` | `/v1/runtime/doctor` | Local provider preflight diagnostics |
@@ -94,6 +97,10 @@ If you set an API key in Settings, pass it as a Bearer token. If no API key is c
 | `POST` | `/v1/sessions` | Create a chat session |
 | `DELETE` | `/v1/sessions/{id}` | Delete a chat session |
 | `GET` | `/v1/sessions/{id}/messages` | Get session messages |
+
+### OpenAI Provider Mode
+
+InferenceBridge can also act as the stable front door for the official OpenAI API. In Settings, enable `OpenAI`, set the active provider to `OpenAI`, and provide an API key or set `OPENAI_API_KEY` before starting IB. Requests to `/v1/chat/completions`, `/v1/responses`, `/v1/embeddings`, and `/v1/models` are then proxied to `https://api.openai.com/v1`.
 
 ### Example: List Models
 
@@ -129,6 +136,27 @@ curl "http://127.0.0.1:8800/v1/chat/completions" \
     "stream": false
   }'
 ```
+
+`/v1/chat/completions` and `/v1/completions` accept OpenAI `response_format` values. `{"type":"json_object"}` maps to a permissive object schema, and `{"type":"json_schema","json_schema":{"schema":...}}` is passed to llama-server constrained decoding.
+
+### Example: Embeddings
+
+```bash
+curl "http://127.0.0.1:8800/v1/embeddings" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"local-embedding-model","input":"hello"}'
+```
+
+Embeddings require the currently loaded llama-server model to support embeddings. For best results, load an embedding GGUF such as `nomic-embed-text` or `bge`.
+
+### Example: Anthropic Messages
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8800/v1"
+export ANTHROPIC_API_KEY="your-key-here"
+```
+
+InferenceBridge accepts Anthropic `POST /v1/messages` requests, including `x-api-key` auth, `system`, `tools`, `tool_result`, and streaming SSE framing.
 
 ### Example: Validate Agent Action Output
 
@@ -191,6 +219,10 @@ Requirements:
 - Rust 1.75+
 - Node.js 18+
 - platform build tools for Tauri
+
+InferenceBridge intentionally has no STT/TTS/audio runtime dependency. Voice features live in
+client apps such as TheMauler/HelixClaw; do not install Kokoro, Piper, or ffmpeg here unless another
+local workflow needs them.
 
 ```bash
 git clone https://github.com/AssassinUKG/InferenceBridge

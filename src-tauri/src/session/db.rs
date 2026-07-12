@@ -219,13 +219,22 @@ impl SessionDb {
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
-        self.conn.execute_batch(&format!(
-            "DELETE FROM tool_calls WHERE message_id IN (SELECT id FROM messages WHERE session_id = '{}');
-             DELETE FROM context_snapshots WHERE session_id = '{}';
-             DELETE FROM messages WHERE session_id = '{}';
-             DELETE FROM sessions WHERE id = '{}';",
-            session_id, session_id, session_id, session_id
-        ))?;
+        self.conn.execute(
+            "DELETE FROM tool_calls WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)",
+            rusqlite::params![session_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM context_snapshots WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            rusqlite::params![session_id],
+        )?;
         Ok(())
     }
 }

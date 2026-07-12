@@ -618,6 +618,7 @@ pub async fn send_message(
         special: true,
         image_data,
         grammar: None,
+        json_schema: None,
     };
 
     let generation_started_at = now_rfc3339();

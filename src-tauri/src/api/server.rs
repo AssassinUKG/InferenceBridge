@@ -1,5 +1,7 @@
 //! Axum HTTP server that runs alongside Tauri and serves the OpenAI-compatible API.
 
+use axum::body::{Body, Bytes};
+use axum::response::IntoResponse;
 use axum::Router;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -123,6 +125,7 @@ async fn serve_api_server(
         // automatically — no explicit proxy routes needed.
         // The /v1/* and /api/v1/* routes take priority (.nest() before .fallback()).
         .fallback(backend_proxy_fallback)
+        .route_layer(axum::middleware::from_fn(strip_json_bom))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_api_key,
@@ -628,9 +631,54 @@ async fn backend_proxy_fallback(
 // Auth middleware
 // ---------------------------------------------------------------------------
 
+async fn strip_json_bom(
+    req: axum::http::Request<Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if !should_strip_json_bom(&req) {
+        return next.run(req).await;
+    }
+
+    let (parts, body) = req.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, 128 * 1024 * 1024).await {
+        Ok(bytes) => strip_utf8_bom(bytes),
+        Err(error) => {
+            tracing::warn!(error = %error, "Failed to read JSON request body for BOM normalization");
+            return axum::http::StatusCode::BAD_REQUEST.into_response();
+        }
+    };
+
+    next.run(axum::http::Request::from_parts(
+        parts,
+        Body::from(body_bytes),
+    ))
+    .await
+}
+
+fn should_strip_json_bom(req: &axum::http::Request<Body>) -> bool {
+    matches!(
+        *req.method(),
+        axum::http::Method::POST | axum::http::Method::PUT | axum::http::Method::PATCH
+    ) && req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase().contains("json"))
+        .unwrap_or(false)
+}
+
+fn strip_utf8_bom(bytes: Bytes) -> Bytes {
+    const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+    if bytes.starts_with(UTF8_BOM) {
+        Bytes::copy_from_slice(&bytes[UTF8_BOM.len()..])
+    } else {
+        bytes
+    }
+}
+
 async fn require_api_key(
     axum::extract::State(state): axum::extract::State<SharedState>,
-    req: axum::http::Request<axum::body::Body>,
+    req: axum::http::Request<Body>,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let path = req.uri().path();
@@ -652,8 +700,15 @@ async fn require_api_key(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    let x_api_key = req
+        .headers()
+        .get("x-api-key")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
 
-    if constant_time_eq(auth.strip_prefix("Bearer ").unwrap_or(""), &api_key) {
+    if constant_time_eq(auth.strip_prefix("Bearer ").unwrap_or(""), &api_key)
+        || constant_time_eq(x_api_key, &api_key)
+    {
         return next.run(req).await;
     }
 
@@ -662,7 +717,7 @@ async fn require_api_key(
         .header(axum::http::header::CONTENT_TYPE, "application/json")
         .header("WWW-Authenticate", "Bearer")
         .body(axum::body::Body::from(
-            r#"{"error":{"message":"Invalid API key. Provide your key as: Authorization: Bearer <key>","type":"invalid_request_error","code":"invalid_api_key"}}"#,
+            r#"{"error":{"message":"Invalid API key. Provide your key as Authorization: Bearer <key> or x-api-key: <key>","type":"invalid_request_error","code":"invalid_api_key"}}"#,
         ))
         .unwrap_or_default()
 }
@@ -695,13 +750,29 @@ fn api_routes() -> Router<SharedState> {
             axum::routing::post(super::responses::responses),
         )
         .route(
+            "/responses/input_tokens",
+            axum::routing::post(backend_proxy_fallback),
+        )
+        .route(
             "/chat/completions",
             axum::routing::post(super::completions::chat_completions),
         )
         .route(
+            "/chat/completions/input_tokens",
+            axum::routing::post(backend_proxy_fallback),
+        )
+        .route("/messages", axum::routing::post(super::messages::messages))
+        .route(
             "/completions",
             axum::routing::post(super::completions::text_completions),
         )
+        .route(
+            "/embeddings",
+            axum::routing::post(super::embeddings::embeddings),
+        )
+        .route("/rerank", axum::routing::post(backend_proxy_fallback))
+        .route("/reranking", axum::routing::post(backend_proxy_fallback))
+        .route("/reranker", axum::routing::post(backend_proxy_fallback))
         .route("/models", axum::routing::get(super::models::list_models))
         .route(
             "/models/load",
@@ -907,7 +978,8 @@ impl Drop for ApiServerGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, is_api_auth_exempt, port_owner_is_killable};
+    use super::{constant_time_eq, is_api_auth_exempt, port_owner_is_killable, strip_utf8_bom};
+    use axum::body::Bytes;
     use axum::http::Method;
 
     #[test]
@@ -917,6 +989,8 @@ mod tests {
         assert!(is_api_auth_exempt(&Method::OPTIONS, "/v1/chat/completions"));
 
         assert!(!is_api_auth_exempt(&Method::GET, "/v1/models"));
+        assert!(!is_api_auth_exempt(&Method::POST, "/v1/messages"));
+        assert!(!is_api_auth_exempt(&Method::POST, "/v1/embeddings"));
         assert!(!is_api_auth_exempt(&Method::POST, "/api/v1/models/load"));
         assert!(!is_api_auth_exempt(&Method::POST, "/completion"));
         assert!(!is_api_auth_exempt(&Method::GET, "/v1/anything/health"));
@@ -928,6 +1002,15 @@ mod tests {
         assert!(!constant_time_eq("secret", "Secret"));
         assert!(!constant_time_eq("secret", "secret-extra"));
         assert!(!constant_time_eq("", "secret"));
+    }
+
+    #[test]
+    fn strips_utf8_bom_from_json_body_bytes() {
+        let stripped = strip_utf8_bom(Bytes::from_static(b"\xEF\xBB\xBF{\"ok\":true}"));
+        assert_eq!(&stripped[..], br#"{"ok":true}"#);
+
+        let unchanged = strip_utf8_bom(Bytes::from_static(br#"{"ok":true}"#));
+        assert_eq!(&unchanged[..], br#"{"ok":true}"#);
     }
 
     #[test]

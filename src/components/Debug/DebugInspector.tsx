@@ -62,7 +62,7 @@ function Panel({
       style={{
         background: "var(--surface-1)",
         border: "1px solid var(--border)",
-        borderRadius: "10px",
+        borderRadius: "8px",
         overflow: "hidden",
       }}
     >
@@ -179,13 +179,36 @@ function StatusDot({ running, starting, error }: { running: boolean; starting?: 
 
 function Metric({ label, value, mono }: { label: string; value: string; mono?: boolean }) {
   return (
-    <div className="rounded px-3 py-3" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
+    <div className="rounded-md px-3 py-3" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
       <div className="text-[11px] font-semibold uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>
         {label}
       </div>
       <div className={`mt-1 text-sm ${mono ? "break-all font-mono" : "font-medium"}`} style={{ color: "var(--text-0)" }}>
         {value}
       </div>
+    </div>
+  );
+}
+
+function ServerMetric({
+  label,
+  value,
+  detail,
+  tone,
+  mono,
+}: {
+  label: string;
+  value: string;
+  detail?: string;
+  tone?: "ok" | "warn" | "error" | "neutral";
+  mono?: boolean;
+}) {
+  const color = tone === "ok" ? "#34d399" : tone === "warn" ? "#fbbf24" : tone === "error" ? "#f87171" : "var(--text-0)";
+  return (
+    <div className="min-w-0 rounded-md px-3 py-3" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
+      <div className="text-[10px] font-semibold uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>{label}</div>
+      <div className={`mt-1 truncate text-sm font-semibold ${mono ? "font-mono" : ""}`} title={value} style={{ color }}>{value}</div>
+      {detail && <div className="mt-1 truncate text-xs" title={detail} style={{ color: "var(--text-2)" }}>{detail}</div>}
     </div>
   );
 }
@@ -631,8 +654,8 @@ export function DebugInspector({
     <div className="h-full overflow-y-auto">
       <div className="flex flex-col gap-3 p-3">
         <Panel
-          title="Developer Server"
-          description="Run the app like LM Studio and inspect the same public API your external tools use."
+          title="Developer Console"
+          description="Manage the embedded OpenAI-compatible server and inspect the public API used by external tools."
           actions={
             <div className="flex flex-wrap items-center gap-2">
               <ActionButton label="Copy URL" onClick={() => navigator.clipboard.writeText(apiUrl)} />
@@ -646,7 +669,42 @@ export function DebugInspector({
             </div>
           }
         >
-          <div className="grid gap-3 px-4 py-3 lg:grid-cols-4">
+          <div className="grid gap-3 px-4 py-3 xl:grid-cols-[1.25fr_1.45fr_1.6fr_1fr]">
+            <ServerMetric
+              label="Server"
+              value={
+                serveRunning
+                  ? "Running"
+                  : serveStopping
+                    ? "Stopping"
+                    : modelTransitionActive
+                      ? processStatus?.model_load_state ?? "Loading"
+                      : serveStarting
+                        ? "Starting"
+                        : serveState === "Error"
+                          ? "Unreachable"
+                          : "Stopped"
+              }
+              detail={
+                modelTransitionActive
+                  ? modelTransition?.message ?? "Model transition in progress"
+                  : serveRunning
+                    ? "Public API is reachable"
+                    : serveState === "Error"
+                      ? processStatus?.api_error ?? "API is not bound"
+                      : "External clients are not being served"
+              }
+              tone={serveRunning ? "ok" : serveStarting || serveStopping || modelTransitionActive ? "warn" : serveState === "Error" ? "error" : "neutral"}
+            />
+            <ServerMetric label={serveReachable ? "Reachable at" : "Configured at"} value={apiUrl} tone={serveReachable ? "ok" : "neutral"} mono />
+            <ServerMetric label="Active model" value={activeModel ?? "No model loaded"} detail={processStatus?.last_launch_preview?.context_size ? `${processStatus.last_launch_preview.context_size.toLocaleString()} ctx` : undefined} />
+            <ServerMetric
+              label="Runtime"
+              value={processStatus?.backend ?? "Unknown backend"}
+              detail={processStatus?.startup_duration_ms != null ? `${processStatus.startup_duration_ms} ms startup` : undefined}
+            />
+          </div>
+          <div className="hidden">
             <div>
               <div className="flex items-center gap-2 text-sm font-semibold" style={{ color: serveRunning ? "#34d399" : serveStarting || serveStopping || modelTransitionActive ? "#fde68a" : serveState === "Error" ? "#f87171" : "var(--text-0)" }}>
                 <StatusDot running={serveRunning} starting={serveStarting || serveStopping || modelTransitionActive} error={serveState === "Error" && !modelTransitionActive} />
@@ -707,7 +765,7 @@ export function DebugInspector({
         </Panel>
 
         <section
-          className="flex flex-wrap items-center gap-2 rounded px-3 py-2"
+          className="flex flex-wrap items-center gap-1 rounded-md px-2 py-2"
           style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
         >
           {TABS.map((tab) => (
@@ -716,9 +774,9 @@ export function DebugInspector({
               onClick={() => setActiveTab(tab.key)}
               className="rounded px-3 py-1.5 text-sm font-medium transition"
               style={{
-                background: activeTab === tab.key ? "var(--surface-2)" : "transparent",
-                color: activeTab === tab.key ? "var(--text-0)" : "var(--text-1)",
-                border: activeTab === tab.key ? "1px solid var(--border)" : "1px solid transparent",
+                background: activeTab === tab.key ? "rgba(34,211,238,0.12)" : "transparent",
+                color: activeTab === tab.key ? "#a5f3fc" : "var(--text-1)",
+                border: activeTab === tab.key ? "1px solid rgba(34,211,238,0.24)" : "1px solid transparent",
                 cursor: "pointer",
               }}
             >

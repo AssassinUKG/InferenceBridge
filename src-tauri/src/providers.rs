@@ -64,6 +64,7 @@ pub enum ProviderType {
     ExternalLlamaCpp,
     LmStudio,
     SgLang,
+    OpenAi,
     Ollama,
     OpenAiCompatible,
 }
@@ -227,7 +228,8 @@ pub async fn collect_runtime_doctor(state: SharedState) -> RuntimeDoctorReport {
             "http://127.0.0.1:30000",
         ),
     ] {
-        providers.push(probe_openai_compatible_endpoint(id, provider_type, name, base_url).await);
+        providers
+            .push(probe_openai_compatible_endpoint(id, provider_type, name, base_url, None).await);
     }
 
     let reachable_providers = providers
@@ -268,6 +270,7 @@ async fn probe_openai_provider_config(
         provider_type,
         &format!("{} configured", provider.name),
         &provider.base_url,
+        provider.api_key.as_deref(),
     )
     .await
 }
@@ -276,6 +279,7 @@ fn provider_type_from_key(key: &str) -> ProviderType {
     match key {
         "lm_studio" => ProviderType::LmStudio,
         "sglang" => ProviderType::SgLang,
+        "openai" => ProviderType::OpenAi,
         _ => ProviderType::OpenAiCompatible,
     }
 }
@@ -586,7 +590,7 @@ async fn probe_llamacpp_base(
         .map(|value| value.to_string());
 
     endpoints.slots = get_json(&format!("{base_url}/slots")).await.is_ok();
-    let model_result = get_openai_models(&format!("{base_url}/v1/models")).await;
+    let model_result = get_openai_models(&format!("{base_url}/v1/models"), None).await;
     endpoints.openai_models = model_result.is_ok();
     let models = model_result.unwrap_or_default();
 
@@ -623,9 +627,14 @@ async fn probe_llamacpp_base(
 
 async fn probe_ollama_endpoint() -> ProviderProbe {
     let base_url = "http://127.0.0.1:11434";
-    let mut probe =
-        probe_openai_compatible_endpoint("ollama-11434", ProviderType::Ollama, "Ollama", base_url)
-            .await;
+    let mut probe = probe_openai_compatible_endpoint(
+        "ollama-11434",
+        ProviderType::Ollama,
+        "Ollama",
+        base_url,
+        None,
+    )
+    .await;
 
     match get_json(&format!("{base_url}/api/tags")).await {
         Ok(value) => {
@@ -661,10 +670,11 @@ async fn probe_openai_compatible_endpoint(
     provider_type: ProviderType,
     name: &str,
     base_url: &str,
+    api_key: Option<&str>,
 ) -> ProviderProbe {
     let mut endpoints = ProviderEndpointSupport::empty();
     let normalized_base = normalize_openai_base_url(base_url);
-    let models_result = get_openai_models(&format!("{normalized_base}/models")).await;
+    let models_result = get_openai_models(&format!("{normalized_base}/models"), api_key).await;
     endpoints.openai_models = models_result.is_ok();
     let models = models_result.unwrap_or_default();
     let reachable = endpoints.openai_models;
@@ -726,9 +736,28 @@ async fn get_json(url: &str) -> anyhow::Result<Value> {
     Ok(response.json::<Value>().await?)
 }
 
-async fn get_openai_models(url: &str) -> anyhow::Result<Vec<ProviderModelInfo>> {
-    let value = get_json(url).await?;
+async fn get_openai_models(
+    url: &str,
+    api_key: Option<&str>,
+) -> anyhow::Result<Vec<ProviderModelInfo>> {
+    let value = get_json_with_auth(url, api_key).await?;
     parse_openai_models(value)
+}
+
+async fn get_json_with_auth(url: &str, api_key: Option<&str>) -> anyhow::Result<Value> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(2500))
+        .connect_timeout(Duration::from_millis(1000))
+        .build()?;
+    let mut request = client.get(url);
+    if let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request.send().await?;
+    if !response.status().is_success() {
+        anyhow::bail!("HTTP {}", response.status());
+    }
+    Ok(response.json::<Value>().await?)
 }
 
 fn parse_openai_models(value: Value) -> anyhow::Result<Vec<ProviderModelInfo>> {

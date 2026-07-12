@@ -59,6 +59,14 @@ function Stop-RunningReleaseBinary {
     return $wasRunning
 }
 
+if (-not (Get-Command npm.cmd -ErrorAction SilentlyContinue)) {
+    throw "npm.cmd was not found on PATH. Install Node.js 18+ before building InferenceBridge."
+}
+
+if (-not (Get-Command cargo.exe -ErrorAction SilentlyContinue)) {
+    throw "cargo.exe was not found on PATH. Install Rust 1.75+ before building InferenceBridge."
+}
+
 if (-not $SkipInstall) {
     Step "Installing Node dependencies"
     if ($CleanInstall -and (Test-Path -LiteralPath "package-lock.json")) {

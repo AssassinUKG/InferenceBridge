@@ -35,6 +35,18 @@ pub fn configured_openai_providers(config: &ProvidersConfig) -> Vec<OpenAiProvid
             provider_type: "sglang".to_string(),
             enabled: config.sglang.enabled,
         },
+        OpenAiProvider {
+            id: "openai".to_string(),
+            name: "OpenAI".to_string(),
+            base_url: crate::providers::normalize_openai_base_url(&config.openai.base_url),
+            api_key: config
+                .openai
+                .api_key
+                .clone()
+                .or_else(|| std::env::var("OPENAI_API_KEY").ok()),
+            provider_type: "openai".to_string(),
+            enabled: config.openai.enabled,
+        },
     ]
 }
 

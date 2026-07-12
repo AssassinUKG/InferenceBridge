@@ -844,7 +844,10 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
       (persistedSettings.lm_studio_api_key ?? "") !== (settings.lm_studio_api_key ?? "") ||
       persistedSettings.sglang_enabled !== settings.sglang_enabled ||
       persistedSettings.sglang_base_url !== settings.sglang_base_url ||
-      (persistedSettings.sglang_api_key ?? "") !== (settings.sglang_api_key ?? ""));
+      (persistedSettings.sglang_api_key ?? "") !== (settings.sglang_api_key ?? "") ||
+      persistedSettings.openai_enabled !== settings.openai_enabled ||
+      persistedSettings.openai_base_url !== settings.openai_base_url ||
+      (persistedSettings.openai_api_key ?? "") !== (settings.openai_api_key ?? ""));
   const lmStudioBaseUrl = settings.lm_studio_base_url.trim() || "http://127.0.0.1:1234/v1";
   const normalizedLmStudioUrl = lmStudioBaseUrl.endsWith("/v1")
     ? lmStudioBaseUrl
@@ -853,8 +856,13 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
   const normalizedSglangUrl = sglangBaseUrl.endsWith("/v1")
     ? sglangBaseUrl
     : `${sglangBaseUrl.replace(/\/$/, "")}/v1`;
+  const openaiBaseUrl = settings.openai_base_url.trim() || "https://api.openai.com/v1";
+  const normalizedOpenAiUrl = openaiBaseUrl.endsWith("/v1")
+    ? openaiBaseUrl
+    : `${openaiBaseUrl.replace(/\/$/, "")}/v1`;
   const configuredLmStudioProbe = providerCheck?.providers.find((provider) => provider.id === "lm-studio-configured");
   const configuredSglangProbe = providerCheck?.providers.find((provider) => provider.id === "sglang-configured");
+  const configuredOpenAiProbe = providerCheck?.providers.find((provider) => provider.id === "openai-configured");
 
   const handleApiServerToggle = async () => {
     if (apiBusy) {
@@ -1085,6 +1093,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
               <option value="managed_llamacpp">Managed llama.cpp</option>
               <option value="lm_studio">LM Studio</option>
               <option value="sglang">SGLang</option>
+              <option value="openai">OpenAI</option>
             </FlatSelect>
           </FieldRow>
           <Divider />
@@ -1162,6 +1171,43 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
             />
           </FieldRow>
           <Divider />
+          <FieldRow label="OpenAI" hint="Official OpenAI API">
+            <div className="flex items-center gap-3">
+              <Toggle
+                checked={settings.openai_enabled}
+                onChange={() =>
+                  setSettings({
+                    ...settings,
+                    openai_enabled: !settings.openai_enabled,
+                    active_provider: !settings.openai_enabled ? "openai" : settings.active_provider,
+                  })
+                }
+              />
+              <span className="text-sm" style={{ color: "var(--text-1)" }}>
+                {settings.openai_enabled ? "Enabled" : "Disabled"}
+              </span>
+            </div>
+          </FieldRow>
+          <Divider />
+          <FieldRow label="OpenAI URL" hint="Official default is https://api.openai.com/v1">
+            <FlatInput
+              value={settings.openai_base_url}
+              onChange={(v) => setSettings({ ...settings, openai_base_url: v })}
+              placeholder="https://api.openai.com/v1"
+            />
+            <p className="mt-1 text-xs font-mono" style={{ color: "var(--text-2)" }}>
+              Target: {normalizedOpenAiUrl}
+            </p>
+          </FieldRow>
+          <Divider />
+          <FieldRow label="OpenAI Key" hint="Stored locally; OPENAI_API_KEY is also supported">
+            <FlatInput
+              value={settings.openai_api_key ?? ""}
+              onChange={(v) => setSettings({ ...settings, openai_api_key: v || null })}
+              placeholder="sk-..."
+            />
+          </FieldRow>
+          <Divider />
           <FieldRow label="Hugging Face" hint="Used for Hub search and gated downloads">
             <FlatInput
               value={settings.hf_api_key ?? ""}
@@ -1181,7 +1227,9 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
                   ? "Chat completions and model listing will route through LM Studio."
                   : settings.active_provider === "sglang"
                     ? "Chat completions and model listing will route through SGLang."
-                  : "Chat completions use the managed llama.cpp runtime."}
+                    : settings.active_provider === "openai"
+                      ? "Chat completions, Responses, embeddings, and model listing will route through OpenAI."
+                      : "Chat completions use the managed llama.cpp runtime."}
             </span>
             <div className="flex items-center gap-2">
               <FlatBtn label={providerChecking ? "Checking..." : "Test"} onClick={() => void checkProviders()} disabled={providerChecking || providerDirty} />
@@ -1203,6 +1251,15 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
               <div className="px-4 py-2.5 text-xs" style={{ color: configuredSglangProbe.reachable ? "#34d399" : "#f87171", background: configuredSglangProbe.reachable ? "rgba(52,211,153,0.05)" : "rgba(248,113,113,0.06)" }}>
                 SGLang {configuredSglangProbe.status}: {configuredSglangProbe.model_count} model{configuredSglangProbe.model_count === 1 ? "" : "s"} at {configuredSglangProbe.base_url}
                 {configuredSglangProbe.error ? ` (${configuredSglangProbe.error})` : ""}
+              </div>
+            </>
+          )}
+          {configuredOpenAiProbe && (
+            <>
+              <Divider />
+              <div className="px-4 py-2.5 text-xs" style={{ color: configuredOpenAiProbe.reachable ? "#34d399" : "#f87171", background: configuredOpenAiProbe.reachable ? "rgba(52,211,153,0.05)" : "rgba(248,113,113,0.06)" }}>
+                OpenAI {configuredOpenAiProbe.status}: {configuredOpenAiProbe.model_count} model{configuredOpenAiProbe.model_count === 1 ? "" : "s"} at {configuredOpenAiProbe.base_url}
+                {configuredOpenAiProbe.error ? ` (${configuredOpenAiProbe.error})` : ""}
               </div>
             </>
           )}

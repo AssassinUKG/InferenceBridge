@@ -1,5 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import * as api from "../../lib/tauri";
 import type { DownloadProgress, HubAccessStatus, HubModel, HubQuant } from "../../lib/tauri";
@@ -49,44 +51,111 @@ function formatBytes(bytes: number) {
   return `${Math.max(1, Math.round(bytes / 1024))} KB`;
 }
 
+function formatSpeed(bytesPerSecond?: number | null) {
+  if (!bytesPerSecond) return null;
+  return `${formatBytes(bytesPerSecond)}/s`;
+}
+
+function formatEta(seconds?: number | null) {
+  if (!seconds) return null;
+  if (seconds < 60) return `${seconds}s left`;
+  const minutes = Math.floor(seconds / 60);
+  const rem = seconds % 60;
+  if (minutes < 60) return `${minutes}m ${rem}s left`;
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  return `${hours}h ${mins}m left`;
+}
+
+function downloadDetail(entry: DownloadProgress) {
+  const parts = [
+    `${formatBytes(entry.downloaded_bytes)} / ${formatBytes(entry.total_bytes)}`,
+    `${Math.round(entry.percent * 100)}%`,
+    formatSpeed(entry.speed_bps),
+    formatEta(entry.eta_seconds),
+  ].filter(Boolean);
+  return parts.join(" · ");
+}
+
 function progressTone(status: string, error?: string | null) {
   if (error || status === "Failed") return "#f87171";
   if (status === "Completed") return "#34d399";
+  if (status === "Retrying") return "#a5b4fc";
   if (status === "Cancelled" || status === "Paused" || status === "Pausing") return "#fbbf24";
   return "#22d3ee";
 }
 
-function formatModelSizeRange(quants: HubQuant[]) {
-  const sizes = quants.map((quant) => quant.size_gb).filter((size) => size > 0).sort((a, b) => a - b);
-  if (sizes.length === 0) return "size unknown";
+function quantSizeBytes(quant: HubQuant) {
+  if (quant.size_bytes && quant.size_bytes > 0) return quant.size_bytes;
+  if (quant.size_gb > 0) return Math.round(quant.size_gb * 1_073_741_824);
+  return 0;
+}
+
+function modelHasMissingSize(model: HubModel) {
+  return model.quants.some((quant) => quantSizeBytes(quant) <= 0);
+}
+
+function formatModelSizeRange(quants: HubQuant[], loading = false) {
+  const sizes = quants.map(quantSizeBytes).filter((size) => size > 0).sort((a, b) => a - b);
+  if (sizes.length === 0) return loading ? "checking..." : "size unknown";
   const min = sizes[0];
   const max = sizes[sizes.length - 1];
-  if (Math.abs(min - max) < 0.01) return `${min.toFixed(2)} GB`;
-  return `${min.toFixed(2)}-${max.toFixed(2)} GB`;
+  if (Math.abs(min - max) < 64 * 1024 * 1024) return formatBytes(min);
+  return `${formatBytes(min)}-${formatBytes(max)}`;
 }
 
-function formatQuantSize(quant: HubQuant | null | undefined) {
-  if (!quant || quant.size_gb <= 0) return "unknown";
-  return `${quant.size_gb.toFixed(2)} GB`;
+function formatQuantSize(quant: HubQuant | null | undefined, loading = false) {
+  if (!quant) return "unknown";
+  const size = quantSizeBytes(quant);
+  if (size <= 0) return loading ? "checking..." : "unknown";
+  return formatBytes(size);
 }
 
-function formatOptionSummary(model: HubModel) {
-  const sizes = model.quants.map((quant) => quant.size_gb).filter((size) => size > 0).sort((a, b) => a - b);
+function formatOptionSummary(model: HubModel, loading = false) {
+  const sizes = model.quants.map(quantSizeBytes).filter((size) => size > 0).sort((a, b) => a - b);
   const count = model.quants.length;
-  if (sizes.length === 0) return `${count} file${count === 1 ? "" : "s"} - size unknown`;
+  if (sizes.length === 0) return `${count} file${count === 1 ? "" : "s"} - ${loading ? "checking sizes" : "size unknown"}`;
   const min = sizes[0];
   const max = sizes[sizes.length - 1];
-  const range = Math.abs(min - max) < 0.01 ? `${min.toFixed(2)} GB` : `${min.toFixed(2)}-${max.toFixed(2)} GB`;
+  const range = Math.abs(min - max) < 64 * 1024 * 1024 ? formatBytes(min) : `${formatBytes(min)}-${formatBytes(max)}`;
   return `${count} file${count === 1 ? "" : "s"} - ${range}`;
 }
 
+function modelTotalSize(quants: HubQuant[]) {
+  const total = quants.reduce((sum, quant) => sum + quantSizeBytes(quant), 0);
+  return total > 0 ? formatBytes(total) : "unknown";
+}
+
+function modelNeedsDetails(model: HubModel, includeReadme: boolean) {
+  return modelHasMissingSize(model) || !model.license || !model.base_model || !model.pipeline_tag || (includeReadme && model.readme == null);
+}
+
+function readmePreview(text?: string | null) {
+  if (!text) return "";
+  return text
+    .replace(/^---[\s\S]*?---\s*/m, "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/!\[[^\]]*]\([^)]+\)/g, "")
+    .trim();
+}
+
+function uniqueHubModels(models: HubModel[]) {
+  const seen = new Set<string>();
+  return models.filter((model) => {
+    const key = model.id.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function modelMinSize(model: HubModel) {
-  const sizes = model.quants.map((quant) => quant.size_gb).filter((size) => size > 0);
+  const sizes = model.quants.map(quantSizeBytes).filter((size) => size > 0);
   return sizes.length > 0 ? Math.min(...sizes) : Number.POSITIVE_INFINITY;
 }
 
 function modelMaxSize(model: HubModel) {
-  const sizes = model.quants.map((quant) => quant.size_gb).filter((size) => size > 0);
+  const sizes = model.quants.map(quantSizeBytes).filter((size) => size > 0);
   return sizes.length > 0 ? Math.max(...sizes) : 0;
 }
 
@@ -115,14 +184,15 @@ function recommendedQuant(model: HubModel, isInstalled: (quant: HubQuant) => boo
   return (
     QUANT_PREFERENCE.map((preferred) => candidates.find((quant) => quant.quant === preferred && !quant.filename.toLowerCase().includes("-mtp-"))).find(Boolean) ??
     QUANT_PREFERENCE.map((preferred) => candidates.find((quant) => quant.quant === preferred)).find(Boolean) ??
-    candidates.find((quant) => quant.size_gb > 0) ??
+    candidates.find((quant) => quantSizeBytes(quant) > 0) ??
     candidates[0] ??
     null
   );
 }
 
 function quantLabel(quant: HubQuant) {
-  const size = quant.size_gb > 0 ? ` - ${quant.size_gb.toFixed(2)} GB` : "";
+  const sizeBytes = quantSizeBytes(quant);
+  const size = sizeBytes > 0 ? ` - ${formatBytes(sizeBytes)}` : "";
   return `${quant.quant}${size}`;
 }
 
@@ -140,9 +210,57 @@ function HubStat({ label, value }: { label: string; value: string }) {
   );
 }
 
+function DetailRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="flex min-w-0 items-center justify-between gap-4 border-b py-2.5 last:border-b-0" style={{ borderColor: "var(--border)" }}>
+      <span className="shrink-0 text-[10px] font-semibold uppercase tracking-[0.16em]" style={{ color: "var(--text-2)" }}>{label}</span>
+      <span className="min-w-0 truncate text-right font-mono text-xs" style={{ color: "var(--text-0)" }} title={value}>{value}</span>
+    </div>
+  );
+}
+
+function ReadmeMarkdown({ markdown }: { markdown: string }) {
+  return (
+    <div className="max-h-96 overflow-y-auto rounded-md px-4 py-3 text-sm leading-6" style={{ background: "#1b1c20", border: "1px solid var(--border)", color: "var(--text-1)" }}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          h1: ({ children }) => <h1 className="mb-3 mt-1 text-lg font-semibold leading-6" style={{ color: "var(--text-0)" }}>{children}</h1>,
+          h2: ({ children }) => <h2 className="mb-2 mt-5 border-t pt-4 text-sm font-semibold uppercase tracking-[0.08em]" style={{ borderColor: "var(--border)", color: "var(--text-0)" }}>{children}</h2>,
+          h3: ({ children }) => <h3 className="mb-2 mt-4 text-sm font-semibold" style={{ color: "var(--text-0)" }}>{children}</h3>,
+          p: ({ children }) => <p className="mb-3" style={{ color: "var(--text-1)" }}>{children}</p>,
+          a: ({ href, children }) => (
+            <button
+              type="button"
+              onClick={() => href && href.startsWith("https://huggingface.co/") && void api.openExternalUrl(href)}
+              className="font-medium underline decoration-dotted underline-offset-4"
+              style={{ color: "#67e8f9" }}
+            >
+              {children}
+            </button>
+          ),
+          ul: ({ children }) => <ul className="mb-3 list-disc space-y-1 pl-5">{children}</ul>,
+          ol: ({ children }) => <ol className="mb-3 list-decimal space-y-1 pl-5">{children}</ol>,
+          li: ({ children }) => <li style={{ color: "var(--text-1)" }}>{children}</li>,
+          code: ({ children }) => <code className="rounded px-1 py-0.5 font-mono text-[11px]" style={{ background: "#111216", color: "#a5f3fc" }}>{children}</code>,
+          pre: ({ children }) => <pre className="mb-3 overflow-x-auto rounded-md p-3 text-[11px]" style={{ background: "#111216", border: "1px solid var(--border)", color: "var(--text-1)" }}>{children}</pre>,
+          blockquote: ({ children }) => <blockquote className="mb-3 border-l-2 pl-3" style={{ borderColor: "#22d3ee", color: "var(--text-1)" }}>{children}</blockquote>,
+          table: ({ children }) => <div className="mb-3 overflow-x-auto rounded-md" style={{ border: "1px solid var(--border)" }}><table className="w-full text-left text-xs">{children}</table></div>,
+          th: ({ children }) => <th className="px-2 py-1.5 font-semibold" style={{ background: "#111216", color: "var(--text-0)" }}>{children}</th>,
+          td: ({ children }) => <td className="border-t px-2 py-1.5" style={{ borderColor: "var(--border)", color: "var(--text-1)" }}>{children}</td>,
+          hr: () => <hr className="my-4" style={{ borderColor: "var(--border)" }} />,
+        }}
+      >
+        {markdown}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
 function HubPreview({
   model,
   downloads,
+  detailsLoading,
   isInstalled,
   onDownload,
   onCancel,
@@ -150,12 +268,14 @@ function HubPreview({
 }: {
   model: HubModel | null;
   downloads: Record<string, DownloadProgress>;
+  detailsLoading: boolean;
   isInstalled: (quant: HubQuant) => boolean;
   onDownload: (model: HubModel, quant: HubQuant) => void;
   onCancel: (id: string) => void;
   onPause: (id: string) => void;
 }) {
   const [selectedQuantUrl, setSelectedQuantUrl] = useState<string | null>(null);
+  const [panelTab, setPanelTab] = useState<"overview" | "files" | "readme">("overview");
   const recommended = model ? recommendedQuant(model, isInstalled) : null;
   const selectedQuant =
     model?.quants.find((quant) => quant.url === selectedQuantUrl) ??
@@ -167,10 +287,11 @@ function HubPreview({
   const downloading = progress && !progress.done && !paused;
   const selectedInstalled = selectedQuant ? isInstalled(selectedQuant) : false;
   const tone = progressTone(progress?.status ?? "", progress?.error);
-  const selectedSize = formatQuantSize(selectedQuant);
+  const selectedSize = formatQuantSize(selectedQuant, detailsLoading);
 
   useEffect(() => {
     setSelectedQuantUrl(null);
+    setPanelTab("overview");
   }, [model?.id]);
 
   if (!model) {
@@ -182,43 +303,103 @@ function HubPreview({
   }
 
   return (
-    <aside className="overflow-hidden rounded" style={{ border: "1px solid var(--border)", background: "var(--surface-1)" }}>
-      <div className="px-4 py-4" style={{ borderBottom: "1px solid var(--border)" }}>
-        <div className="text-xs uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>{model.family}</div>
-        <h3 className="mt-1 text-lg font-semibold" style={{ color: "var(--text-0)" }}>{model.name}</h3>
-        <p className="mt-2 text-xs font-mono leading-5" style={{ color: "var(--text-2)" }}>{model.id}</p>
-        <div className="mt-3 flex flex-wrap gap-1.5">{model.tags.map((tag) => <TagBadge key={tag} tag={tag} />)}</div>
-        <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
-          <div className="rounded px-2 py-1.5" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}>
-            <div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--text-2)" }}>Downloads</div>
-            <div className="mt-0.5 font-semibold" style={{ color: "var(--text-0)" }}>{abbrevCount(model.downloads ?? 0)}</div>
+    <aside className="h-full overflow-y-auto rounded-md" style={{ border: "1px solid var(--border)", background: "#151619" }}>
+      <div className="px-5 py-5" style={{ borderBottom: "1px solid var(--border)", background: "linear-gradient(180deg, rgba(34,211,238,0.055), rgba(34,211,238,0))" }}>
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <div className="text-[10px] uppercase tracking-[0.22em]" style={{ color: "var(--text-2)" }}>{model.family}</div>
+            <h3 className="mt-1 text-xl font-semibold leading-6" style={{ color: "var(--text-0)" }}>{model.name}</h3>
+            <p className="mt-1 truncate font-mono text-xs" style={{ color: "var(--text-2)" }}>{model.id}</p>
           </div>
-          <div className="rounded px-2 py-1.5" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}>
-            <div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--text-2)" }}>Likes</div>
-            <div className="mt-0.5 font-semibold" style={{ color: "var(--text-0)" }}>{abbrevCount(model.likes ?? 0)}</div>
-          </div>
-          <div className="rounded px-2 py-1.5" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}>
-            <div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--text-2)" }}>Files / size</div>
-            <div className="mt-0.5 font-semibold" style={{ color: "var(--text-0)" }}>{formatOptionSummary(model)}</div>
-          </div>
-          <div className="rounded px-2 py-1.5" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}>
-            <div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--text-2)" }}>Updated</div>
-            <div className="mt-0.5 font-semibold" style={{ color: "var(--text-0)" }}>{timeAgo(model.last_modified ?? null)}</div>
-          </div>
+          {selectedInstalled && <span className="shrink-0 rounded-md px-2.5 py-1.5 text-[10px] font-bold uppercase" style={{ background: "rgba(52,211,153,0.12)", border: "1px solid rgba(52,211,153,0.28)", color: "#34d399" }}>Local</span>}
+        </div>
+        <div className="mt-4 grid grid-cols-3 gap-2">
+          <button onClick={() => void api.openExternalUrl(model.hf_url)} className="rounded-md px-3 py-2 text-xs font-semibold" style={{ background: "#22d3ee", border: "none", color: "#041014" }}>Open HF</button>
+          <button onClick={() => void navigator.clipboard?.writeText(model.id)} className="rounded-md px-3 py-2 text-xs font-medium" style={{ background: "#202126", border: "1px solid var(--border)", color: "var(--text-1)" }}>Copy repo</button>
+          {selectedQuant && <button onClick={() => void api.openExternalUrl(selectedQuant.url)} className="rounded-md px-3 py-2 text-xs font-medium" style={{ background: "#202126", border: "1px solid var(--border)", color: "var(--text-1)" }}>Open file</button>}
+        </div>
+        <div className="mt-4 flex flex-wrap gap-1.5">{model.tags.slice(0, 7).map((tag) => <TagBadge key={tag} tag={tag} />)}</div>
+        <div className="mt-5 grid grid-cols-4 gap-3 border-t pt-4 text-xs" style={{ borderColor: "var(--border)" }}>
+          {[
+            ["Downloads", abbrevCount(model.downloads ?? 0)],
+            ["Likes", abbrevCount(model.likes ?? 0)],
+            ["Files", String(model.quants.length)],
+            ["Updated", timeAgo(model.last_modified ?? null).replace("updated ", "")],
+          ].map(([label, value]) => (
+            <div key={label} className="min-w-0">
+              <div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--text-2)" }}>{label}</div>
+              <div className="mt-1 truncate font-semibold" style={{ color: "var(--text-0)" }}>{value}</div>
+            </div>
+          ))}
         </div>
       </div>
-      <div className="px-4 py-3">
+      <div className="flex gap-5 border-b px-5" style={{ borderColor: "var(--border)" }}>
+        {(["overview", "files", "readme"] as const).map((tab) => (
+          <button
+            key={tab}
+            onClick={() => setPanelTab(tab)}
+            className="border-b-2 px-0 py-3 text-xs font-semibold capitalize"
+            style={{
+              background: "transparent",
+              borderColor: panelTab === tab ? "#22d3ee" : "transparent",
+              color: panelTab === tab ? "#a5f3fc" : "var(--text-1)",
+            }}
+          >
+            {tab}
+          </button>
+        ))}
+      </div>
+      {panelTab === "overview" && (
+        <div className="border-b px-5 py-4" style={{ borderColor: "var(--border)" }}>
+          <div className="rounded-md px-3" style={{ background: "#1b1c20", border: "1px solid var(--border)" }}>
+            <DetailRow label="Repo" value={model.id} />
+            <DetailRow label="Pipeline" value={model.pipeline_tag ?? "-"} />
+            <DetailRow label="License" value={model.license ?? "-"} />
+            <DetailRow label="Base" value={model.base_model ?? "-"} />
+            <DetailRow label="Total GGUF" value={modelTotalSize(model.quants)} />
+            <DetailRow label="Vision" value={model.supports_vision ? "yes" : "no"} />
+          </div>
+        </div>
+      )}
+      {panelTab === "files" && (
+        <div className="border-b px-5 py-4" style={{ borderColor: "var(--border)" }}>
+          <div className="max-h-72 overflow-y-auto rounded-md" style={{ border: "1px solid var(--border)", background: "#1b1c20" }}>
+            {model.quants.map((quant) => {
+              const installed = isInstalled(quant);
+              return (
+                <button key={quant.url} onClick={() => setSelectedQuantUrl(quant.url)} className="grid w-full grid-cols-[minmax(0,1fr)_86px_72px] items-center gap-3 border-b px-3 py-2.5 text-left last:border-b-0" style={{ borderColor: "var(--border)", background: selectedQuant?.url === quant.url ? "rgba(34,211,238,0.08)" : "transparent" }}>
+                  <span className="truncate font-mono text-[11px]" style={{ color: "var(--text-0)" }}>{quant.filename}</span>
+                  <span className="text-[11px]" style={{ color: "var(--text-1)" }}>{formatQuantSize(quant, detailsLoading)}</span>
+                  <span className="justify-self-start rounded px-1.5 py-0.5 text-[9px] font-bold uppercase" style={{ background: installed ? "rgba(52,211,153,0.12)" : "#22242a", border: `1px solid ${installed ? "rgba(52,211,153,0.24)" : "var(--border)"}`, color: installed ? "#34d399" : "var(--text-2)" }}>{installed ? "local" : quant.quant}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      {panelTab === "readme" && (
+        <div className="border-b px-5 py-4" style={{ borderColor: "var(--border)" }}>
+          {detailsLoading && !model.readme ? (
+            <div className="rounded-md px-3 py-6 text-sm" style={{ background: "#1b1c20", border: "1px solid var(--border)", color: "var(--text-2)" }}>Loading README...</div>
+          ) : readmePreview(model.readme) ? (
+            <ReadmeMarkdown markdown={readmePreview(model.readme)} />
+          ) : (
+            <div className="rounded-md px-3 py-6 text-sm" style={{ background: "#1b1c20", border: "1px solid var(--border)", color: "var(--text-2)" }}>No README preview available for this repo.</div>
+          )}
+        </div>
+      )}
+      <div className="px-5 py-4">
         <div className="mb-2 flex items-center justify-between gap-2">
           <div className="text-xs font-semibold uppercase tracking-[0.16em]" style={{ color: "var(--text-2)" }}>GGUF file</div>
-          <span className="text-[11px]" style={{ color: "var(--text-2)" }}>{model.quants.length} options</span>
+          <span className="text-[11px]" style={{ color: "var(--text-2)" }}>{detailsLoading ? "checking file metadata" : `${model.quants.length} options`}</span>
         </div>
-        <div className="rounded p-3" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
-          <div className="flex flex-col gap-2">
+        <div className="rounded-md p-3" style={{ background: "#1b1c20", border: "1px solid var(--border)" }}>
+          <div className="flex flex-col gap-3">
             <select
               value={selectedQuant?.url ?? ""}
               onChange={(event) => setSelectedQuantUrl(event.target.value)}
               className="w-full rounded px-3 py-2 text-sm outline-none"
-              style={{ background: "var(--surface-1)", border: "1px solid var(--border-mid)", color: "var(--text-0)" }}
+              style={{ background: "#111216", border: "1px solid var(--border-mid)", color: "var(--text-0)" }}
             >
               {model.quants.map((quant) => (
                 <option key={quant.url} value={quant.url}>
@@ -227,12 +408,12 @@ function HubPreview({
               ))}
             </select>
             {selectedQuant && (
-              <div className="min-w-0 rounded px-3 py-2" style={{ background: "rgba(34,211,238,0.075)", border: "1px solid rgba(34,211,238,0.24)" }}>
+              <div className="min-w-0 rounded-md px-3 py-3" style={{ background: "rgba(34,211,238,0.065)", border: "1px solid rgba(34,211,238,0.20)" }}>
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-[10px] font-semibold uppercase tracking-[0.16em]" style={{ color: "#67e8f9" }}>Selected download</span>
                   <span className="rounded-full px-2 py-0.5 text-[11px] font-semibold" style={{ background: "rgba(34,211,238,0.12)", color: "#a5f3fc", border: "1px solid rgba(34,211,238,0.24)" }}>{selectedSize}</span>
                 </div>
-                <div className="truncate font-mono text-[11px]" style={{ color: "var(--text-2)" }}>{selectedQuant.filename}</div>
+                <div className="mt-1 truncate font-mono text-[11px]" style={{ color: "var(--text-2)" }}>{selectedQuant.filename}</div>
                 <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px]" style={{ color: "var(--text-1)" }}>
                   <span>{selectedQuant.quant}</span>
                   <span>{selectedSize === "unknown" ? "download size unknown" : selectedSize}</span>
@@ -246,7 +427,7 @@ function HubPreview({
                 <div className="h-1.5 overflow-hidden rounded" style={{ background: "rgba(255,255,255,0.08)" }}>
                   <div className="h-full rounded transition-all" style={{ width: `${Math.max(4, Math.round(progress.percent * 100))}%`, background: tone }} />
                 </div>
-                <div className="mt-1 text-[11px]" style={{ color: progress.error ? "#f87171" : "var(--text-2)" }}>{progress.error ?? `${progress.status} ${formatBytes(progress.downloaded_bytes)} / ${formatBytes(progress.total_bytes)}`}</div>
+                <div className="mt-1 text-[11px]" style={{ color: progress.error ? "#f87171" : "var(--text-2)" }}>{progress.error ?? `${progress.status} · ${downloadDetail(progress)}`}</div>
               </div>
             )}
             <div className="flex justify-end">
@@ -261,9 +442,9 @@ function HubPreview({
                   <button onClick={() => onCancel(progress.id)} className="rounded px-3 py-1.5 text-xs font-medium" style={{ background: "rgba(248,113,113,0.12)", border: "1px solid rgba(248,113,113,0.24)", color: "#f87171" }}>Cancel</button>
                 </div>
               ) : selectedInstalled ? (
-                <span className="rounded px-3 py-1.5 text-xs font-medium" style={{ background: "rgba(52,211,153,0.10)", border: "1px solid rgba(52,211,153,0.22)", color: "#34d399" }}>Already on device</span>
+                <span className="rounded-md px-3 py-2 text-xs font-medium" style={{ background: "rgba(52,211,153,0.10)", border: "1px solid rgba(52,211,153,0.22)", color: "#34d399" }}>Already on device</span>
               ) : (
-                <button disabled={!selectedQuant} onClick={() => selectedQuant && onDownload(model, selectedQuant)} className="rounded px-3 py-1.5 text-xs font-semibold disabled:opacity-50" style={{ background: "#22d3ee", border: "none", color: "#041014" }}>
+                <button disabled={!selectedQuant} onClick={() => selectedQuant && onDownload(model, selectedQuant)} className="rounded-md px-4 py-2 text-xs font-semibold disabled:opacity-50" style={{ background: "#22d3ee", border: "none", color: "#041014" }}>
                   {selectedSize === "unknown" ? "Download selected" : `Download ${selectedSize}`}
                 </button>
               )}
@@ -280,7 +461,7 @@ export function ModelBrowser({ models, onRefresh }: Props) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<HubModel[]>([]);
   const [selectedTag, setSelectedTag] = useState<string | null>(null);
-  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [expandedId, setExpandedId] = useState<string | null>("rows");
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
   const [capabilityFilter, setCapabilityFilter] = useState("all");
   const [formatFilter, setFormatFilter] = useState("gguf");
@@ -293,6 +474,7 @@ export function ModelBrowser({ models, onRefresh }: Props) {
   const [hasMore, setHasMore] = useState(false);
   const [downloads, setDownloads] = useState<Record<string, DownloadProgress>>({});
   const [downloadsOpen, setDownloadsOpen] = useState(false);
+  const [detailLoadingIds, setDetailLoadingIds] = useState<Set<string>>(() => new Set());
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
   const [deletingPath, setDeletingPath] = useState<string | null>(null);
   const [deleteMessage, setDeleteMessage] = useState<string | null>(null);
@@ -300,11 +482,12 @@ export function ModelBrowser({ models, onRefresh }: Props) {
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
   const downloadsMenuRef = useRef<HTMLDivElement>(null);
+  const detailFetchedIds = useRef<Set<string>>(new Set());
 
   const installedFilenames = useMemo(() => new Set(models.map((model) => basename(model.filename))), [models]);
   const tags = useMemo(() => Array.from(new Set(results.flatMap((model) => model.tags))).sort(), [results]);
   const visibleResults = useMemo(() => {
-    const filtered = results.filter((model) => {
+    const filtered = uniqueHubModels(results).filter((model) => {
       const tagOk = !selectedTag || model.tags.includes(selectedTag);
       const capabilityOk = capabilityFilter === "all" || model.tags.some((tag) => tag.toLowerCase() === capabilityFilter) || (capabilityFilter === "vision" && model.supports_vision);
       return tagOk && capabilityOk;
@@ -323,7 +506,13 @@ export function ModelBrowser({ models, onRefresh }: Props) {
     }
     return filtered;
   }, [capabilityFilter, results, selectedTag, sortMode]);
-  const summary = query.trim() ? `Results for "${query.trim()}"` : "Top GGUF models on Hugging Face";
+  const summary = query.trim()
+    ? selectedTag
+      ? `Results for "${query.trim()}" tagged ${selectedTag}`
+      : `Results for "${query.trim()}"`
+    : selectedTag
+      ? `HF search for ${selectedTag}`
+      : "Top GGUF models on Hugging Face";
   const downloadEntries = useMemo(() => Object.values(downloads).sort((a, b) => (a.done === b.done ? a.filename.localeCompare(b.filename) : a.done ? 1 : -1)), [downloads]);
   const activeDownloadCount = downloadEntries.filter((entry) => !entry.done).length;
   const completedDownloadCount = downloadEntries.filter((entry) => entry.done).length;
@@ -335,19 +524,52 @@ export function ModelBrowser({ models, onRefresh }: Props) {
   const isInstalled = useCallback((quant: HubQuant) => installedFilenames.has(basename(quant.filename)), [installedFilenames]);
   const anyInstalled = useCallback((model: HubModel) => model.quants.some(isInstalled), [isInstalled]);
 
+  const mergeHubDetail = useCallback((detail: HubModel | null) => {
+    if (!detail) return;
+    setResults((prev) => prev.map((model) => {
+      if (model.id !== detail.id) return model;
+      return {
+        ...model,
+        ...detail,
+        tags: detail.tags.length > 0 ? detail.tags : model.tags,
+        description: detail.description || model.description,
+      };
+    }));
+  }, []);
+
+  const requestHubDetails = useCallback((model: HubModel, includeReadme = false) => {
+    if (!modelNeedsDetails(model, includeReadme)) return;
+    const detailKey = `${model.id}:${includeReadme ? "readme" : "meta"}`;
+    if (detailFetchedIds.current.has(detailKey)) return;
+    detailFetchedIds.current.add(detailKey);
+    setDetailLoadingIds((prev) => new Set(prev).add(model.id));
+    void api.getHubModelDetails(model.id, includeReadme)
+      .then(mergeHubDetail)
+      .catch(() => {})
+      .finally(() => {
+        setDetailLoadingIds((prev) => {
+          const next = new Set(prev);
+          next.delete(model.id);
+          return next;
+        });
+      });
+  }, [mergeHubDetail]);
+
   const runSearch = useCallback(async (nextQuery: string, nextOffset: number, append: boolean) => {
     const trimmed = nextQuery.trim();
     append ? setLoadingMore(true) : (setLoading(true), setResults([]), setOffset(0), setHasMore(false));
     setError(null);
     try {
       const serverSort = sortMode === "lastModified" || sortMode === "likes" ? sortMode : "downloads";
-      const found = await api.searchHubModels(trimmed, nextOffset, serverSort);
-      setResults((prev) => (append ? [...prev, ...found] : found));
+      const found = uniqueHubModels(await api.searchHubModels(trimmed, nextOffset, serverSort, selectedTag));
+      let addedCount = found.length;
+      setResults((prev) => {
+        const next = uniqueHubModels(append ? [...prev, ...found] : found);
+        addedCount = append ? Math.max(0, next.length - prev.length) : next.length;
+        return next;
+      });
       setOffset(nextOffset + found.length);
-      setHasMore(found.length === PAGE_SIZE);
-      if (!append && selectedTag && !found.some((model) => model.tags.includes(selectedTag))) {
-        setSelectedTag(null);
-      }
+      setHasMore(found.length === PAGE_SIZE && addedCount > 0);
     } catch (searchError) {
       setError(String(searchError));
       if (!append) setResults([]);
@@ -382,12 +604,21 @@ export function ModelBrowser({ models, onRefresh }: Props) {
   useEffect(() => {
     const timer = window.setTimeout(() => { void runSearch(query, 0, false); }, 250);
     return () => window.clearTimeout(timer);
-  }, [query, runSearch]);
+  }, [query, selectedTag, runSearch]);
 
   useEffect(() => {
     if (selectedHubModel || visibleResults.length === 0) return;
     setSelectedModelId(visibleResults[0].id);
   }, [selectedHubModel, visibleResults]);
+
+  useEffect(() => {
+    if (!selectedHubModel) return;
+    requestHubDetails(selectedHubModel, true);
+  }, [requestHubDetails, selectedHubModel]);
+
+  useEffect(() => {
+    visibleResults.slice(0, 8).forEach((model) => requestHubDetails(model, false));
+  }, [requestHubDetails, visibleResults]);
 
   useEffect(() => {
     const element = sentinelRef.current;
@@ -401,11 +632,49 @@ export function ModelBrowser({ models, onRefresh }: Props) {
 
   async function handleDownload(model: HubModel, quant: HubQuant) {
     const id = quant.url;
-    setDownloads((prev) => ({ ...prev, [id]: prev[id] ?? { id, filename: quant.filename, dest_path: null, supports_vision: model.supports_vision, repo_id: model.id, downloaded_bytes: 0, total_bytes: 0, percent: 0, done: false, status: "Starting", error: null } }));
+    setDownloads((prev) => ({
+      ...prev,
+      [id]: prev[id] ?? {
+        id,
+        filename: quant.filename,
+        dest_path: null,
+        partial_path: null,
+        supports_vision: model.supports_vision,
+        repo_id: model.id,
+        downloaded_bytes: 0,
+        total_bytes: 0,
+        percent: 0,
+        speed_bps: null,
+        eta_seconds: null,
+        resumable: false,
+        attempt: 1,
+        done: false,
+        status: "Starting",
+        error: null,
+      },
+    }));
     void api.downloadHubModel(quant.url, quant.filename, model.supports_vision, model.id).catch((downloadError) => {
       const message = String(downloadError);
       if (message.toLowerCase().includes("cancelled") || message.toLowerCase().includes("paused")) return;
-      setDownloads((prev) => ({ ...prev, [id]: { id, filename: quant.filename, dest_path: prev[id]?.dest_path ?? null, downloaded_bytes: prev[id]?.downloaded_bytes ?? 0, total_bytes: prev[id]?.total_bytes ?? 0, percent: prev[id]?.percent ?? 0, done: true, status: "Failed", error: message } }));
+      setDownloads((prev) => ({
+        ...prev,
+        [id]: {
+          id,
+          filename: quant.filename,
+          dest_path: prev[id]?.dest_path ?? null,
+          partial_path: prev[id]?.partial_path ?? null,
+          downloaded_bytes: prev[id]?.downloaded_bytes ?? 0,
+          total_bytes: prev[id]?.total_bytes ?? 0,
+          percent: prev[id]?.percent ?? 0,
+          speed_bps: null,
+          eta_seconds: null,
+          resumable: prev[id]?.resumable ?? false,
+          attempt: prev[id]?.attempt ?? 1,
+          done: true,
+          status: "Failed",
+          error: message,
+        },
+      }));
     });
   }
 
@@ -471,11 +740,11 @@ export function ModelBrowser({ models, onRefresh }: Props) {
 
   return (
     <div className="flex h-full flex-col">
-      <div className="border-b px-5 py-4" style={{ borderColor: "var(--border)", background: "var(--surface-1)" }}>
-        <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+      <div className="border-b px-5 py-3" style={{ borderColor: "var(--border)", background: "var(--surface-1)" }}>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h2 className="text-2xl font-semibold" style={{ color: "var(--text-0)" }}>Hub</h2>
-            <p className="mt-1 text-sm" style={{ color: "var(--text-2)" }}>Discover, download, and run inference models locally.</p>
+            <h2 className="text-xl font-semibold" style={{ color: "var(--text-0)" }}>Model Hub</h2>
+            <p className="mt-0.5 text-xs" style={{ color: "var(--text-2)" }}>Search Hugging Face GGUF models, download resumably, and manage local files.</p>
           </div>
           <div className="flex flex-wrap gap-2">
             <HubStat label="HTTP" value={hubStatus?.configured ? "Auth" : "Public"} />
@@ -486,26 +755,26 @@ export function ModelBrowser({ models, onRefresh }: Props) {
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
-          <div className="flex overflow-hidden rounded-full" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
-            <button onClick={() => setSection("search")} className="px-8 py-2 text-sm font-medium transition" style={{ background: section === "search" ? "rgba(255,255,255,0.10)" : "transparent", color: section === "search" ? "var(--text-0)" : "var(--text-1)", border: "none", cursor: "pointer" }}>Discover</button>
-            <button onClick={() => setSection("local")} className="px-8 py-2 text-sm font-medium transition" style={{ background: section === "local" ? "rgba(255,255,255,0.10)" : "transparent", color: section === "local" ? "var(--text-0)" : "var(--text-1)", border: "none", cursor: "pointer" }}>On Device</button>
+          <div className="flex overflow-hidden rounded-md" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
+            <button onClick={() => setSection("search")} className="px-6 py-2 text-sm font-medium transition" style={{ background: section === "search" ? "rgba(34,211,238,0.12)" : "transparent", color: section === "search" ? "#a5f3fc" : "var(--text-1)", border: "none", cursor: "pointer" }}>Discover</button>
+            <button onClick={() => setSection("local")} className="px-6 py-2 text-sm font-medium transition" style={{ background: section === "local" ? "rgba(34,211,238,0.12)" : "transparent", color: section === "local" ? "#a5f3fc" : "var(--text-1)", border: "none", cursor: "pointer" }}>On Device</button>
           </div>
 
           {section === "search" && (
             <>
               <form className="min-w-[280px] flex-1" onSubmit={(event) => { event.preventDefault(); void runSearch(query, 0, false); }}>
-                <input type="text" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search models" className="w-full rounded-full px-4 py-2 text-sm outline-none" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-0)" }} autoFocus />
+                <input type="text" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search models" className="w-full rounded-md px-4 py-2 text-sm outline-none" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-0)" }} autoFocus />
               </form>
-              <select value={formatFilter} onChange={(event) => setFormatFilter(event.target.value)} className="rounded-full px-3 py-2 text-sm outline-none" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-0)" }}>
+              <select value={formatFilter} onChange={(event) => setFormatFilter(event.target.value)} className="rounded-md px-3 py-2 text-sm outline-none" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-0)" }}>
                 <option value="gguf">GGUF</option>
               </select>
-              <select value={capabilityFilter} onChange={(event) => setCapabilityFilter(event.target.value)} className="rounded-full px-3 py-2 text-sm outline-none" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-0)" }}>
+              <select value={capabilityFilter} onChange={(event) => setCapabilityFilter(event.target.value)} className="rounded-md px-3 py-2 text-sm outline-none" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-0)" }}>
                 <option value="all">All capabilities</option>
                 <option value="vision">Vision</option>
                 <option value="reasoning">Reasoning</option>
                 <option value="tools">Tools</option>
               </select>
-              <select value={sortMode} onChange={(event) => setSortMode(event.target.value as HubSortMode)} className="rounded-full px-3 py-2 text-sm outline-none" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-0)" }}>
+              <select value={sortMode} onChange={(event) => setSortMode(event.target.value as HubSortMode)} className="rounded-md px-3 py-2 text-sm outline-none" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-0)" }}>
                 <option value="lastModified">Latest</option>
                 <option value="downloads">Popular</option>
                 <option value="likes">Most liked</option>
@@ -513,7 +782,7 @@ export function ModelBrowser({ models, onRefresh }: Props) {
                 <option value="smallest">Smallest</option>
                 <option value="name">Name</option>
               </select>
-              <button onClick={() => void runSearch(query, 0, false)} disabled={loading} className="rounded-full px-3 py-2 text-sm" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)", cursor: loading ? "not-allowed" : "pointer" }}>{loading ? "..." : "Refresh"}</button>
+              <button onClick={() => void runSearch(query, 0, false)} disabled={loading} className="rounded-md px-3 py-2 text-sm" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)", cursor: loading ? "not-allowed" : "pointer" }}>{loading ? "..." : "Refresh"}</button>
             </>
           )}
         </div>
@@ -535,16 +804,16 @@ export function ModelBrowser({ models, onRefresh }: Props) {
 
         <div className="relative ml-auto" ref={downloadsMenuRef}>
           <button onClick={() => setDownloadsOpen((open) => !open)} className="flex items-center gap-2 rounded px-3 py-1.5 text-xs font-medium transition" style={{ background: downloadsOpen ? "rgba(34,211,238,0.12)" : "var(--surface-2)", border: downloadsOpen ? "1px solid rgba(34,211,238,0.24)" : "1px solid var(--border)", color: downloadsOpen ? "#22d3ee" : "var(--text-1)", cursor: "pointer" }}>
-            <span>Downloads</span>
+            <span>Download Manager</span>
             {(activeDownloadCount > 0 || completedDownloadCount > 0) && <span className="rounded px-1.5 py-0.5 text-[10px] font-semibold" style={{ background: activeDownloadCount > 0 ? "rgba(34,211,238,0.18)" : "rgba(255,255,255,0.08)", color: activeDownloadCount > 0 ? "#22d3ee" : "var(--text-1)" }}>{activeDownloadCount > 0 ? activeDownloadCount : completedDownloadCount}</span>}
           </button>
 
           {downloadsOpen && (
-            <div className="absolute right-0 top-full z-20 mt-2 w-[380px] overflow-hidden rounded" style={{ background: "var(--surface-1)", border: "1px solid var(--border)", boxShadow: "0 14px 40px rgba(0,0,0,0.35)" }}>
+            <div className="absolute right-0 top-full z-20 mt-2 w-[460px] overflow-hidden rounded" style={{ background: "var(--surface-1)", border: "1px solid var(--border)", boxShadow: "0 14px 40px rgba(0,0,0,0.35)" }}>
               <div className="flex items-center justify-between border-b px-3 py-2" style={{ borderColor: "var(--border)" }}>
                 <div>
                   <div className="text-xs font-semibold uppercase tracking-[0.18em]" style={{ color: "var(--text-2)" }}>Download Manager</div>
-                  <div className="mt-1 text-xs" style={{ color: "var(--text-1)" }}>{activeDownloadCount > 0 ? `${activeDownloadCount} active` : completedDownloadCount > 0 ? `${completedDownloadCount} recent` : "No downloads yet"}</div>
+                  <div className="mt-1 text-xs" style={{ color: "var(--text-1)" }}>{activeDownloadCount > 0 ? `${activeDownloadCount} active · resumable transfers` : completedDownloadCount > 0 ? `${completedDownloadCount} recent` : "No downloads yet"}</div>
                 </div>
                 {completedDownloadCount > 0 && <button onClick={() => void api.clearCompletedDownloads().then(() => setDownloads((prev) => Object.fromEntries(Object.entries(prev).filter(([, entry]) => !entry.done))))} className="rounded px-2 py-1 text-[11px] font-medium transition" style={{ background: "transparent", border: "1px solid var(--border)", color: "var(--text-1)", cursor: "pointer" }}>Clear Done</button>}
               </div>
@@ -568,7 +837,11 @@ export function ModelBrowser({ models, onRefresh }: Props) {
                           <div className="h-1.5 overflow-hidden rounded" style={{ background: "rgba(255,255,255,0.08)" }}>
                             <div className="h-full rounded transition-all" style={{ width: `${Math.max(4, Math.round(entry.percent * 100))}%`, background: tone }} />
                           </div>
-                          <div className="mt-1 text-[11px]" style={{ color: "var(--text-2)" }}>{formatBytes(entry.downloaded_bytes)} / {formatBytes(entry.total_bytes)} ({Math.round(entry.percent * 100)}%)</div>
+                          <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px]" style={{ color: "var(--text-2)" }}>
+                            <span>{downloadDetail(entry)}</span>
+                            {entry.attempt > 1 && <span style={{ color: "#a5b4fc" }}>attempt {entry.attempt}/5</span>}
+                            {entry.resumable && !entry.done && <span style={{ color: "#fde68a" }}>resume ready</span>}
+                          </div>
                         </div>
                       )}
                       {entry.error && <div className="mt-2 text-[11px]" style={{ color: "#f87171" }}>{entry.error}</div>}
@@ -583,6 +856,11 @@ export function ModelBrowser({ models, onRefresh }: Props) {
                             <button onClick={() => void handlePauseDownload(entry.id)} disabled={entry.status === "Pausing" || entry.status === "Cancelling"} className="rounded px-2.5 py-1 text-[11px] font-medium transition" style={{ background: "rgba(251,191,36,0.12)", border: "1px solid rgba(251,191,36,0.24)", color: "#fde68a", cursor: entry.status === "Pausing" || entry.status === "Cancelling" ? "not-allowed" : "pointer", opacity: entry.status === "Pausing" || entry.status === "Cancelling" ? 0.7 : 1 }}>{entry.status === "Pausing" ? "Pausing..." : "Pause"}</button>
                             <button onClick={() => void handleCancelDownload(entry.id)} disabled={entry.status === "Cancelling"} className="rounded px-2.5 py-1 text-[11px] font-medium transition" style={{ background: "rgba(248,113,113,0.12)", border: "1px solid rgba(248,113,113,0.24)", color: "#f87171", cursor: entry.status === "Cancelling" ? "not-allowed" : "pointer", opacity: entry.status === "Cancelling" ? 0.7 : 1 }}>{entry.status === "Cancelling" ? "Cancelling..." : "Cancel"}</button>
                           </>
+                        ) : entry.done && entry.status === "Failed" && entry.resumable ? (
+                          <>
+                            <button onClick={() => void handleResumeDownload(entry)} className="rounded px-2.5 py-1 text-[11px] font-semibold transition" style={{ background: "#22d3ee", border: "none", color: "#041014", cursor: "pointer" }}>Resume</button>
+                            <button onClick={() => void handleCancelDownload(entry.id)} className="rounded px-2.5 py-1 text-[11px] font-medium transition" style={{ background: "rgba(248,113,113,0.12)", border: "1px solid rgba(248,113,113,0.24)", color: "#f87171", cursor: "pointer" }}>Discard</button>
+                          </>
                         ) : entry.dest_path ? (
                           <button onClick={() => void api.showInFolder(entry.dest_path as string)} className="rounded px-2.5 py-1 text-[11px] font-medium transition" style={{ background: "transparent", border: "1px solid var(--border)", color: "var(--text-1)", cursor: "pointer" }}>Open Folder</button>
                         ) : null}
@@ -596,16 +874,16 @@ export function ModelBrowser({ models, onRefresh }: Props) {
         </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-4">
+      <div className="min-h-0 flex-1 overflow-hidden p-4">
         {section === "search" ? (
-          <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_420px]">
-            {error && <div className="mb-4 rounded px-4 py-3 text-sm" style={{ background: "rgba(248,113,113,0.10)", border: "1px solid rgba(248,113,113,0.25)", color: "#f87171" }}>{error}</div>}
-            <div>
+          <div className="grid h-full min-h-0 gap-4 xl:grid-cols-[minmax(0,1fr)_500px]">
+            <div className="min-h-0 overflow-y-auto pr-1">
+              {error && <div className="mb-4 rounded px-4 py-3 text-sm" style={{ background: "rgba(248,113,113,0.10)", border: "1px solid rgba(248,113,113,0.25)", color: "#f87171" }}>{error}</div>}
               <div className="mb-3 flex items-center justify-between gap-2">
                 <h3 className="text-sm font-semibold" style={{ color: "var(--text-0)" }}>{resultTitle}</h3>
-                <div className="flex overflow-hidden rounded-full" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
-                  {["cards", "rows"].map((view) => (
-                    <button key={view} onClick={() => setExpandedId(view)} className="px-3 py-1 text-xs" style={{ background: expandedId === view ? "rgba(255,255,255,0.10)" : "transparent", color: "var(--text-1)", border: "none" }}>{view}</button>
+                <div className="flex overflow-hidden rounded-md" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
+                  {(["rows", "cards"] as const).map((view) => (
+                    <button key={view} onClick={() => setExpandedId(view)} className="px-3 py-1 text-xs" style={{ background: expandedId === view ? "rgba(34,211,238,0.12)" : "transparent", color: expandedId === view ? "#a5f3fc" : "var(--text-1)", border: "none" }}>{view === "rows" ? "list" : "cards"}</button>
                   ))}
                 </div>
               </div>
@@ -617,46 +895,50 @@ export function ModelBrowser({ models, onRefresh }: Props) {
                   <span className="text-xs" style={{ color: "var(--text-2)" }}>Try llama, qwen, mistral, phi, gemma, or unsloth.</span>
                 </div>
               ) : (
-                <div className={expandedId === "rows" ? "flex flex-col gap-2" : "grid gap-3 lg:grid-cols-2 2xl:grid-cols-3"}>
+                <div className={expandedId === "rows" ? "overflow-hidden rounded-md" : "grid gap-3 lg:grid-cols-2 2xl:grid-cols-3"} style={expandedId === "rows" ? { border: "1px solid var(--border)", background: "var(--surface-1)" } : undefined}>
+                  {expandedId === "rows" && (
+                    <div className="grid grid-cols-[minmax(0,1.7fr)_92px_92px_120px_92px] gap-3 border-b px-3 py-2 text-[10px] font-semibold uppercase tracking-[0.16em]" style={{ borderColor: "var(--border)", color: "var(--text-2)" }}>
+                      <span>Model</span>
+                      <span>Files</span>
+                      <span>Size</span>
+                      <span>Updated</span>
+                      <span>Status</span>
+                    </div>
+                  )}
                   {visibleResults.map((model) => {
                     const installed = anyInstalled(model);
                     const selected = selectedHubModel?.id === model.id;
                     const topTags = model.tags.slice(0, expandedId === "rows" ? 4 : 5);
+                    const detailsLoading = detailLoadingIds.has(model.id);
                     return (
                       <button
                         key={model.id}
                         onClick={() => setSelectedModelId(model.id)}
-                        className={expandedId === "rows" ? "rounded px-4 py-3 text-left transition" : "flex min-h-[168px] flex-col rounded px-4 py-4 text-left transition"}
+                        className={expandedId === "rows" ? "grid w-full grid-cols-[minmax(0,1.7fr)_92px_92px_120px_92px] items-center gap-3 border-b px-3 py-3 text-left transition last:border-b-0" : "flex min-h-[168px] flex-col rounded px-4 py-4 text-left transition"}
                         style={{
-                          ...panelStyle,
-                          background: modelCardBackground(selected, installed),
-                          border: `1px solid ${selected ? "rgba(34,211,238,0.72)" : installed ? "rgba(52,211,153,0.28)" : "var(--border)"}`,
-                          boxShadow: selected ? "0 0 0 1px rgba(34,211,238,0.26) inset, 0 10px 28px rgba(34,211,238,0.08)" : "none",
+                          ...(expandedId === "rows" ? { background: selected ? "rgba(34,211,238,0.075)" : installed ? "rgba(52,211,153,0.045)" : "transparent", borderColor: "var(--border)" } : panelStyle),
+                          ...(expandedId === "rows" ? {} : { background: modelCardBackground(selected, installed), border: `1px solid ${selected ? "rgba(34,211,238,0.72)" : installed ? "rgba(52,211,153,0.28)" : "var(--border)"}` }),
+                          boxShadow: selected && expandedId !== "rows" ? "0 0 0 1px rgba(34,211,238,0.26) inset, 0 10px 28px rgba(34,211,238,0.08)" : "none",
                           cursor: "pointer",
                         }}
                       >
                         {expandedId === "rows" ? (
-                          <div className="flex items-start gap-3">
-                            <div className="min-w-0 flex-1">
-                              <div className="mb-1 flex flex-wrap items-center gap-2">
-                                <span className="max-w-md truncate text-sm font-semibold" style={{ color: "var(--text-0)" }}>{model.name}</span>
-                                {selected && <span className="rounded px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider" style={{ background: "rgba(34,211,238,0.14)", color: "#67e8f9", border: "1px solid rgba(34,211,238,0.30)" }}>Selected</span>}
-                                {installed && <span className="rounded px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider" style={{ background: "rgba(52,211,153,0.10)", color: "#34d399", border: "1px solid rgba(52,211,153,0.22)" }}>On device</span>}
-                                {topTags.map((tag) => <TagBadge key={tag} tag={tag} />)}
+                          <>
+                            <div className="min-w-0">
+                              <div className="flex min-w-0 items-center gap-2">
+                                <span className="truncate text-sm font-semibold" style={{ color: "var(--text-0)" }}>{model.name}</span>
+                                {selected && <span className="shrink-0 rounded px-1.5 py-0.5 text-[9px] font-bold uppercase" style={{ background: "rgba(34,211,238,0.14)", color: "#67e8f9", border: "1px solid rgba(34,211,238,0.30)" }}>Selected</span>}
                               </div>
-                              <p className="truncate text-xs font-mono" style={{ color: "var(--text-2)" }}>{model.description}</p>
-                              <div className="mt-2 flex flex-wrap gap-2 text-[11px]" style={{ color: "var(--text-1)" }}>
-                                <span>{abbrevCount(model.downloads ?? 0)} downloads</span>
-                                <span>{abbrevCount(model.likes ?? 0)} likes</span>
-                                <span>{formatOptionSummary(model)}</span>
-                                <span>{timeAgo(model.last_modified ?? null)}</span>
+                              <div className="mt-1 truncate font-mono text-[11px]" style={{ color: "var(--text-2)" }}>{model.id}</div>
+                              <div className="mt-2 flex min-w-0 flex-wrap gap-1.5">
+                                {topTags.slice(0, 3).map((tag) => <TagBadge key={tag} tag={tag} />)}
                               </div>
                             </div>
-                            <div className="shrink-0 text-right text-xs" style={{ color: "var(--text-1)" }}>
-                              <div>{model.quants.length} files</div>
-                              <div style={{ color: "var(--text-2)" }}>{formatModelSizeRange(model.quants)}</div>
-                            </div>
-                          </div>
+                            <span className="text-xs" style={{ color: "var(--text-1)" }}>{model.quants.length}</span>
+                            <span className="truncate text-xs" style={{ color: detailsLoading ? "#67e8f9" : "var(--text-1)" }}>{formatModelSizeRange(model.quants, detailsLoading)}</span>
+                            <span className="text-xs" style={{ color: "var(--text-1)" }}>{timeAgo(model.last_modified ?? null).replace("updated ", "")}</span>
+                            <span className="justify-self-start rounded px-2 py-1 text-[10px] font-bold uppercase" style={{ background: installed ? "rgba(52,211,153,0.10)" : "var(--surface-2)", color: installed ? "#34d399" : "var(--text-2)", border: `1px solid ${installed ? "rgba(52,211,153,0.22)" : "var(--border)"}` }}>{installed ? "On device" : `${abbrevCount(model.downloads ?? 0)} dl`}</span>
+                          </>
                         ) : (
                           <>
                             <div className="flex items-start gap-3">
@@ -666,7 +948,7 @@ export function ModelBrowser({ models, onRefresh }: Props) {
                                 <div className="mt-2 flex flex-wrap gap-2 text-[11px]" style={{ color: "var(--text-1)" }}>
                                   <span>{abbrevCount(model.downloads ?? 0)} downloads</span>
                                   <span>{abbrevCount(model.likes ?? 0)} likes</span>
-                                  <span>{formatOptionSummary(model)}</span>
+                                  <span>{formatOptionSummary(model, detailsLoading)}</span>
                                   <span>{timeAgo(model.last_modified ?? null)}</span>
                                 </div>
                               </div>
@@ -689,7 +971,7 @@ export function ModelBrowser({ models, onRefresh }: Props) {
                               </div>
                               <div className="rounded px-2 py-1.5" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}>
                                 <div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--text-2)" }}>Size</div>
-                                <div className="mt-0.5 truncate text-xs font-semibold" style={{ color: "var(--text-0)" }}>{formatModelSizeRange(model.quants)}</div>
+                                <div className="mt-0.5 truncate text-xs font-semibold" style={{ color: detailsLoading ? "#67e8f9" : "var(--text-0)" }}>{formatModelSizeRange(model.quants, detailsLoading)}</div>
                               </div>
                             </div>
                           </>
@@ -703,12 +985,17 @@ export function ModelBrowser({ models, onRefresh }: Props) {
               {visibleResults.length > 0 && (
                 <div className="mt-4 flex flex-col items-center gap-2">
                   {loadingMore && <span className="text-xs" style={{ color: "var(--text-2)" }}>Loading more...</span>}
+                  {hasMore && !loadingMore && (
+                    <button onClick={() => void runSearch(query, offset, true)} className="rounded-md px-3 py-1.5 text-xs font-medium" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}>
+                      Load more from Hugging Face
+                    </button>
+                  )}
                   <div ref={sentinelRef} className="h-4 w-full" />
                   {!hasMore && <span className="pb-2 text-xs" style={{ color: "var(--text-2)" }}>All {visibleResults.length} visible results shown</span>}
                 </div>
               )}
             </div>
-            <HubPreview model={selectedHubModel} downloads={downloads} isInstalled={isInstalled} onDownload={(model, quant) => void handleDownload(model, quant)} onCancel={(id) => void handleCancelDownload(id)} onPause={(id) => void handlePauseDownload(id)} />
+            <HubPreview model={selectedHubModel} downloads={downloads} detailsLoading={selectedHubModel ? detailLoadingIds.has(selectedHubModel.id) : false} isInstalled={isInstalled} onDownload={(model, quant) => void handleDownload(model, quant)} onCancel={(id) => void handleCancelDownload(id)} onPause={(id) => void handlePauseDownload(id)} />
           </div>
         ) : (
           <div>

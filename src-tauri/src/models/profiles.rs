@@ -195,6 +195,7 @@ impl ModelProfile {
             // Qwen3.5 35B-A3B multimodal variants are commonly published as plain GGUF
             // filenames without an explicit `vision` or `-vl` marker.
             || normalized.contains("qwen3.5-35b-a3b")
+            || normalized.contains("qwen3.6-35b-a3b")
             // DiffusionGemma is a multimodal diffusion model with image understanding support.
             || normalized.contains("diffusiongemma")
             || normalized.contains("diffusion-gemma")
@@ -580,6 +581,14 @@ mod tests {
     fn detect_qwen3_5_35b_a3b_with_repo_style_tokens_as_vision_capable() {
         let profile =
             ModelProfile::detect("HauhauCS/Qwen3.5-35B-A3B-Uncensored-HauhauCS-Aggressive");
+        assert!(profile.supports_vision);
+    }
+
+    #[test]
+    fn detect_qwen3_6_35b_a3b_mtp_preserved_as_vision_capable() {
+        let profile = ModelProfile::detect(
+            "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved.Q4_K_M.gguf",
+        );
         assert!(profile.supports_vision);
     }
 

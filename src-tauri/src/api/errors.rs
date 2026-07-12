@@ -28,7 +28,9 @@ pub struct ApiErrorBody {
 impl ApiError {
     pub fn new(status: StatusCode, message: impl Into<String>) -> (StatusCode, Json<Self>) {
         let error_type = match status {
-            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => "invalid_request_error",
+            StatusCode::BAD_REQUEST
+            | StatusCode::UNPROCESSABLE_ENTITY
+            | StatusCode::NOT_IMPLEMENTED => "invalid_request_error",
             StatusCode::UNAUTHORIZED => "authentication_error",
             StatusCode::NOT_FOUND => "invalid_request_error",
             StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
@@ -105,6 +107,11 @@ impl ApiErrorResponse {
 
     pub fn bad_request(detail: impl Into<String>) -> Self {
         let (s, j) = ApiError::bad_request(detail);
+        Self(s, j)
+    }
+
+    pub fn not_supported(detail: impl Into<String>) -> Self {
+        let (s, j) = ApiError::new(StatusCode::NOT_IMPLEMENTED, detail);
         Self(s, j)
     }
 

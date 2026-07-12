@@ -243,6 +243,9 @@ export interface AppSettings {
   sglang_enabled: boolean;
   sglang_base_url: string;
   sglang_api_key: string | null;
+  openai_enabled: boolean;
+  openai_base_url: string;
+  openai_api_key: string | null;
   hf_api_key: string | null;
 }
 
@@ -441,6 +444,7 @@ export type ProviderType =
   | "external_llama_cpp"
   | "lm_studio"
   | "sg_lang"
+  | "open_ai"
   | "ollama"
   | "open_ai_compatible";
 

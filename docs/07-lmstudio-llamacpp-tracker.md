@@ -32,7 +32,8 @@ This tracker covers the current multi-tranche push to make InferenceBridge behav
 - [ ] T6 API compatibility
   - [x] T6.1 Extend load/config request aliases
   - [x] T6.2 Add richer runtime/model response fields
-  - [ ] T6.3 Add explicit runtime-ready transitions
+  - [x] T6.3 Add structured output, embeddings proxy, and Anthropic Messages endpoint
+  - [ ] T6.4 Add explicit runtime-ready transitions
 
 ## Last Update
 
@@ -65,6 +66,9 @@ The broader provider/runtime plan is now tracked in [docs/08-local-provider-runt
   - [x] Keep machine-specific provider config separate from model overrides.
   - [x] Route `/v1/models` and `/v1/chat/completions` through the active LM Studio provider for testing.
   - [x] Route `/v1/completions` and `/v1/responses` through the active LM Studio provider with shared upstream streaming passthrough.
+  - [x] Add OpenAI `response_format` constrained decoding passthrough to llama-server.
+  - [x] Add `/v1/embeddings` Phase A proxy to the loaded llama-server runtime.
+  - [x] Add `/v1/messages` Anthropic-compatible request/response translation for Claude-style clients.
 - `T5.3` API/Debug launch and template inspection
   - Surface the richer launch preview and effective profile data already being produced in:
     - `src-tauri/src/commands/model.rs`
@@ -74,7 +78,7 @@ The broader provider/runtime plan is now tracked in [docs/08-local-provider-runt
 - `T5.4` Live runtime state cleanup in Models/Status
   - Tighten `src/hooks/useModel.ts` so ready transitions clear stale loading UI immediately.
   - Normalize displayed labels in `src/components/Model/ModelSelector.tsx` and `src/components/Model/ProcessStatus.tsx` so `loading`, `warming`, `ready`, and `error` map to real runtime state.
-- `T6.3` Explicit runtime-ready transitions
+- `T6.4` Explicit runtime-ready transitions
   - Keep offline/error banners suppressed during healthy swap/load windows.
   - Publish and consume a clear post-health-check ready state from `src-tauri/src/commands/model.rs`.
 - `T3.3` Surface HF metadata in Models/Browse

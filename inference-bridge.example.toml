@@ -11,7 +11,7 @@
 port = 8800
 host = "127.0.0.1"
 autostart = true
-default_ctx_size = 32768
+default_ctx_size = 40960
 tool_argument_repair_enabled = true
 # Empty or omitted means no Bearer auth is required.
 api_key = ""
@@ -47,7 +47,7 @@ rope_freq_scale = 0.0
 fit_mode = ""
 # cache_ram_mb = 8192
 # ctxcp = 4
-use_jinja = false
+use_jinja = true
 reasoning_mode = ""
 template_mode = "repo"
 # template_name = "chatml"
@@ -76,7 +76,7 @@ inter_token_timeout_secs = 120
 health_poll_interval_ms = 150
 
 [providers]
-active = "managed_llamacpp" # managed_llamacpp, lm_studio, sglang
+active = "managed_llamacpp" # managed_llamacpp, lm_studio, sglang, openai
 
 [providers.lm_studio]
 enabled = false
@@ -87,6 +87,19 @@ api_key = ""
 enabled = false
 base_url = "http://127.0.0.1:30000/v1"
 api_key = ""
+
+[providers.openai]
+enabled = false
+base_url = "https://api.openai.com/v1"
+# Optional. If blank, InferenceBridge also checks OPENAI_API_KEY.
+api_key = ""
+
+# response_format and /v1/messages need no extra config.
+# /v1/embeddings currently proxies to the loaded llama-server model. Future
+# Phase B work can add a dedicated embedding runtime here.
+# [embeddings]
+# model_path = "C:\\path\\to\\nomic-embed-text.gguf"
+# enabled = false
 
 [hub]
 # Hugging Face token for gated metadata/downloads. Leave blank in examples.

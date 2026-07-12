@@ -178,6 +178,60 @@ fn filename_supports_vision(path: &Path) -> bool {
     crate::models::overrides::detect_effective_profile(&name).supports_vision
 }
 
+const DEFAULT_SELF_MTP_SPEC_TYPE: &str = "draft-mtp";
+const DEFAULT_SELF_MTP_DRAFT_N_MAX: u32 = 2;
+
+fn launch_config_model_key(config: &LaunchConfig) -> String {
+    format!(
+        "{} {} {}",
+        config.model_path.to_string_lossy(),
+        config.hf_repo.as_deref().unwrap_or_default(),
+        config.hf_file.as_deref().unwrap_or_default()
+    )
+    .to_ascii_lowercase()
+}
+
+fn launch_config_looks_self_mtp(config: &LaunchConfig) -> bool {
+    if !config.draft_model_path.trim().is_empty() {
+        return false;
+    }
+
+    let key = launch_config_model_key(config);
+    key.contains("-mtp")
+        || key.contains("_mtp")
+        || key.contains(".mtp")
+        || key.contains(" mtp")
+        || key.contains("mtp-")
+        || key.contains("mtp_")
+        || key.contains("mtp.")
+        || key.ends_with("mtp")
+}
+
+fn effective_spec_type(config: &LaunchConfig) -> Option<String> {
+    let explicit = config.spec_type.trim();
+    if !explicit.is_empty() {
+        return Some(explicit.to_string());
+    }
+
+    if launch_config_looks_self_mtp(config) {
+        return Some(DEFAULT_SELF_MTP_SPEC_TYPE.to_string());
+    }
+
+    None
+}
+
+fn effective_spec_draft_n_max(config: &LaunchConfig, spec_type: &str) -> u32 {
+    if config.spec_draft_n_max > 0 {
+        return config.spec_draft_n_max;
+    }
+
+    if spec_type == DEFAULT_SELF_MTP_SPEC_TYPE && launch_config_looks_self_mtp(config) {
+        return DEFAULT_SELF_MTP_DRAFT_N_MAX;
+    }
+
+    0
+}
+
 fn reasoning_mode_disables_thinking(reasoning_mode: Option<&str>) -> bool {
     matches!(
         reasoning_mode.map(|value| value.trim().to_ascii_lowercase()),
@@ -232,6 +286,7 @@ fn is_mmproj_candidate(path: &Path) -> bool {
         && (filename.starts_with("mmproj")
             || filename.contains("-mmproj")
             || filename.contains("_mmproj")
+            || filename.contains(".mmproj")
             || filename.contains("mmproj-model"))
 }
 
@@ -272,34 +327,72 @@ fn model_family_token(path: &Path) -> Option<&'static str> {
     .find(|family| name.contains(family))
 }
 
-fn find_mmproj_for_model(model_path: &Path) -> Option<PathBuf> {
-    let parent = model_path.parent()?;
+fn collect_mmproj_candidates(dir: &Path, recursive: bool, candidates: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() && is_mmproj_candidate(&path) {
+            candidates.push(path);
+        } else if recursive && path.is_dir() {
+            collect_mmproj_candidates(&path, true, candidates);
+        }
+    }
+}
+
+fn model_scan_root(model_path: &Path) -> Option<PathBuf> {
+    // LM Studio-style layout: <scan-root>/<publisher>/<repo>/<file.gguf>.
+    model_path
+        .parent()
+        .and_then(|repo| repo.parent())
+        .and_then(|publisher| publisher.parent())
+        .map(Path::to_path_buf)
+}
+
+fn best_mmproj_candidate(model_path: &Path, candidates: Vec<PathBuf>) -> Option<PathBuf> {
     let model_family = model_family_token(model_path);
-    let mut candidates = std::fs::read_dir(parent)
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| is_mmproj_candidate(path))
+    let min_score = 4;
+    let mut scored = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let score = shared_token_score(model_path, &candidate);
+            if score < min_score {
+                return None;
+            }
+            let family_matches = model_family.map_or(true, |family| {
+                candidate
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_lowercase().contains(family))
+                    .unwrap_or(false)
+            });
+            family_matches.then_some((score, candidate))
+        })
         .collect::<Vec<_>>();
 
-    if candidates.is_empty() {
-        return None;
+    scored.sort_by_key(|(score, candidate)| {
+        (
+            std::cmp::Reverse(*score),
+            candidate.to_string_lossy().to_lowercase(),
+        )
+    });
+    scored.into_iter().map(|(_, candidate)| candidate).next()
+}
+
+fn find_mmproj_for_model(model_path: &Path) -> Option<PathBuf> {
+    let parent = model_path.parent()?;
+    let mut candidates = Vec::new();
+    collect_mmproj_candidates(parent, false, &mut candidates);
+
+    if let Some(best) = best_mmproj_candidate(model_path, candidates) {
+        return Some(best);
     }
 
-    candidates
-        .sort_by_key(|candidate| std::cmp::Reverse(shared_token_score(model_path, candidate)));
-    candidates.into_iter().find(|candidate| {
-        let score = shared_token_score(model_path, candidate);
-        if score == 0 {
-            return false;
-        }
-        model_family.map_or(true, |family| {
-            candidate
-                .file_name()
-                .map(|name| name.to_string_lossy().to_lowercase().contains(family))
-                .unwrap_or(false)
-        })
-    })
+    let root = model_scan_root(model_path)?;
+    let mut candidates = Vec::new();
+    collect_mmproj_candidates(&root, true, &mut candidates);
+    best_mmproj_candidate(model_path, candidates)
 }
 
 #[cfg(test)]
@@ -387,6 +480,52 @@ mod tests {
         assert_eq!(found.file_name(), mmproj.file_name());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finds_dot_mmproj_sidecar() {
+        let dir = std::env::temp_dir().join(format!(
+            "inference-bridge-mmproj-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp model dir");
+        let model = dir.join("Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved.Q4_K_S.gguf");
+        let mmproj =
+            dir.join("Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved.mmproj-f16.gguf");
+        std::fs::write(&model, b"").expect("write model placeholder");
+        std::fs::write(&mmproj, b"").expect("write mmproj placeholder");
+
+        let found = find_mmproj_for_model(&model).expect("dot mmproj should be found");
+        assert_eq!(found.file_name(), mmproj.file_name());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finds_matching_mmproj_in_sibling_cache_repo() {
+        let root = std::env::temp_dir().join(format!(
+            "inference-bridge-cross-repo-mmproj-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let model_dir = root
+            .join("mradermacher")
+            .join("Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GGUF");
+        let projector_dir = root
+            .join("llmfan46")
+            .join("Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-GGUF");
+        std::fs::create_dir_all(&model_dir).expect("create model dir");
+        std::fs::create_dir_all(&projector_dir).expect("create projector dir");
+        let model =
+            model_dir.join("Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved.Q4_K_M.gguf");
+        let mmproj = projector_dir
+            .join("Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved.mmproj-f16.gguf");
+        std::fs::write(&model, b"").expect("write model placeholder");
+        std::fs::write(&mmproj, b"").expect("write mmproj placeholder");
+
+        let found = find_mmproj_for_model(&model).expect("cross-repo mmproj should be found");
+        assert_eq!(found, mmproj);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -660,6 +799,80 @@ mod tests {
         assert!(
             !preview.args.iter().any(|arg| arg == "-md"),
             "self-MTP must not emit a -md draft model, got {:?}",
+            preview.args
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mtp_filename_auto_emits_draft_mtp_flags_when_spec_blank() {
+        let dir = std::env::temp_dir().join(format!(
+            "inference-bridge-auto-mtp-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let model = dir.join("Qwen3.6-35B-A3B-Native-MTP-Preserved.Q4_K_M.gguf");
+        std::fs::write(&model, b"").expect("write model placeholder");
+        let server = dir.join("llama-server.exe");
+        std::fs::write(&server, b"").expect("write server placeholder");
+
+        let mut process = LlamaProcess::new();
+        process.set_server_path(server);
+
+        let config = test_launch_config(model);
+        let preview = process
+            .build_args_preview(&config)
+            .expect("build auto-MTP preview");
+
+        assert!(!preview.args.iter().any(|arg| arg == "-md"));
+        assert_eq!(preview.spec_type, "draft-mtp");
+        assert_eq!(preview.spec_draft_n_max, 2);
+        assert!(
+            preview
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--spec-type" && pair[1] == "draft-mtp"),
+            "expected auto --spec-type draft-mtp, got {:?}",
+            preview.args
+        );
+        assert!(
+            preview
+                .args
+                .windows(2)
+                .any(|pair| pair[0] == "--spec-draft-n-max" && pair[1] == "2"),
+            "expected auto --spec-draft-n-max 2, got {:?}",
+            preview.args
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_mtp_filename_does_not_emit_spec_flags_when_blank() {
+        let dir = std::env::temp_dir().join(format!(
+            "inference-bridge-non-mtp-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let model = dir.join("gemma-4-26B-A4B-it-QAT-Q4_0.gguf");
+        std::fs::write(&model, b"").expect("write model placeholder");
+        let server = dir.join("llama-server.exe");
+        std::fs::write(&server, b"").expect("write server placeholder");
+
+        let mut process = LlamaProcess::new();
+        process.set_server_path(server);
+
+        let config = test_launch_config(model);
+        let preview = process
+            .build_args_preview(&config)
+            .expect("build non-MTP preview");
+
+        assert_eq!(preview.spec_type, "");
+        assert_eq!(preview.spec_draft_n_max, 0);
+        assert!(
+            !preview.args.iter().any(|arg| arg == "--spec-type"),
+            "non-MTP model should not emit speculative flags, got {:?}",
             preview.args
         );
 
@@ -1286,12 +1499,18 @@ impl LlamaProcess {
         // --spec-type drives BOTH self-MTP (no draft model) and draft-model modes.
         // It must be emitted whenever a spec type is configured, independent of -md,
         // otherwise self-MTP never activates. --spec-draft-n-max pairs with it.
-        if !config.spec_type.trim().is_empty() {
+        let spec_type = effective_spec_type(config);
+        let spec_draft_n_max = spec_type
+            .as_deref()
+            .map(|spec_type| effective_spec_draft_n_max(config, spec_type))
+            .unwrap_or(0);
+
+        if let Some(spec_type) = spec_type.as_deref() {
             args.push("--spec-type".to_string());
-            args.push(config.spec_type.clone());
-            if config.spec_draft_n_max > 0 {
+            args.push(spec_type.to_string());
+            if spec_draft_n_max > 0 {
                 args.push("--spec-draft-n-max".to_string());
-                args.push(config.spec_draft_n_max.to_string());
+                args.push(spec_draft_n_max.to_string());
             }
         }
         // The remaining --draft-* knobs only apply to a separate draft model.
@@ -1337,8 +1556,8 @@ impl LlamaProcess {
             template_name: config.template_name.clone(),
             chat_template_kwargs_json,
             draft_model_path: config.draft_model_path.clone(),
-            spec_type: config.spec_type.clone(),
-            spec_draft_n_max: config.spec_draft_n_max,
+            spec_type: spec_type.unwrap_or_default(),
+            spec_draft_n_max,
             draft_max_tokens: config.draft_max_tokens,
             draft_min_tokens: config.draft_min_tokens,
             draft_p_min: config.draft_p_min,
@@ -1853,13 +2072,14 @@ impl LlamaProcess {
         );
         // Explicit, greppable record of the speculative-decoding mode so MTP
         // activation (self-MTP or draft-model) is obvious in the bridge logs.
-        if !config.spec_type.trim().is_empty() {
+        if !preview.spec_type.trim().is_empty() {
             tracing::info!(
                 target: "speculative",
-                spec_type = %config.spec_type,
-                spec_draft_n_max = config.spec_draft_n_max,
+                spec_type = %preview.spec_type,
+                spec_draft_n_max = preview.spec_draft_n_max,
                 draft_model = %config.draft_model_path,
                 self_mtp = config.draft_model_path.trim().is_empty(),
+                auto_detected = config.spec_type.trim().is_empty(),
                 "Speculative decoding enabled"
             );
         }

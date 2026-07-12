@@ -68,6 +68,8 @@ pub struct ResponsesRequest {
     pub repetition_penalty: Option<f32>,
     #[serde(default)]
     pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    pub text: Option<serde_json::Value>,
     #[serde(
         default,
         alias = "contextLength",
@@ -177,6 +179,7 @@ fn now_unix_secs() -> u64 {
 
 fn into_chat_request(request: ResponsesRequest) -> ChatCompletionRequest {
     let requested_context_size = request.requested_context_size();
+    let response_format = response_text_to_chat_response_format(request.text.as_ref());
     let messages = match request.input {
         ResponseInput::Text(text) => vec![ApiMessage {
             role: "user".to_string(),
@@ -204,6 +207,7 @@ fn into_chat_request(request: ResponsesRequest) -> ChatCompletionRequest {
         seed: request.seed,
         stop: request.stop,
         tools: request.tools,
+        response_format,
         context_size: requested_context_size,
         top: request.top,
         reasoning: request
@@ -217,6 +221,27 @@ fn into_chat_request(request: ResponsesRequest) -> ChatCompletionRequest {
         stream_options: None,
         options: request.options,
         extra: request.extra,
+    }
+}
+
+fn response_text_to_chat_response_format(
+    text: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let format = text?.get("format")?;
+    match format.get("type").and_then(|value| value.as_str()) {
+        Some("json_schema") => Some(serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": format
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("response"),
+                "strict": format.get("strict").and_then(|value| value.as_bool()).unwrap_or(true),
+                "schema": format.get("schema").cloned().unwrap_or_else(|| serde_json::json!({ "type": "object" }))
+            }
+        })),
+        Some("json_object") => Some(serde_json::json!({ "type": "json_object" })),
+        _ => None,
     }
 }
 
@@ -293,7 +318,7 @@ pub async fn responses(
     .await?;
     let profile = crate::models::overrides::detect_effective_profile(&model_name);
 
-    let (server_defaults, llama_port, context_limit) = {
+    let (server_defaults, llama_port, context_limit, scheduler) = {
         let s = state.read().await;
         (
             (
@@ -312,8 +337,11 @@ pub async fn responses(
                         .and_then(|preview| preview.context_size)
                 })
                 .or(requested_context_size),
+            s.request_scheduler.clone(),
         )
     };
+    let client = LlamaClient::new(llama_port);
+    let permit = scheduler.acquire().await;
 
     let (request, _compaction) = build_chat_request(
         &profile,
@@ -325,6 +353,7 @@ pub async fn responses(
             &server_defaults.3,
         ),
         context_limit,
+        Some(&client),
     )
     .await?;
 
@@ -341,13 +370,6 @@ pub async fn responses(
         s.last_prompt = Some(request.prompt.clone());
     }
 
-    let scheduler = {
-        let s = state.read().await;
-        s.request_scheduler.clone()
-    };
-    let permit = scheduler.acquire().await;
-
-    let client = LlamaClient::new(llama_port);
     let generation_started_at = chrono::Utc::now().to_rfc3339();
     let generation_started = std::time::Instant::now();
 
@@ -659,4 +681,63 @@ pub async fn responses(
         previous_response_id,
     })
     .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{into_chat_request, ResponseInput, ResponsesRequest};
+    use std::collections::HashMap;
+
+    fn base_request(text: Option<serde_json::Value>) -> ResponsesRequest {
+        ResponsesRequest {
+            model: Some("local".to_string()),
+            input: ResponseInput::Text("Return weather JSON.".to_string()),
+            stream: false,
+            max_output_tokens: Some(64),
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            min_p: None,
+            top: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            repetition_penalty: None,
+            tools: None,
+            text,
+            context_size: None,
+            stop: None,
+            seed: None,
+            reasoning: None,
+            reasoning_effort: None,
+            reasoning_tokens: None,
+            previous_response_id: None,
+            options: None,
+            extra: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn maps_responses_text_format_to_chat_response_format() {
+        let request = base_request(Some(serde_json::json!({
+            "format": {
+                "type": "json_schema",
+                "name": "weather",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "required": ["forecast"],
+                    "properties": { "forecast": { "type": "string" } }
+                }
+            }
+        })));
+
+        let chat = into_chat_request(request);
+        let response_format = chat.response_format.expect("response format");
+        assert_eq!(response_format["type"], "json_schema");
+        assert_eq!(response_format["json_schema"]["name"], "weather");
+        assert_eq!(
+            response_format["json_schema"]["schema"]["required"][0],
+            "forecast"
+        );
+    }
 }

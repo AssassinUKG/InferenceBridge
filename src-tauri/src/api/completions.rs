@@ -92,6 +92,8 @@ pub struct ChatCompletionRequest {
     pub seed: Option<i64>,
     pub stop: Option<StopParam>,
     pub tools: Option<Vec<serde_json::Value>>,
+    #[serde(default, alias = "responseFormat")]
+    pub response_format: Option<serde_json::Value>,
     #[serde(
         default,
         alias = "contextLength",
@@ -201,6 +203,23 @@ impl ChatCompletionRequest {
                 .or(self.reasoning_effort.as_deref())
                 .map(|effort| effort.eq_ignore_ascii_case("none"))
                 .unwrap_or(false)
+    }
+}
+
+/// Maps an OpenAI `response_format` into a llama-server json_schema payload.
+/// Returns None when no constraint is requested.
+pub(crate) fn response_format_to_json_schema(
+    response_format: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let response_format = response_format?;
+    match response_format.get("type").and_then(|value| value.as_str()) {
+        Some("json_schema") => response_format
+            .get("json_schema")
+            .and_then(|json_schema| json_schema.get("schema"))
+            .or_else(|| response_format.get("schema"))
+            .cloned(),
+        Some("json_object") => Some(serde_json::json!({ "type": "object" })),
+        _ => None,
     }
 }
 
@@ -657,7 +676,7 @@ pub struct CompletionTokensDetails {
     pub reasoning_tokens: u32,
 }
 
-fn now_unix_secs() -> u64 {
+pub(crate) fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -903,7 +922,7 @@ async fn publish_live_generation_metrics(
     });
 }
 
-async fn completion_failure_diagnostics(
+pub(crate) async fn completion_failure_diagnostics(
     state: &SharedState,
     model_name: &str,
     error: &anyhow::Error,
@@ -1609,6 +1628,7 @@ fn build_tool_argument_repair_request(
         special: true,
         image_data: vec![],
         grammar: None,
+        json_schema: None,
     }
 }
 
@@ -1703,7 +1723,7 @@ fn api_tool_call_value_from_arguments(
     value
 }
 
-async fn api_tool_call_value(
+pub(crate) async fn api_tool_call_value(
     client: Option<&LlamaClient>,
     profile: &ModelProfile,
     tool_call: &crate::normalize::tool_extract::ToolCall,
@@ -1721,10 +1741,12 @@ pub(crate) async fn build_chat_request(
     req: ChatCompletionRequest,
     server_defaults: (&Option<f32>, &Option<f32>, &Option<i32>, &Option<u32>),
     context_limit: Option<u32>,
+    compaction_client: Option<&LlamaClient>,
 ) -> Result<(CompletionRequest, Option<CompactionInfo>), ApiErrorResponse> {
     let requested_top_p = req.requested_top_p();
     let requested_top_k = req.requested_top_k();
     let thinking_disabled = req.requested_thinking_disabled();
+    let json_schema = response_format_to_json_schema(req.response_format.as_ref());
     let (mut messages, image_data) = normalize_api_messages(&req.messages, profile).await?;
     let has_tools = req.tools.as_ref().map_or(false, |t| !t.is_empty());
     prepend_tool_schema_message(&mut messages, profile, req.tools.as_ref());
@@ -1741,7 +1763,14 @@ pub(crate) async fn build_chat_request(
         .or(profile.default_max_output_tokens)
         .or(*server_defaults.3)
         .map(|value| value as i32);
-    let compaction = compact_messages_to_fit(&mut messages, profile, context_limit, n_predict);
+    let compaction = compact_messages_to_fit(
+        &mut messages,
+        profile,
+        context_limit,
+        n_predict,
+        compaction_client,
+    )
+    .await;
 
     let mut stop = profile.stop_markers.clone();
     if let Some(user_stop) = req.stop {
@@ -1774,16 +1803,18 @@ pub(crate) async fn build_chat_request(
             special: true,
             image_data,
             grammar: None,
+            json_schema,
         },
         compaction,
     ))
 }
 
-fn compact_messages_to_fit(
+async fn compact_messages_to_fit(
     messages: &mut Vec<crate::templates::engine::ChatMessage>,
     profile: &ModelProfile,
     context_limit: Option<u32>,
     n_predict: Option<i32>,
+    compaction_client: Option<&LlamaClient>,
 ) -> Option<CompactionInfo> {
     let Some(context_limit) = context_limit.filter(|value| *value > 0) else {
         return None;
@@ -1801,29 +1832,20 @@ fn compact_messages_to_fit(
         .saturating_sub(output_reserve)
         .max(context_limit / 2);
     let mut removed = Vec::new();
-    let mut extra_removed = 0usize;
 
-    while crate::normalize::think_strip::estimate_token_count(
-        &crate::templates::engine::render_prompt(messages, profile),
-    ) > budget
-        && messages.len() > 2
-    {
-        let pinned = messages
-            .iter()
-            .take_while(|message| message.role == "system")
-            .count()
-            .min(messages.len().saturating_sub(1));
-        let remove_index = if pinned < messages.len().saturating_sub(1) {
-            pinned
-        } else {
-            0
+    while prompt_token_count(messages, profile) > budget && messages.len() > 2 {
+        let Some(span) = oldest_evictable_message_span(messages) else {
+            break;
         };
-        let removed_message = messages.remove(remove_index);
-        removed.push((removed_message.role, removed_message.content));
+        let removed_messages = messages
+            .drain(span)
+            .map(|message| (message.role, message.content))
+            .collect::<Vec<_>>();
+        removed.extend(removed_messages);
     }
 
     if !removed.is_empty() {
-        let summary = crate::context::compressor::compress_messages(&removed);
+        let summary = summarize_removed_messages(compaction_client, profile, &removed).await;
         let insert_at = messages
             .iter()
             .take_while(|message| message.role == "system")
@@ -1838,32 +1860,118 @@ fn compact_messages_to_fit(
         );
     }
 
-    while crate::normalize::think_strip::estimate_token_count(
-        &crate::templates::engine::render_prompt(messages, profile),
-    ) > budget
-        && messages.len() > 2
-    {
-        let pinned = messages
-            .iter()
-            .take_while(|message| message.role == "system")
-            .count()
-            .min(messages.len().saturating_sub(1));
-        let remove_index = if pinned < messages.len().saturating_sub(1) {
-            pinned
-        } else {
-            0
+    while prompt_token_count(messages, profile) > budget && messages.len() > 2 {
+        let Some(span) = oldest_evictable_message_span(messages) else {
+            break;
         };
-        messages.remove(remove_index);
-        extra_removed += 1;
+        let extra_removed = messages
+            .drain(span)
+            .map(|message| (message.role, message.content))
+            .collect::<Vec<_>>();
+        if extra_removed.is_empty() {
+            break;
+        }
+        removed.extend(extra_removed);
+        let summary = summarize_removed_messages(compaction_client, profile, &removed).await;
+        replace_existing_compaction_summary(messages, summary);
     }
 
-    let removed_messages = removed.len() + extra_removed;
-    (removed_messages > 0).then_some(CompactionInfo {
-        removed_messages,
+    (!removed.is_empty()).then_some(CompactionInfo {
+        removed_messages: removed.len(),
         remaining_messages: messages.len(),
         context_limit,
         budget,
     })
+}
+
+async fn summarize_removed_messages(
+    client: Option<&LlamaClient>,
+    profile: &ModelProfile,
+    removed: &[(String, String)],
+) -> String {
+    if let Some(client) = client {
+        if let Some(summary) = crate::context::compressor::summarize_message_pairs_with_client(
+            client, profile, removed,
+        )
+        .await
+        {
+            return format!("[Earlier conversation summary]\n{summary}");
+        }
+    }
+
+    crate::context::compressor::compress_messages(removed)
+}
+
+fn prompt_token_count(
+    messages: &[crate::templates::engine::ChatMessage],
+    profile: &ModelProfile,
+) -> u32 {
+    crate::normalize::think_strip::estimate_token_count(&crate::templates::engine::render_prompt(
+        messages, profile,
+    ))
+}
+
+fn oldest_evictable_message_span(
+    messages: &[crate::templates::engine::ChatMessage],
+) -> Option<std::ops::Range<usize>> {
+    if messages.len() <= 2 {
+        return None;
+    }
+
+    let pinned = messages
+        .iter()
+        .take_while(|message| message.role == "system")
+        .count()
+        .min(messages.len().saturating_sub(1));
+    let last_index = messages.len().saturating_sub(1);
+    let start = (pinned..last_index).find(|index| !is_compaction_summary(&messages[*index]))?;
+    let mut end = start + 1;
+
+    if message_has_tool_call(&messages[start])
+        && end < last_index
+        && message_is_tool_result(&messages[end])
+    {
+        end += 1;
+    } else if message_is_tool_result(&messages[start])
+        && start > pinned
+        && message_has_tool_call(&messages[start - 1])
+    {
+        return Some((start - 1)..end);
+    }
+
+    Some(start..end)
+}
+
+fn replace_existing_compaction_summary(
+    messages: &mut [crate::templates::engine::ChatMessage],
+    summary_content: String,
+) {
+    let Some(summary) = messages
+        .iter_mut()
+        .find(|message| is_compaction_summary(message))
+    else {
+        return;
+    };
+
+    summary.content = summary_content;
+}
+
+fn is_compaction_summary(message: &crate::templates::engine::ChatMessage) -> bool {
+    message.role == "system" && message.content.contains("[Earlier conversation summary]")
+}
+
+fn message_has_tool_call(message: &crate::templates::engine::ChatMessage) -> bool {
+    message.role == "assistant"
+        && (message.content.contains("<tool_call>")
+            || message.content.contains("<|tool_call>")
+            || message.content.contains("[tool_call]"))
+}
+
+fn message_is_tool_result(message: &crate::templates::engine::ChatMessage) -> bool {
+    message.role == "tool"
+        || message.content.contains("<tool_response>")
+        || message.content.contains("<|tool_response>")
+        || message.content.contains("Tool call id:")
 }
 
 fn launch_preview_matches_model(model_name: &str, preview_model_path: &str) -> bool {
@@ -2062,6 +2170,8 @@ pub async fn chat_completions(
             s.config.server.tool_argument_repair_enabled,
         )
     };
+    let client = LlamaClient::new(llama_port);
+    let permit = scheduler.acquire().await;
 
     let (request, compaction) = build_chat_request(
         &profile,
@@ -2073,6 +2183,7 @@ pub async fn chat_completions(
             &server_defaults.3,
         ),
         context_limit,
+        Some(&client),
     )
     .await?;
 
@@ -2083,13 +2194,11 @@ pub async fn chat_completions(
         !request.image_data.is_empty(),
     )
     .await?;
-    let permit = scheduler.acquire().await;
     {
         let mut s = state.write().await;
         s.last_prompt = Some(request.prompt.clone());
     }
 
-    let client = LlamaClient::new(llama_port);
     let generation_started_at = chrono::Utc::now().to_rfc3339();
     let generation_started = std::time::Instant::now();
     let gen = begin_api_generation(&state, model_name.clone()).await;
@@ -2631,6 +2740,8 @@ pub struct TextCompletionRequest {
     pub top: Option<TopParam>,
     pub seed: Option<i64>,
     pub stop: Option<StopParam>,
+    #[serde(default, alias = "responseFormat")]
+    pub response_format: Option<serde_json::Value>,
     #[serde(default)]
     pub options: Option<serde_json::Value>,
     #[serde(flatten)]
@@ -2753,6 +2864,7 @@ pub async fn text_completions(
         special: true,
         image_data: vec![],
         grammar: None,
+        json_schema: response_format_to_json_schema(req.response_format.as_ref()),
     };
 
     let _permit = scheduler.acquire().await;
@@ -2807,8 +2919,8 @@ mod tests {
     use super::{
         api_tool_call_value, build_tool_argument_repair_request, compact_messages_to_fit,
         context_request_matches_preview, context_size_for_reload, extract_runtime_load_overrides,
-        loaded_model_matches_request, normalize_api_messages, validate_tool_arguments, ApiMessage,
-        ChatCompletionRequest,
+        loaded_model_matches_request, normalize_api_messages, response_format_to_json_schema,
+        validate_tool_arguments, ApiMessage, ChatCompletionRequest,
     };
     use crate::engine::process::LaunchPreview;
     use crate::models::profiles::ModelProfile;
@@ -2826,6 +2938,48 @@ mod tests {
         .expect("request should deserialize");
 
         assert_eq!(request.messages.len(), 1);
+    }
+
+    #[test]
+    fn response_format_json_schema_maps_to_llama_schema() {
+        let response_format = serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "weather",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "required": ["unit"],
+                    "properties": {
+                        "unit": { "type": "string", "enum": ["celsius", "fahrenheit"] }
+                    }
+                }
+            }
+        });
+
+        let schema = response_format_to_json_schema(Some(&response_format))
+            .expect("schema response_format should map");
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["required"][0], "unit");
+    }
+
+    #[test]
+    fn response_format_json_object_maps_to_object_schema() {
+        let schema = response_format_to_json_schema(Some(&serde_json::json!({
+            "type": "json_object"
+        })))
+        .expect("json_object should map");
+
+        assert_eq!(schema, serde_json::json!({ "type": "object" }));
+    }
+
+    #[test]
+    fn response_format_none_or_unknown_is_unconstrained() {
+        assert!(response_format_to_json_schema(None).is_none());
+        assert!(response_format_to_json_schema(Some(&serde_json::json!({
+            "type": "text"
+        })))
+        .is_none());
     }
 
     #[test]
@@ -3426,8 +3580,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn compacts_messages_before_context_overflow() {
+    #[tokio::test]
+    async fn compacts_messages_before_context_overflow() {
         let profile = ModelProfile::detect("gemma-4-26B-A4B-it-QAT-Q4_0.gguf");
         let mut messages = vec![ChatMessage {
             role: "system".to_string(),
@@ -3440,13 +3594,52 @@ mod tests {
             });
         }
 
-        compact_messages_to_fit(&mut messages, &profile, Some(2048), Some(256));
+        compact_messages_to_fit(&mut messages, &profile, Some(2048), Some(256), None).await;
         let prompt = crate::templates::engine::render_prompt(&messages, &profile);
 
         assert!(crate::normalize::think_strip::estimate_token_count(&prompt) <= 2048);
         assert!(messages
             .iter()
             .any(|message| message.content.contains("[Earlier conversation summary]")));
+    }
+
+    #[tokio::test]
+    async fn compaction_removes_tool_call_and_result_as_pair() {
+        let profile = ModelProfile::detect("Qwen3.6-27B-Q4_K_M.gguf");
+        let mut messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: "Use tools carefully.".to_string(),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: format!(
+                    "<tool_call>{{\"name\":\"search_docs\",\"arguments\":{{\"query\":\"{}\"}}}}</tool_call>",
+                    "qwen ".repeat(400)
+                ),
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: format!("<tool_response>{}</tool_response>", "result ".repeat(400)),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Continue from the tool result.".to_string(),
+            },
+        ];
+
+        let info = compact_messages_to_fit(&mut messages, &profile, Some(256), Some(64), None)
+            .await
+            .expect("messages should compact");
+
+        assert_eq!(info.removed_messages, 2);
+        assert!(messages
+            .iter()
+            .any(|message| message.content.contains("[Earlier conversation summary]")));
+        assert!(!messages
+            .iter()
+            .filter(|message| message.role != "system")
+            .any(|message| message.content.contains("<tool_response>")));
     }
 
     #[tokio::test]

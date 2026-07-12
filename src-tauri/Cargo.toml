@@ -39,3 +39,5 @@ clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 percent-encoding = "2"
 base64 = "0.22"
+rayon = "1"
+memmap2 = "0.9"

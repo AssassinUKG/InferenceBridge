@@ -19,17 +19,22 @@ pub struct ScannedModel {
 
 /// Scan a directory recursively for .gguf files.
 pub fn scan_directory(dir: &Path) -> Vec<ScannedModel> {
-    let mut models = Vec::new();
     if !dir.is_dir() {
         tracing::warn!(?dir, "Model scan directory does not exist");
-        return models;
+        return Vec::new();
     }
-    scan_recursive(dir, &mut models);
+    let mut paths = Vec::new();
+    collect_gguf_paths(dir, &mut paths);
+    let mut models = parse_paths(&paths);
     models.sort_by(|a, b| a.filename.cmp(&b.filename));
     models
 }
 
-fn scan_recursive(dir: &Path, models: &mut Vec<ScannedModel>) {
+/// Walk `dir` recursively and collect paths to standalone `.gguf` model files.
+///
+/// Auxiliary files (mmproj sidecars, tokenizers, control vectors) are filtered
+/// out here — by filename alone — so their headers are never parsed.
+fn collect_gguf_paths(dir: &Path, out: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
@@ -40,24 +45,41 @@ fn scan_recursive(dir: &Path, models: &mut Vec<ScannedModel>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            scan_recursive(&path, models);
-        } else if let Some(ext) = path.extension() {
-            if ext.eq_ignore_ascii_case("gguf") {
-                if let Some(model) = parse_model_file(&path) {
-                    // Skip non-model files (multimodal projections, tokenizers, etc.)
-                    if !is_auxiliary_file(&model.filename) {
-                        models.push(model);
-                    }
-                }
+            collect_gguf_paths(&path, out);
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        {
+            let is_aux = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(is_auxiliary_file);
+            if !is_aux {
+                out.push(path);
             }
         }
     }
 }
 
+/// Parse a batch of GGUF paths in parallel, then flush the metadata cache once.
+///
+/// Header parsing is I/O-bound and independent per file, so it fans out across
+/// the rayon thread pool. The `(size, mtime) → GgufMeta` cache means unchanged
+/// files on a rescan skip parsing entirely.
+fn parse_paths(paths: &[PathBuf]) -> Vec<ScannedModel> {
+    use rayon::prelude::*;
+    let models: Vec<ScannedModel> = paths
+        .par_iter()
+        .filter_map(|p| parse_model_file(p))
+        .collect();
+    super::gguf::flush_gguf_cache();
+    models
+}
+
 fn parse_model_file(path: &Path) -> Option<ScannedModel> {
     let filename = path.file_name()?.to_string_lossy().to_string();
     let metadata = std::fs::metadata(path).ok()?;
-    let gguf_meta = super::gguf::read_gguf_meta(path);
+    let gguf_meta = super::gguf::read_gguf_meta_cached(path);
     let architecture = gguf_meta
         .as_ref()
         .and_then(|meta| meta.architecture.as_deref());
@@ -78,7 +100,11 @@ fn parse_model_file(path: &Path) -> Option<ScannedModel> {
 fn is_auxiliary_file(filename: &str) -> bool {
     let lower = filename.to_lowercase();
     // Multimodal projection files (vision adapters)
-    if lower.starts_with("mmproj") || lower.contains("-mmproj") || lower.contains("_mmproj") {
+    if lower.starts_with("mmproj")
+        || lower.contains("-mmproj")
+        || lower.contains("_mmproj")
+        || lower.contains(".mmproj")
+    {
         return true;
     }
     // Tokenizer / vocab-only files
@@ -92,13 +118,43 @@ fn is_auxiliary_file(filename: &str) -> bool {
     false
 }
 
-/// Scan all configured directories and return all found models.
-pub fn scan_all(dirs: &[PathBuf]) -> Vec<ScannedModel> {
-    let mut all = Vec::new();
-    for dir in dirs {
-        all.extend(scan_directory(dir));
+#[cfg(test)]
+mod tests {
+    use super::is_auxiliary_file;
+
+    #[test]
+    fn treats_dot_mmproj_files_as_auxiliary() {
+        assert!(is_auxiliary_file(
+            "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved.mmproj-f16.gguf"
+        ));
     }
-    // Deduplicate by path
+
+    #[test]
+    fn keeps_regular_models_visible() {
+        assert!(!is_auxiliary_file(
+            "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved.Q4_K_S.gguf"
+        ));
+    }
+}
+
+/// Scan all configured directories and return all found models.
+///
+/// Paths are collected across every directory and de-duplicated *before*
+/// parsing, so overlapping scan dirs never parse the same file twice and the
+/// whole batch is parsed in one parallel pass with a single cache flush.
+pub fn scan_all(dirs: &[PathBuf]) -> Vec<ScannedModel> {
+    let mut paths = Vec::new();
+    for dir in dirs {
+        if dir.is_dir() {
+            collect_gguf_paths(dir, &mut paths);
+        } else {
+            tracing::warn!(?dir, "Model scan directory does not exist");
+        }
+    }
+    paths.sort();
+    paths.dedup();
+
+    let mut all = parse_paths(&paths);
     all.sort_by(|a, b| a.path.cmp(&b.path));
     all.dedup_by(|a, b| a.path == b.path);
     all
