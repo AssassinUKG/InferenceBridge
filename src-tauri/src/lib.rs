@@ -233,9 +233,11 @@ pub fn run() {
             commands::browse::search_hub_models,
             commands::browse::show_in_folder,
             commands::image::get_image_generation_status,
+            commands::image::detect_image_lab_setup,
             commands::image::preview_image_generation,
             commands::image::generate_image,
             commands::image::cancel_image_generation,
+            commands::image::read_generated_image_data_url,
         ])
         .setup(move |app| {
             // Warn if existing llama-server processes may cause port conflicts

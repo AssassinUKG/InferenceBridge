@@ -53,6 +53,15 @@ pub struct AppSettings {
     pub diffusion_kv_cache: String,
     pub diffusion_visual: bool,
     pub diffusion_extra_args: Vec<String>,
+    pub image_generation_enabled: bool,
+    pub image_runner_path: String,
+    pub image_output_dir: String,
+    pub image_default_profile: String,
+    pub image_transformer_path: String,
+    pub image_text_encoder_path: String,
+    pub image_vae_path: String,
+    pub image_warn_temperature_c: f32,
+    pub image_cooldown_temperature_c: f32,
     /// API key for Bearer token auth. None / empty string = no auth required.
     pub api_key: Option<String>,
     pub active_provider: String,
@@ -93,6 +102,12 @@ pub struct RuntimePackInfo {
 #[tauri::command]
 pub async fn get_settings(state: tauri::State<'_, SharedState>) -> Result<AppSettings, String> {
     let s = state.read().await;
+    let image_bundle = s
+        .config
+        .image_generation
+        .bundles
+        .iter()
+        .find(|bundle| bundle.id == s.config.image_generation.default_bundle);
     Ok(AppSettings {
         api_autostart: s.config.server.autostart,
         kill_on_exit: s.config.process.kill_on_exit,
@@ -142,6 +157,21 @@ pub async fn get_settings(state: tauri::State<'_, SharedState>) -> Result<AppSet
         diffusion_kv_cache: s.config.process.diffusion_kv_cache.clone(),
         diffusion_visual: s.config.process.diffusion_visual,
         diffusion_extra_args: s.config.process.diffusion_extra_args.clone(),
+        image_generation_enabled: s.config.image_generation.enabled,
+        image_runner_path: s.config.image_generation.runner_path.clone(),
+        image_output_dir: s.config.image_generation.output_dir.clone(),
+        image_default_profile: s.config.image_generation.default_profile.clone(),
+        image_transformer_path: image_bundle
+            .map(|bundle| bundle.transformer_path.clone())
+            .unwrap_or_default(),
+        image_text_encoder_path: image_bundle
+            .map(|bundle| bundle.text_encoder_path.clone())
+            .unwrap_or_default(),
+        image_vae_path: image_bundle
+            .map(|bundle| bundle.vae_path.clone())
+            .unwrap_or_default(),
+        image_warn_temperature_c: s.config.image_generation.warn_temperature_c,
+        image_cooldown_temperature_c: s.config.image_generation.cooldown_temperature_c,
         api_key: s.config.server.api_key.clone(),
         active_provider: s.config.providers.active.clone(),
         lm_studio_enabled: s.config.providers.lm_studio.enabled,
@@ -191,6 +221,18 @@ pub async fn update_settings(
     settings: AppSettings,
 ) -> Result<(), String> {
     let shared = state.inner().clone();
+    {
+        let app_state = shared.read().await;
+        if app_state
+            .image_generation_exclusive
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(
+                "Wait for image generation and chat restoration to finish before changing settings"
+                    .to_string(),
+            );
+        }
+    }
     let host = settings.server_host.clone();
     let normalized_api_key = settings.api_key.clone().filter(|k| !k.trim().is_empty());
     let active_provider = match settings.active_provider.trim() {
@@ -219,6 +261,44 @@ pub async fn update_settings(
         .hf_api_key
         .clone()
         .filter(|key| !key.trim().is_empty());
+    let mut image_generation = {
+        let s = shared.read().await;
+        s.config.image_generation.clone()
+    };
+    image_generation.enabled = settings.image_generation_enabled;
+    image_generation.runner_path = settings.image_runner_path.trim().to_string();
+    image_generation.output_dir = settings.image_output_dir.trim().to_string();
+    image_generation.default_profile = settings.image_default_profile.trim().to_string();
+    image_generation.warn_temperature_c = settings.image_warn_temperature_c;
+    image_generation.cooldown_temperature_c = settings.image_cooldown_temperature_c;
+    let default_bundle_id = image_generation.default_bundle.clone();
+    let configured_bundle = crate::config::ImageModelBundleConfig {
+        id: default_bundle_id.clone(),
+        name: "Qwen-Image-2512 Q6".to_string(),
+        architecture: "qwen_image".to_string(),
+        quantization: "Q6_K".to_string(),
+        transformer_path: settings.image_transformer_path.trim().to_string(),
+        text_encoder_path: settings.image_text_encoder_path.trim().to_string(),
+        vae_path: settings.image_vae_path.trim().to_string(),
+    };
+    if let Some(bundle) = image_generation
+        .bundles
+        .iter_mut()
+        .find(|bundle| bundle.id == default_bundle_id)
+    {
+        *bundle = configured_bundle;
+    } else {
+        image_generation.bundles.push(configured_bundle);
+    }
+    if image_generation.enabled {
+        let status = crate::image_generation::capability_status(&image_generation, None);
+        if !status.ready {
+            return Err(format!(
+                "Image generation setup is incomplete: {}",
+                status.reasons.join("; ")
+            ));
+        }
+    }
     let (
         should_restart_api,
         should_start_api,
@@ -329,6 +409,7 @@ pub async fn update_settings(
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .collect();
+        s.config.image_generation = image_generation.clone();
         s.config.server.api_key = normalized_api_key.clone();
         s.config.providers.active = active_provider.clone();
         s.config.providers.lm_studio.enabled = settings.lm_studio_enabled;

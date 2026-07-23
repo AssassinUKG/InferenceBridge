@@ -20,9 +20,16 @@ static STEP_PROGRESS_RE: LazyLock<Regex> = LazyLock::new(|| {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageGenerationRequest {
     pub prompt: String,
+    pub session_id: Option<String>,
     pub bundle_id: Option<String>,
     pub profile_id: Option<String>,
     pub seed: Option<i64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub steps: Option<u32>,
+    pub cfg_scale: Option<f32>,
+    pub sampling_method: Option<String>,
+    pub negative_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,13 +51,19 @@ pub struct ImageGenerationResult {
     pub job_id: String,
     pub status: String,
     pub bundle_id: String,
+    pub bundle_name: String,
+    pub quantization: String,
     pub profile_id: String,
     pub prompt: String,
+    pub negative_prompt: Option<String>,
     pub seed: i64,
     pub width: u32,
     pub height: u32,
     pub steps: u32,
+    pub cfg_scale: f32,
+    pub sampling_method: String,
     pub elapsed_seconds: f64,
+    pub file_size_bytes: Option<u64>,
     pub output_path: Option<String>,
     pub error: Option<String>,
 }
@@ -130,6 +143,7 @@ impl ImageGenerationProgress {
 pub struct ImageGenerationCapabilityStatus {
     pub enabled: bool,
     pub ready: bool,
+    pub automatic_model_swap_enabled: bool,
     pub runner_path: Option<String>,
     pub output_dir: String,
     pub default_bundle: String,
@@ -139,7 +153,19 @@ pub struct ImageGenerationCapabilityStatus {
     pub reasons: Vec<String>,
     pub bundles: Vec<ImageBundleStatus>,
     pub profiles: Vec<ImageProfileStatus>,
+    pub size_presets: Vec<ImageSizePreset>,
     pub active_job: Option<ImageGenerationProgress>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageSizePreset {
+    pub id: String,
+    pub name: String,
+    pub aspect_ratio: String,
+    pub width: u32,
+    pub height: u32,
+    pub tier: String,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -169,6 +195,7 @@ pub struct ResolvedImageJob {
     pub bundle: ImageModelBundleConfig,
     pub profile: ImageGenerationProfileConfig,
     pub prompt: String,
+    pub negative_prompt: Option<String>,
     pub seed: i64,
     pub output_path: PathBuf,
     pub arguments: Vec<String>,
@@ -307,6 +334,7 @@ pub fn capability_status(
     ImageGenerationCapabilityStatus {
         enabled: config.enabled,
         ready: config.enabled && reasons.is_empty(),
+        automatic_model_swap_enabled: config.automatic_model_swap_enabled,
         runner_path: runner.map(|path| path.to_string_lossy().to_string()),
         output_dir: output_dir.to_string_lossy().to_string(),
         default_bundle: config.default_bundle.clone(),
@@ -316,8 +344,99 @@ pub fn capability_status(
         reasons,
         bundles,
         profiles,
+        size_presets: image_size_presets(),
         active_job,
     }
+}
+
+pub fn image_size_presets() -> Vec<ImageSizePreset> {
+    [
+        (
+            "recommended_square",
+            "Recommended square",
+            "1:1",
+            1024,
+            1024,
+            "recommended",
+            "Measured Q6 default: best balance of quality, heat, and generation time.",
+        ),
+        (
+            "official_square",
+            "Maximum square",
+            "1:1",
+            1328,
+            1328,
+            "max",
+            "Official Qwen square size; slower and thermally demanding on RTX 3090.",
+        ),
+        (
+            "widescreen",
+            "Widescreen",
+            "16:9",
+            1664,
+            928,
+            "official",
+            "Official Qwen landscape preset.",
+        ),
+        (
+            "portrait",
+            "Tall portrait",
+            "9:16",
+            928,
+            1664,
+            "official",
+            "Official Qwen portrait preset.",
+        ),
+        (
+            "landscape_4_3",
+            "Landscape",
+            "4:3",
+            1472,
+            1104,
+            "official",
+            "Official Qwen landscape preset.",
+        ),
+        (
+            "portrait_3_4",
+            "Portrait",
+            "3:4",
+            1104,
+            1472,
+            "official",
+            "Official Qwen portrait preset.",
+        ),
+        (
+            "photo_3_2",
+            "Photo landscape",
+            "3:2",
+            1584,
+            1056,
+            "official",
+            "Official Qwen photographic landscape preset.",
+        ),
+        (
+            "photo_2_3",
+            "Photo portrait",
+            "2:3",
+            1056,
+            1584,
+            "official",
+            "Official Qwen photographic portrait preset.",
+        ),
+    ]
+    .into_iter()
+    .map(
+        |(id, name, aspect_ratio, width, height, tier, note)| ImageSizePreset {
+            id: id.to_string(),
+            name: name.to_string(),
+            aspect_ratio: aspect_ratio.to_string(),
+            width,
+            height,
+            tier: tier.to_string(),
+            note: note.to_string(),
+        },
+    )
+    .collect()
 }
 
 pub fn resolve_job(
@@ -360,7 +479,7 @@ pub fn resolve_job(
     if !bundle_check.ready {
         return Err(bundle_check.reasons.join("; "));
     }
-    let profile = config
+    let mut profile = config
         .profiles
         .iter()
         .find(|profile| profile.id == profile_id)
@@ -372,18 +491,53 @@ pub fn resolve_job(
             .reason
             .unwrap_or_else(|| format!("Invalid image profile: {profile_id}")));
     }
+    if let Some(width) = request.width {
+        profile.width = width;
+    }
+    if let Some(height) = request.height {
+        profile.height = height;
+    }
+    if let Some(steps) = request.steps {
+        profile.steps = steps;
+    }
+    if let Some(cfg_scale) = request.cfg_scale {
+        profile.cfg_scale = cfg_scale;
+    }
+    if let Some(sampling_method) = request.sampling_method.as_ref() {
+        profile.sampling_method = sampling_method.trim().to_ascii_lowercase();
+    }
+    validate_profile(&profile)?;
+    let negative_prompt = request
+        .negative_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if negative_prompt.is_some_and(|value| value.chars().count() > 4_000) {
+        return Err("Negative image prompt exceeds the 4000 character limit".to_string());
+    }
+    if negative_prompt.is_some_and(|value| value.contains('\0')) {
+        return Err("Negative image prompt contains an invalid null character".to_string());
+    }
     let runner_path = trimmed_path(&config.runner_path)
         .ok_or_else(|| "Image runner path is not configured".to_string())?;
     let seed = request.seed.unwrap_or_else(|| {
         let bytes = *uuid::Uuid::new_v4().as_bytes();
         i64::from(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     });
-    let arguments = build_native_arguments(&bundle, &profile, prompt, seed, &output_path);
+    let arguments = build_native_arguments(
+        &bundle,
+        &profile,
+        prompt,
+        negative_prompt,
+        seed,
+        &output_path,
+    );
     Ok(ResolvedImageJob {
         runner_path,
         bundle,
         profile,
         prompt: prompt.to_string(),
+        negative_prompt: negative_prompt.map(str::to_string),
         seed,
         output_path,
         arguments,
@@ -437,6 +591,7 @@ fn build_native_arguments(
     bundle: &ImageModelBundleConfig,
     profile: &ImageGenerationProfileConfig,
     prompt: &str,
+    negative_prompt: Option<&str>,
     seed: i64,
     output_path: &Path,
 ) -> Vec<String> {
@@ -476,6 +631,10 @@ fn build_native_arguments(
     }
     if profile.diffusion_flash_attention {
         arguments.push("--diffusion-fa".to_string());
+    }
+    if let Some(negative_prompt) = negative_prompt {
+        arguments.push("-n".to_string());
+        arguments.push(negative_prompt.to_string());
     }
     arguments
 }
@@ -597,9 +756,10 @@ fn validate_profile(profile: &ImageGenerationProfileConfig) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::{
-        build_native_arguments, output_png_dimensions, ImageGenerationProfileConfig,
-        ImageModelBundleConfig, NativeProgressParser,
+        build_native_arguments, image_size_presets, output_png_dimensions,
+        ImageGenerationProfileConfig, ImageModelBundleConfig, NativeProgressParser,
     };
+    use crate::config::ImageGenerationConfig;
     use std::path::Path;
 
     fn bundle() -> ImageModelBundleConfig {
@@ -618,8 +778,14 @@ mod tests {
     fn native_arguments_are_allowlisted_and_prompt_is_one_argument() {
         let profile = ImageGenerationProfileConfig::default();
         let prompt = "A cat beside a sign reading \"EXACT TEXT\"";
-        let arguments =
-            build_native_arguments(&bundle(), &profile, prompt, 42, Path::new("output.png"));
+        let arguments = build_native_arguments(
+            &bundle(),
+            &profile,
+            prompt,
+            Some("blurry, distorted"),
+            42,
+            Path::new("output.png"),
+        );
         assert_eq!(
             arguments[arguments.iter().position(|arg| arg == "-p").unwrap() + 1],
             prompt
@@ -628,9 +794,46 @@ mod tests {
         assert!(arguments.contains(&"--diffusion-fa".to_string()));
         assert!(!arguments.contains(&"--taesd".to_string()));
         assert_eq!(
+            arguments[arguments.iter().position(|arg| arg == "-n").unwrap() + 1],
+            "blurry, distorted"
+        );
+        assert_eq!(
             arguments[arguments.iter().position(|arg| arg == "--steps").unwrap() + 1],
             "50"
         );
+    }
+
+    #[test]
+    fn quality_defaults_and_official_sizes_are_stable() {
+        let config = ImageGenerationConfig::default();
+        assert_eq!(config.default_bundle, "qwen-image-2512-q6");
+        assert_eq!(config.default_profile, "quality");
+        let quality = config
+            .profiles
+            .iter()
+            .find(|profile| profile.id == config.default_profile)
+            .expect("quality profile should exist");
+        assert_eq!(
+            (quality.width, quality.height, quality.steps),
+            (1024, 1024, 50)
+        );
+        assert_eq!(quality.sampling_method, "euler");
+        assert!((quality.cfg_scale - 2.5).abs() < f32::EPSILON);
+
+        let presets = image_size_presets();
+        let recommended = presets
+            .first()
+            .expect("recommended square preset should exist");
+        assert_eq!(recommended.id, "recommended_square");
+        assert_eq!((recommended.width, recommended.height), (1024, 1024));
+        for aspect_ratio in ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"] {
+            assert!(
+                presets
+                    .iter()
+                    .any(|preset| preset.aspect_ratio == aspect_ratio),
+                "missing {aspect_ratio} preset"
+            );
+        }
     }
 
     #[test]

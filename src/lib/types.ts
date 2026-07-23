@@ -176,9 +176,16 @@ export interface LoadProgress {
 
 export interface ImageGenerationRequest {
   prompt: string;
+  session_id?: string | null;
   bundle_id?: string | null;
   profile_id?: string | null;
   seed?: number | null;
+  width?: number | null;
+  height?: number | null;
+  steps?: number | null;
+  cfg_scale?: number | null;
+  sampling_method?: string | null;
+  negative_prompt?: string | null;
 }
 
 export interface ImageGenerationProgress {
@@ -219,9 +226,20 @@ export interface ImageProfileStatus {
   reason: string | null;
 }
 
+export interface ImageSizePreset {
+  id: string;
+  name: string;
+  aspect_ratio: string;
+  width: number;
+  height: number;
+  tier: string;
+  note: string;
+}
+
 export interface ImageGenerationCapabilityStatus {
   enabled: boolean;
   ready: boolean;
+  automatic_model_swap_enabled: boolean;
   runner_path: string | null;
   output_dir: string;
   default_bundle: string;
@@ -231,7 +249,16 @@ export interface ImageGenerationCapabilityStatus {
   reasons: string[];
   bundles: ImageBundleStatus[];
   profiles: ImageProfileStatus[];
+  size_presets: ImageSizePreset[];
   active_job: ImageGenerationProgress | null;
+}
+
+export interface DetectedImageLabSetup {
+  runner_path: string;
+  transformer_path: string;
+  text_encoder_path: string;
+  vae_path: string;
+  output_dir: string;
 }
 
 export interface ImageGenerationPreview {
@@ -251,13 +278,19 @@ export interface ImageGenerationResult {
   job_id: string;
   status: string;
   bundle_id: string;
+  bundle_name: string;
+  quantization: string;
   profile_id: string;
   prompt: string;
+  negative_prompt: string | null;
   seed: number;
   width: number;
   height: number;
   steps: number;
+  cfg_scale: number;
+  sampling_method: string;
   elapsed_seconds: number;
+  file_size_bytes: number | null;
   output_path: string | null;
   error: string | null;
 }
@@ -278,6 +311,8 @@ export interface MessageInfo {
   display_content?: string | null;
   reasoning_content?: string | null;
   image_base64?: string | null;
+  image_path?: string | null;
+  image_metadata?: string | null;
   token_count: number | null;
   tokens_evaluated?: number | null;
   tokens_predicted?: number | null;
@@ -346,6 +381,15 @@ export interface AppSettings {
   diffusion_kv_cache: string;
   diffusion_visual: boolean;
   diffusion_extra_args: string[];
+  image_generation_enabled: boolean;
+  image_runner_path: string;
+  image_output_dir: string;
+  image_default_profile: string;
+  image_transformer_path: string;
+  image_text_encoder_path: string;
+  image_vae_path: string;
+  image_warn_temperature_c: number;
+  image_cooldown_temperature_c: number;
   api_key: string | null;
   active_provider: string;
   lm_studio_enabled: boolean;

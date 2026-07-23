@@ -55,6 +55,8 @@ impl SessionDb {
                 display_content   TEXT,
                 reasoning_content TEXT,
                 image_base64      TEXT,
+                image_path        TEXT,
+                image_metadata    TEXT,
                 token_count       INTEGER DEFAULT 0,
                 tokens_evaluated  INTEGER,
                 tokens_predicted  INTEGER,
@@ -143,6 +145,14 @@ impl SessionDb {
         if !names.iter().any(|col| col == "image_base64") {
             self.conn
                 .execute("ALTER TABLE messages ADD COLUMN image_base64 TEXT", [])?;
+        }
+        if !names.iter().any(|col| col == "image_path") {
+            self.conn
+                .execute("ALTER TABLE messages ADD COLUMN image_path TEXT", [])?;
+        }
+        if !names.iter().any(|col| col == "image_metadata") {
+            self.conn
+                .execute("ALTER TABLE messages ADD COLUMN image_metadata TEXT", [])?;
         }
         if !names.iter().any(|col| col == "tokens_evaluated") {
             self.conn.execute(
@@ -292,6 +302,31 @@ impl SessionDb {
         Ok(())
     }
 
+    pub fn add_generated_image_message(
+        &self,
+        session_id: &str,
+        content: &str,
+        image_path: &str,
+        image_metadata: &str,
+    ) -> Result<i64> {
+        let session_exists = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+            rusqlite::params![session_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        anyhow::ensure!(session_exists, "Conversation not found");
+        self.conn.execute(
+            "INSERT INTO messages (session_id, role, content, image_path, image_metadata, token_count) VALUES (?1, 'assistant', ?2, ?3, ?4, 0)",
+            rusqlite::params![session_id, content, image_path, image_metadata],
+        )?;
+        let message_id = self.conn.last_insert_rowid();
+        self.conn.execute(
+            "UPDATE sessions SET updated_at = datetime('now') WHERE id = ?1",
+            rusqlite::params![session_id],
+        )?;
+        Ok(message_id)
+    }
+
     pub fn update_message_presentation(
         &self,
         message_id: i64,
@@ -308,7 +343,7 @@ impl SessionDb {
     pub fn get_messages(&self, session_id: &str) -> Result<Vec<MessageInfo>> {
         let mut messages = {
             let mut stmt = self.conn.prepare(
-                "SELECT id, role, content, display_content, reasoning_content, image_base64, token_count, tokens_evaluated, tokens_predicted, created_at FROM messages WHERE session_id = ?1 ORDER BY id",
+                "SELECT id, role, content, display_content, reasoning_content, image_base64, image_path, image_metadata, token_count, tokens_evaluated, tokens_predicted, created_at FROM messages WHERE session_id = ?1 ORDER BY id",
             )?;
             let rows = stmt.query_map(rusqlite::params![session_id], |row| {
                 Ok(MessageInfo {
@@ -318,10 +353,12 @@ impl SessionDb {
                     display_content: row.get(3)?,
                     reasoning_content: row.get(4)?,
                     image_base64: row.get(5)?,
-                    token_count: row.get(6)?,
-                    tokens_evaluated: row.get(7)?,
-                    tokens_predicted: row.get(8)?,
-                    created_at: row.get(9)?,
+                    image_path: row.get(6)?,
+                    image_metadata: row.get(7)?,
+                    token_count: row.get(8)?,
+                    tokens_evaluated: row.get(9)?,
+                    tokens_predicted: row.get(10)?,
+                    created_at: row.get(11)?,
                     tool_calls: Vec::new(),
                 })
             })?;
@@ -433,6 +470,8 @@ pub struct MessageInfo {
     pub display_content: Option<String>,
     pub reasoning_content: Option<String>,
     pub image_base64: Option<String>,
+    pub image_path: Option<String>,
+    pub image_metadata: Option<String>,
     pub token_count: Option<u32>,
     pub tokens_evaluated: Option<u32>,
     pub tokens_predicted: Option<u32>,

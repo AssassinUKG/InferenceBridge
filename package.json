@@ -8,7 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test": "node --test tests/chatNames.test.mjs tests/chatPresentation.test.mjs tests/conversationUi.test.mjs tests/modelHubLayout.test.mjs tests/liveStreams.test.mjs tests/modelLoadProfiles.test.mjs tests/benchmarkData.test.mjs tests/benchmarkMatrix.test.mjs tests/downloads.test.mjs && node tests/inferencebridge.test.cjs",
+    "test": "node --test tests/chatNames.test.mjs tests/chatPresentation.test.mjs tests/conversationUi.test.mjs tests/generatedImagePresentation.test.mjs tests/modelHubLayout.test.mjs tests/liveStreams.test.mjs tests/modelLoadProfiles.test.mjs tests/benchmarkData.test.mjs tests/benchmarkMatrix.test.mjs tests/downloads.test.mjs && node tests/inferencebridge.test.cjs",
     "test:api": "node tests/inferencebridge.test.cjs"
   },
   "devDependencies": {

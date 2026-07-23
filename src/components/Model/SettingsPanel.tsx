@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { emit } from "@tauri-apps/api/event";
-import { Cpu, FolderOpen, Network, Plug, Power, Search, SlidersHorizontal } from "lucide-react";
-import type { ApiAccessInfo, ApiServerAction, AppSettings, LlamaServerInfo, LoadProgress, ProcessStatusInfo, RuntimeDoctorReport, RuntimePackInfo, TemplateDryRunReport } from "../../lib/types";
+import { Cpu, FolderOpen, Image as ImageIcon, Network, Plug, Power, Search, SlidersHorizontal } from "lucide-react";
+import type { ApiAccessInfo, ApiServerAction, AppSettings, ImageGenerationCapabilityStatus, LlamaServerInfo, LoadProgress, ProcessStatusInfo, RuntimeDoctorReport, RuntimePackInfo, TemplateDryRunReport } from "../../lib/types";
 import * as api from "../../lib/tauri";
 import { formatCliArgs, parseCliArgs } from "../../lib/args";
 import { stripStaleThinkingKwargs } from "../../lib/modelLoadProfiles";
@@ -19,6 +19,7 @@ const SETTINGS_SECTIONS = [
   { id: "api", label: "API", icon: Network, keywords: "server host port key network autostart" },
   { id: "providers", label: "Providers", icon: Plug, keywords: "openai lm studio sglang hugging face provider" },
   { id: "runtime", label: "Runtime", icon: Cpu, keywords: "llama cpp cuda cpu install update backend" },
+  { id: "images", label: "Image generation", icon: ImageIcon, keywords: "qwen image picture diffusion size quality aspect" },
   { id: "inference", label: "Inference", icon: SlidersHorizontal, keywords: "batch context template jinja reasoning speculative gpu threads" },
   { id: "storage", label: "Model folders", icon: FolderOpen, keywords: "directory folder scan gguf models" },
   { id: "lifecycle", label: "Lifecycle", icon: Power, keywords: "close exit unload stop" },
@@ -667,6 +668,8 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
   const [templateDryRunLoading, setTemplateDryRunLoading] = useState(false);
   const [configPath, setConfigPath] = useState<string | null>(null);
   const [configPathCopied, setConfigPathCopied] = useState(false);
+  const [imageStatus, setImageStatus] = useState<ImageGenerationCapabilityStatus | null>(null);
+  const [imageSetupMessage, setImageSetupMessage] = useState<string | null>(null);
 
   const loadSettings = useCallback(async () => {
     try {
@@ -692,6 +695,14 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
       setConfigPath(await api.getConfigFilePath());
     } catch {
       setConfigPath(null);
+    }
+  }, []);
+
+  const loadImageStatus = useCallback(async () => {
+    try {
+      setImageStatus(await api.getImageGenerationStatus());
+    } catch {
+      setImageStatus(null);
     }
   }, []);
 
@@ -728,7 +739,8 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
     loadConfigPath();
     loadLlamaInfo();
     loadRuntimePacks();
-  }, [loadSettings, loadApiAccessInfo, loadConfigPath, loadLlamaInfo, loadRuntimePacks]);
+    loadImageStatus();
+  }, [loadSettings, loadApiAccessInfo, loadConfigPath, loadLlamaInfo, loadRuntimePacks, loadImageStatus]);
 
   useEffect(() => {
     if (runtimeFocusRequest <= 0) return;
@@ -739,6 +751,19 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
         ?.scrollIntoView({ behavior: "smooth", block: "start" });
     });
   }, [runtimeFocusRequest]);
+
+  useEffect(() => {
+    const openImageSettings = () => {
+      setActiveSettingsSection("images");
+      window.requestAnimationFrame(() => {
+        document
+          .getElementById("settings-images")
+          ?.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+    };
+    window.addEventListener("ib-open-image-settings", openImageSettings);
+    return () => window.removeEventListener("ib-open-image-settings", openImageSettings);
+  }, []);
 
   const saveSettings = useCallback(async (nextSettings?: AppSettings) => {
     const settingsToSave = nextSettings ?? settings;
@@ -756,6 +781,8 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
       setError(null);
       setPersistedSettings(settingsToSave);
       await loadApiAccessInfo();
+      await loadImageStatus();
+      window.dispatchEvent(new CustomEvent("ib-image-settings-updated"));
       onSaved?.(settingsToSave);
       setTimeout(() => setSaved(false), 2000);
       return true;
@@ -765,7 +792,27 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
     } finally {
       setSaving(false);
     }
-  }, [settings, loadApiAccessInfo, onSaved]);
+  }, [settings, loadApiAccessInfo, loadImageStatus, onSaved]);
+
+  const detectTestedImageSetup = async () => {
+    setImageSetupMessage("Looking for the tested Qwen-Image lab files...");
+    try {
+      const detected = await api.detectImageLabSetup();
+      setSettings((current) => current ? {
+        ...current,
+        image_generation_enabled: true,
+        image_runner_path: detected.runner_path,
+        image_output_dir: detected.output_dir,
+        image_transformer_path: detected.transformer_path,
+        image_text_encoder_path: detected.text_encoder_path,
+        image_vae_path: detected.vae_path,
+        image_default_profile: "quality",
+      } : current);
+      setImageSetupMessage("Tested Qwen-Image Q6 files found. Save settings to enable image generation.");
+    } catch (imageError) {
+      setImageSetupMessage(String(imageError));
+    }
+  };
 
   const handleDownload = async (backend: string) => {
     setDownloadingBackend(backend);
@@ -1403,6 +1450,139 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
               </div>
             </>
           )}
+        </SectionPanel>
+        </div>
+
+        <div id="settings-images" className="scroll-mt-5">
+        <SectionPanel>
+          <SectionHeader
+            title="Native image generation"
+            description="Qwen-Image is a separate local renderer. Direct generation works now; automatic chat unload and exact restoration stays safety-locked until the recovery suite passes."
+          />
+          <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-3">
+            <div>
+              <div className="text-sm font-medium text-[var(--text-0)]">
+                {imageStatus?.ready ? "Image runtime ready" : "Image runtime needs setup"}
+              </div>
+              <div className="mt-1 text-xs text-[var(--text-2)]">
+                Default: Qwen-Image-2512 Q6, 1024×1024, 50 steps.
+              </div>
+              <div className={`mt-1 text-xs ${
+                imageStatus?.automatic_model_swap_enabled ? "text-emerald-300" : "text-amber-200"
+              }`}>
+                Automatic chat restoration: {imageStatus?.automatic_model_swap_enabled
+                  ? "certified and enabled"
+                  : "locked — unload the chat model before generating"}
+              </div>
+            </div>
+            <FlatBtn
+              label="Use tested lab setup"
+              onClick={() => { void detectTestedImageSetup(); }}
+              disabled={saving}
+            />
+          </div>
+          {imageSetupMessage && (
+            <>
+              <Divider />
+              <div className="px-4 py-2.5 text-xs text-[var(--text-1)]">{imageSetupMessage}</div>
+            </>
+          )}
+          {!imageStatus?.ready && imageStatus?.reasons?.length ? (
+            <>
+              <Divider />
+              <div className="px-4 py-2.5 text-xs leading-5 text-amber-200">
+                {imageStatus.reasons.join(" · ")}
+              </div>
+            </>
+          ) : null}
+          <Divider />
+          <FieldRow label="Enabled" hint="Only becomes active after every file validates.">
+            <Toggle
+              checked={settings.image_generation_enabled}
+              onChange={() => setSettings({
+                ...settings,
+                image_generation_enabled: !settings.image_generation_enabled,
+              })}
+            />
+          </FieldRow>
+          <Divider />
+          <FieldRow label="Image runner" hint="Pinned stable-diffusion.cpp sd-cli.exe">
+            <FlatInput
+              value={settings.image_runner_path}
+              onChange={(value) => setSettings({ ...settings, image_runner_path: value })}
+              placeholder="C:\path\to\sd-cli.exe"
+            />
+          </FieldRow>
+          <Divider />
+          <FieldRow label="Qwen transformer" hint="Qwen-Image-2512 Q6 GGUF">
+            <FlatInput
+              value={settings.image_transformer_path}
+              onChange={(value) => setSettings({ ...settings, image_transformer_path: value })}
+              placeholder="C:\path\to\qwen-image-2512-Q6_K.gguf"
+            />
+          </FieldRow>
+          <Divider />
+          <FieldRow label="Text encoder" hint="Qwen2.5-VL-7B Q8 GGUF">
+            <FlatInput
+              value={settings.image_text_encoder_path}
+              onChange={(value) => setSettings({ ...settings, image_text_encoder_path: value })}
+              placeholder="C:\path\to\Qwen2.5-VL-7B-Instruct.Q8_0.gguf"
+            />
+          </FieldRow>
+          <Divider />
+          <FieldRow label="Image VAE">
+            <FlatInput
+              value={settings.image_vae_path}
+              onChange={(value) => setSettings({ ...settings, image_vae_path: value })}
+              placeholder="C:\path\to\qwen_image_vae.safetensors"
+            />
+          </FieldRow>
+          <Divider />
+          <FieldRow label="Output folder" hint="Blank uses IB's app-data image folder.">
+            <FlatInput
+              value={settings.image_output_dir}
+              onChange={(value) => setSettings({ ...settings, image_output_dir: value })}
+              placeholder="C:\path\to\generated-images"
+            />
+          </FieldRow>
+          <Divider />
+          <FieldRow label="Default quality">
+            <FlatSelect
+              value={settings.image_default_profile}
+              onChange={(value) => setSettings({ ...settings, image_default_profile: value })}
+            >
+              <option value="quality">Quality — 1024×1024, 50 steps</option>
+              <option value="max_quality">Maximum square — 1328×1328, 50 steps</option>
+              <option value="preview">Diagnostic preview — 512×512, 4 steps</option>
+            </FlatSelect>
+          </FieldRow>
+          <Divider />
+          <div className="grid gap-0 md:grid-cols-2 md:divide-x md:divide-[var(--border)]">
+            <FieldRow label="Temperature warning">
+              <FlatInput
+                type="number"
+                min={40}
+                max={100}
+                value={settings.image_warn_temperature_c}
+                onChange={(value) => setSettings({
+                  ...settings,
+                  image_warn_temperature_c: Number(value),
+                })}
+              />
+            </FieldRow>
+            <FieldRow label="Queue cooldown">
+              <FlatInput
+                type="number"
+                min={20}
+                max={90}
+                value={settings.image_cooldown_temperature_c}
+                onChange={(value) => setSettings({
+                  ...settings,
+                  image_cooldown_temperature_c: Number(value),
+                })}
+              />
+            </FieldRow>
+          </div>
         </SectionPanel>
         </div>
 

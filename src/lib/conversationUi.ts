@@ -2,6 +2,17 @@ import type { MessageInfo, SessionInfo } from "./types";
 
 export const STREAM_FOLLOW_THRESHOLD_PX = 96;
 
+export type ComposerPrimaryAction = "send_message" | "generate_image" | "unavailable";
+
+export function composerPrimaryAction(
+  hasModel: boolean,
+  imageGenerationReady: boolean,
+): ComposerPrimaryAction {
+  if (hasModel) return "send_message";
+  if (imageGenerationReady) return "generate_image";
+  return "unavailable";
+}
+
 export function isNearScrollBottom(
   scrollHeight: number,
   scrollTop: number,

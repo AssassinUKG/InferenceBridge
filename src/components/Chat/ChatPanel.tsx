@@ -13,19 +13,22 @@ import {
   X,
 } from "lucide-react";
 import type {
+  ImageGenerationCapabilityStatus,
   ImageGenerationProgress,
+  ImageSizePreset,
   MessageInfo,
   ModelInfo,
   ProcessStatusInfo,
 } from "../../lib/types";
 import {
   cancelImageGeneration,
+  generateImage,
   getImageGenerationStatus,
   type SamplingParams,
 } from "../../lib/tauri";
 import { readSamplingSettings, recommendedLoadPresets } from "../../lib/modelLoadProfiles";
 import { latestAssistantOutputTokens } from "../../lib/chatPresentation";
-import { isNearScrollBottom } from "../../lib/conversationUi";
+import { composerPrimaryAction, isNearScrollBottom } from "../../lib/conversationUi";
 import {
   PRESETS,
   PRESET_ORDER,
@@ -65,6 +68,7 @@ interface Props {
   creatingSession: boolean;
   onCreateSession: () => void;
   onOpenModelPicker: (trigger: HTMLElement | null) => void;
+  onOpenImageSettings: () => void;
 }
 
 const suggestionPrompts = [
@@ -96,6 +100,7 @@ export function ChatPanel({
   creatingSession,
   onCreateSession,
   onOpenModelPicker,
+  onOpenImageSettings,
 }: Props) {
   const [input, setInput] = useState("");
   const [image, setImage] = useState<File | null>(null);
@@ -111,6 +116,9 @@ export function ChatPanel({
   const [canvasOpen, setCanvasOpen] = useState(false);
   const [followingOutput, setFollowingOutput] = useState(true);
   const [imageProgress, setImageProgress] = useState<ImageGenerationProgress | null>(null);
+  const [imageCapability, setImageCapability] = useState<ImageGenerationCapabilityStatus | null>(null);
+  const [imageControlsOpen, setImageControlsOpen] = useState(false);
+  const [imageSubmitting, setImageSubmitting] = useState(false);
   const [imageProgressReceivedAt, setImageProgressReceivedAt] = useState(Date.now());
   const [, setImageClock] = useState(Date.now());
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -120,6 +128,7 @@ export function ChatPanel({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const controlsRef = useRef<HTMLDivElement>(null);
+  const imageControlsRef = useRef<HTMLDivElement>(null);
 
   const canThink = loadedModelInfo?.supports_reasoning ?? modelSupportsThinking(loadedModel);
   const tessQwenPresets = loadedModelInfo ? recommendedLoadPresets(loadedModelInfo) : [];
@@ -157,17 +166,37 @@ export function ChatPanel({
   const hasCustomSampling = Object.values(sampling).some(
     (value) => value !== undefined
   );
-  const canSend =
-    (!!input.trim() || !!image) && hasModel && hasSession && !isStreaming;
+  const imageJobActive = !!imageProgress && !imageProgress.done;
+  const primaryAction = composerPrimaryAction(hasModel, !!imageCapability?.ready);
+  const canSubmit =
+    hasSession &&
+    !isStreaming &&
+    !imageJobActive &&
+    !imageSubmitting &&
+    (
+      primaryAction === "send_message"
+        ? !!input.trim() || !!image
+        : primaryAction === "generate_image"
+          ? !!input.trim() && !image
+          : false
+    );
   const sendDisabledReason = isStreaming
     ? "Generation is already running"
-    : !hasModel
-      ? "Load a model before sending"
-      : !hasSession
-        ? "Select a conversation before sending"
-        : !input.trim() && !image
-          ? "Enter a message or attach an image"
-          : undefined;
+    : imageJobActive
+      ? "Image generation is using the GPU"
+      : imageSubmitting
+        ? "Image generation is starting"
+        : !hasSession
+          ? "Select a conversation before sending"
+          : primaryAction === "unavailable"
+            ? "Set up image generation in Settings"
+            : primaryAction === "generate_image" && image
+              ? "Remove the attachment before generating an image"
+              : !input.trim() && !image
+                ? primaryAction === "generate_image"
+                  ? "Describe the image you want to generate"
+                  : "Enter a message or attach an image"
+                : undefined;
 
   const openCanvas = useCallback((html: string) => {
     setCanvasVersions((current) => {
@@ -247,11 +276,19 @@ export function ChatPanel({
       setImageProgressReceivedAt(Date.now());
     };
 
-    void getImageGenerationStatus()
-      .then((status) => receiveProgress(status.active_job))
-      .catch(() => {
-        // The browser-only Vite preview has no native image runtime.
-      });
+    const refreshCapability = () => {
+      void getImageGenerationStatus()
+        .then((status) => {
+          if (!mounted) return;
+          setImageCapability(status);
+          receiveProgress(status.active_job);
+        })
+        .catch(() => {
+          // The browser-only Vite preview has no native image runtime.
+        });
+    };
+    refreshCapability();
+    window.addEventListener("ib-image-settings-updated", refreshCapability);
     void listen<ImageGenerationProgress>("image-generation-progress", (event) => {
       receiveProgress(event.payload);
     }).then((unlisten) => {
@@ -262,8 +299,20 @@ export function ChatPanel({
     return () => {
       mounted = false;
       stopListening?.();
+      window.removeEventListener("ib-image-settings-updated", refreshCapability);
     };
   }, []);
+
+  useEffect(() => {
+    if (!imageControlsOpen) return undefined;
+    const closeOnOutsideClick = (event: MouseEvent) => {
+      if (!imageControlsRef.current?.contains(event.target as Node)) {
+        setImageControlsOpen(false);
+      }
+    };
+    window.addEventListener("mousedown", closeOnOutsideClick);
+    return () => window.removeEventListener("mousedown", closeOnOutsideClick);
+  }, [imageControlsOpen]);
 
   useEffect(() => {
     if (!imageProgress || imageProgress.done) return undefined;
@@ -361,9 +410,79 @@ export function ChatPanel({
     if (file) attachImage(file);
   };
 
+  const openImageControls = async () => {
+    try {
+      const status = await getImageGenerationStatus();
+      setImageCapability(status);
+      if (!status.ready) {
+        setComposerError("Set up and enable Qwen image generation in Settings first.");
+        onOpenImageSettings();
+        return;
+      }
+      setComposerError(null);
+      setImageControlsOpen(true);
+    } catch (imageError) {
+      setComposerError(String(imageError));
+    }
+  };
+
+  const handleGenerateImage = (options: {
+    size: ImageSizePreset;
+    steps: number;
+    cfgScale: number;
+    sampler: string;
+    seed: number | null;
+    negativePrompt: string;
+  }) => {
+    const prompt = input.trim();
+    if (!prompt || !sessionId || imageSubmitting || imageJobActive) return;
+    setImageSubmitting(true);
+    setImageControlsOpen(false);
+    setComposerError(null);
+    setInput("");
+    void generateImage({
+      prompt,
+      session_id: sessionId,
+      profile_id: "quality",
+      width: options.size.width,
+      height: options.size.height,
+      steps: options.steps,
+      cfg_scale: options.cfgScale,
+      sampling_method: options.sampler,
+      seed: options.seed,
+      negative_prompt: options.negativePrompt || null,
+    }).then(
+      (result) => {
+        if (result.error) setComposerError(result.error);
+      },
+      (imageError) => {
+        setInput(prompt);
+        setComposerError(String(imageError));
+      },
+    ).finally(() => setImageSubmitting(false));
+  };
+
   const handleSubmit = () => {
     const trimmed = input.trim();
-    if ((!trimmed && !image) || !hasModel || !hasSession || isStreaming) return;
+    if (!hasSession || isStreaming || imageJobActive || imageSubmitting) return;
+
+    if (primaryAction === "generate_image") {
+      const defaultSize =
+        imageCapability?.size_presets.find((preset) => preset.id === "recommended_square") ??
+        imageCapability?.size_presets[0];
+      if (!trimmed || image || !defaultSize) return;
+      handleGenerateImage({
+        size: defaultSize,
+        steps: 50,
+        cfgScale: 2.5,
+        sampler: "euler",
+        seed: null,
+        negativePrompt: "",
+      });
+      return;
+    }
+
+    if (primaryAction !== "send_message" || (!trimmed && !image)) return;
     if (image && !loadedModelSupportsVision) {
       setComposerError(
         loadedModelVisionStatusText ??
@@ -451,7 +570,7 @@ export function ChatPanel({
             }
           }}
         >
-          {!hasModel ? (
+          {!hasModel && !(hasSession && imageCapability?.ready) ? (
           <ChatEmptyState
             icon={<Box size={22} />}
             title="Load a model to begin"
@@ -523,7 +642,7 @@ export function ChatPanel({
         )}
       </div>
 
-      {hasModel && hasSession && (
+      {hasSession && (hasModel || imageCapability?.ready) && (
         <div className="shrink-0 px-3 pb-3 pt-2 sm:px-6 sm:pb-4">
           <div className="mx-auto w-full max-w-[var(--content-max)]">
             {(error || composerError) && (
@@ -605,7 +724,7 @@ export function ChatPanel({
                   }
                 }}
                 onPaste={handlePaste}
-                placeholder="Message InferenceBridge"
+                placeholder={hasModel ? "Message InferenceBridge" : "Describe the image you want to generate"}
                 rows={1}
                 className="ib-chat-input block max-h-[200px] min-h-[46px] w-full resize-none overflow-y-auto bg-transparent px-4 pb-2 pt-3.5 text-[15px] leading-6 text-[var(--text-0)] outline-none placeholder:text-[var(--text-3)]"
               />
@@ -618,16 +737,39 @@ export function ChatPanel({
                     accept="image/*"
                     className="hidden"
                     onChange={handleImageChange}
-                    disabled={isStreaming}
+                    disabled={isStreaming || !hasModel}
                   />
                   <IconButton
                     label="Attach image"
                     size="md"
                     onClick={() => fileInputRef.current?.click()}
-                    disabled={isStreaming}
+                    disabled={isStreaming || !hasModel}
                   >
                     <Paperclip size={18} />
                   </IconButton>
+
+                  <div className="relative" ref={imageControlsRef}>
+                    <IconButton
+                      label={imageCapability?.ready ? "Generate image" : "Set up image generation"}
+                      size="md"
+                      selected={imageControlsOpen}
+                      onClick={() => { void openImageControls(); }}
+                      disabled={isStreaming || imageJobActive || imageSubmitting || !input.trim()}
+                    >
+                      <ImageIcon size={18} />
+                    </IconButton>
+                    {imageControlsOpen && imageCapability?.ready && (
+                      <ImageGenerationControls
+                        presets={imageCapability.size_presets}
+                        busy={imageSubmitting || imageJobActive}
+                        requiresManualUnload={
+                          hasModel && !imageCapability.automatic_model_swap_enabled
+                        }
+                        onGenerate={handleGenerateImage}
+                        onClose={() => setImageControlsOpen(false)}
+                      />
+                    )}
+                  </div>
 
                   <div className="relative" ref={controlsRef}>
                     <IconButton
@@ -635,6 +777,7 @@ export function ChatPanel({
                       size="md"
                       selected={controlsOpen || hasCustomSampling || showThinking}
                       onClick={() => setControlsOpen((value) => !value)}
+                      disabled={!hasModel}
                     >
                       <SlidersHorizontal size={17} />
                     </IconButton>
@@ -679,12 +822,23 @@ export function ChatPanel({
                   <button
                     type="button"
                     onClick={handleSubmit}
-                    disabled={!canSend}
-                    aria-label="Send message"
-                    title={sendDisabledReason ?? "Send message"}
+                    disabled={!canSubmit}
+                    aria-label={
+                      primaryAction === "generate_image"
+                        ? "Generate image with quality defaults"
+                        : "Send message"
+                    }
+                    title={
+                      sendDisabledReason ??
+                      (primaryAction === "generate_image"
+                        ? "Generate image with Q6 quality defaults"
+                        : "Send message")
+                    }
                     className="flex h-8 w-8 items-center justify-center rounded-full bg-white text-black transition hover:bg-neutral-200 disabled:bg-[#676767] disabled:text-[#303030]"
                   >
-                    <ArrowUp size={17} strokeWidth={2.5} />
+                    {primaryAction === "generate_image"
+                      ? <ImageIcon size={16} />
+                      : <ArrowUp size={17} strokeWidth={2.5} />}
                   </button>
                 )}
               </div>
@@ -731,6 +885,187 @@ function ChatEmptyState({
   );
 }
 
+function ImageGenerationControls({
+  presets,
+  busy,
+  requiresManualUnload,
+  onGenerate,
+  onClose,
+}: {
+  presets: ImageSizePreset[];
+  busy: boolean;
+  requiresManualUnload: boolean;
+  onGenerate: (options: {
+    size: ImageSizePreset;
+    steps: number;
+    cfgScale: number;
+    sampler: string;
+    seed: number | null;
+    negativePrompt: string;
+  }) => void;
+  onClose: () => void;
+}) {
+  const defaultPreset =
+    presets.find((preset) => preset.id === "recommended_square") ?? presets[0];
+  const [sizeId, setSizeId] = useState(defaultPreset?.id ?? "");
+  const [steps, setSteps] = useState(50);
+  const [advanced, setAdvanced] = useState(false);
+  const [randomSeed, setRandomSeed] = useState(true);
+  const [seed, setSeed] = useState("42");
+  const [cfgScale, setCfgScale] = useState(2.5);
+  const [sampler, setSampler] = useState("euler");
+  const [negativePrompt, setNegativePrompt] = useState("");
+  const selected = presets.find((preset) => preset.id === sizeId) ?? defaultPreset;
+  if (!selected) return null;
+
+  return (
+    <div className="absolute bottom-full left-0 z-50 mb-3 w-[480px] max-w-[calc(100vw-32px)] rounded-2xl border border-white/10 bg-[#292929] p-4 shadow-[0_18px_56px_rgba(0,0,0,0.5)]">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <div className="text-sm font-semibold text-[var(--text-0)]">Generate a high-quality image</div>
+          <div className="mt-1 text-[11px] leading-4 text-[var(--text-2)]">
+            {requiresManualUnload
+              ? "Automatic swapping is safety-locked. Unload the chat model first; this composer stays available for image generation."
+              : "IB will render with Qwen-Image and keep the result attached to this chat."}
+          </div>
+        </div>
+        <IconButton label="Close image options" size="sm" onClick={onClose}>
+          <X size={14} />
+        </IconButton>
+      </div>
+
+      <label className="mt-4 block">
+        <span className="mb-1.5 block text-[11px] font-medium text-[var(--text-1)]">Size and shape</span>
+        <select
+          value={sizeId}
+          onChange={(event) => setSizeId(event.target.value)}
+          className="h-10 w-full rounded-xl border border-white/10 bg-black/15 px-3 text-sm text-white outline-none focus:border-white/25"
+        >
+          {presets.map((preset) => (
+            <option key={preset.id} value={preset.id}>
+              {preset.name} · {preset.aspect_ratio} · {preset.width}×{preset.height}
+            </option>
+          ))}
+        </select>
+      </label>
+      <div className={`mt-2 rounded-lg px-3 py-2 text-[11px] leading-4 ${
+        selected.tier === "max"
+          ? "bg-amber-400/8 text-amber-200"
+          : "bg-black/10 text-[var(--text-2)]"
+      }`}>
+        {selected.note}
+      </div>
+
+      <div className="mt-3 grid grid-cols-2 gap-3">
+        <label>
+          <span className="mb-1.5 block text-[11px] font-medium text-[var(--text-1)]">Quality steps</span>
+          <select
+            value={steps}
+            onChange={(event) => setSteps(Number(event.target.value))}
+            className="h-9 w-full rounded-lg border border-white/10 bg-black/15 px-2 text-xs text-white outline-none"
+          >
+            <option value={30}>30 · Faster</option>
+            <option value={40}>40 · Balanced</option>
+            <option value={50}>50 · Quality (recommended)</option>
+            <option value={60}>60 · Extra refinement</option>
+          </select>
+        </label>
+        <label>
+          <span className="mb-1.5 block text-[11px] font-medium text-[var(--text-1)]">Seed</span>
+          <div className="flex h-9 items-center gap-2 rounded-lg border border-white/10 bg-black/15 px-2">
+            <input
+              type="checkbox"
+              checked={randomSeed}
+              onChange={(event) => setRandomSeed(event.target.checked)}
+              className="accent-violet-400"
+            />
+            {randomSeed ? (
+              <span className="text-xs text-[var(--text-2)]">Random</span>
+            ) : (
+              <input
+                type="number"
+                value={seed}
+                onChange={(event) => setSeed(event.target.value)}
+                className="min-w-0 flex-1 bg-transparent text-xs text-white outline-none"
+              />
+            )}
+          </div>
+        </label>
+      </div>
+
+      <button
+        type="button"
+        onClick={() => setAdvanced((value) => !value)}
+        className="mt-3 text-[11px] font-medium text-[var(--text-2)] hover:text-white"
+      >
+        {advanced ? "Hide advanced options" : "Show advanced options"}
+      </button>
+      {advanced && (
+        <div className="mt-2 rounded-xl border border-white/8 bg-black/10 p-3">
+          <div className="grid grid-cols-2 gap-3">
+            <label>
+              <span className="mb-1 block text-[10px] text-[var(--text-2)]">CFG scale</span>
+              <input
+                type="number"
+                min={0}
+                max={20}
+                step={0.1}
+                value={cfgScale}
+                onChange={(event) => setCfgScale(Number(event.target.value))}
+                className="h-8 w-full rounded-lg border border-white/10 bg-black/15 px-2 text-xs text-white outline-none"
+              />
+            </label>
+            <label>
+              <span className="mb-1 block text-[10px] text-[var(--text-2)]">Sampler</span>
+              <select
+                value={sampler}
+                onChange={(event) => setSampler(event.target.value)}
+                className="h-8 w-full rounded-lg border border-white/10 bg-black/15 px-2 text-xs text-white outline-none"
+              >
+                <option value="euler">Euler (tested)</option>
+                <option value="euler_a">Euler A</option>
+                <option value="heun">Heun</option>
+                <option value="dpm2">DPM2</option>
+                <option value="dpm++2m">DPM++ 2M</option>
+              </select>
+            </label>
+          </div>
+          <label className="mt-3 block">
+            <span className="mb-1 block text-[10px] text-[var(--text-2)]">Negative prompt</span>
+            <textarea
+              value={negativePrompt}
+              onChange={(event) => setNegativePrompt(event.target.value)}
+              rows={2}
+              placeholder="Optional things to avoid, e.g. blurry, distorted text, extra fingers"
+              className="w-full resize-none rounded-lg border border-white/10 bg-black/15 px-2 py-1.5 text-xs text-white outline-none placeholder:text-[var(--text-3)]"
+            />
+          </label>
+        </div>
+      )}
+
+      <div className="mt-4 flex items-center justify-between gap-3">
+        <div className="text-[10px] text-[var(--text-3)]">
+          Progress, elapsed time and ETA will appear in chat.
+        </div>
+        <Button
+          variant="primary"
+          disabled={busy || requiresManualUnload || (!randomSeed && !seed.trim())}
+          onClick={() => onGenerate({
+            size: selected,
+            steps,
+            cfgScale,
+            sampler,
+            seed: randomSeed ? null : Number(seed),
+            negativePrompt,
+          })}
+        >
+          {busy ? "Starting..." : requiresManualUnload ? "Unload model first" : "Generate image"}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function ImageGenerationProgressCard({
   progress,
   receivedAt,
@@ -753,6 +1088,13 @@ function ImageGenerationProgressCard({
     : cancelled
       ? "Generation cancelled"
       : progress.message;
+  const title = failed
+    ? "Image generation failed"
+    : cancelled
+      ? "Image cancelled"
+      : progress.done
+        ? "Image ready"
+        : "Generating image";
 
   return (
     <div
@@ -771,7 +1113,7 @@ function ImageGenerationProgressCard({
           <div className="flex flex-wrap items-center justify-between gap-2">
             <div>
               <div className="text-sm font-semibold text-[var(--text-0)]">
-                {progress.done && !failed && !cancelled ? "Image ready" : "Generating image"}
+                {title}
               </div>
               <div className={`mt-0.5 text-xs ${failed ? "text-rose-200" : "text-[var(--text-2)]"}`}>
                 {statusText}

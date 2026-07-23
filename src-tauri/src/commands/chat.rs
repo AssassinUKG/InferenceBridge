@@ -265,6 +265,8 @@ mod tests {
             display_content: None,
             reasoning_content: None,
             image_base64: image_base64.map(str::to_string),
+            image_path: None,
+            image_metadata: None,
             token_count: Some(0),
             tokens_evaluated: None,
             tokens_predicted: None,
@@ -553,6 +555,18 @@ pub async fn send_message(
     show_thinking: Option<bool>,
 ) -> Result<String, String> {
     tracing::info!(session = %session_id, content_len = content.len(), "send_message called");
+    {
+        let app_state = state.read().await;
+        if app_state
+            .image_generation_exclusive
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(
+                "Image generation is using the GPU. Chat will resume automatically after the model is restored."
+                    .to_string(),
+            );
+        }
+    }
 
     let normalized_inline_image = image_base64
         .as_deref()
@@ -634,6 +648,8 @@ pub async fn send_message(
         display_content: None,
         reasoning_content: None,
         image_base64: image_base64.clone(),
+        image_path: None,
+        image_metadata: None,
         token_count: Some(0),
         tokens_evaluated: None,
         tokens_predicted: None,

@@ -2,10 +2,18 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  composerPrimaryAction,
   conversationMarkdown,
   isNearScrollBottom,
   safeConversationFilename,
 } from "../src/lib/conversationUi.ts";
+
+test("uses the primary composer action for image generation without a chat model", () => {
+  assert.equal(composerPrimaryAction(true, true), "send_message");
+  assert.equal(composerPrimaryAction(true, false), "send_message");
+  assert.equal(composerPrimaryAction(false, true), "generate_image");
+  assert.equal(composerPrimaryAction(false, false), "unavailable");
+});
 
 test("only follows streaming output while the reader is near the bottom", () => {
   assert.equal(isNearScrollBottom(2_000, 1_300, 600), false);

@@ -1258,6 +1258,13 @@ pub(crate) async fn resolve_loaded_model(
     let has_overrides = has_runtime_load_overrides(&requested_overrides);
     let (target_model, needs_swap, context_size) = {
         let s = state.read().await;
+        if s.image_generation_exclusive
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ApiErrorResponse::service_unavailable(
+                "Image generation is using the managed GPU runtime; chat will resume after model restoration.",
+            ));
+        }
         let runtime_running = matches!(s.process.state(), ProcessState::Running);
         let current_context_size = s.model_stats.as_ref().map(|stats| stats.context_size);
         let target_model = if requested_model.trim().is_empty() {

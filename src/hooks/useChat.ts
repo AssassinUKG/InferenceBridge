@@ -62,6 +62,34 @@ export function useChat(sessionId: string | null) {
     };
   }, [sessionId]);
 
+  useEffect(() => {
+    if (!sessionId) return undefined;
+    let mounted = true;
+    let stopListening: (() => void) | undefined;
+    void listen<string>("session-messages-changed", (event) => {
+      if (!mounted || event.payload !== sessionId) return;
+      void api.getSessionMessages(sessionId).then(
+        (messages) => {
+          if (mounted) {
+            setState((current) => ({ ...current, messages, error: null }));
+          }
+        },
+        (error) => {
+          if (mounted) {
+            setState((current) => ({ ...current, error: String(error) }));
+          }
+        },
+      );
+    }).then((unlisten) => {
+      if (mounted) stopListening = unlisten;
+      else unlisten();
+    });
+    return () => {
+      mounted = false;
+      stopListening?.();
+    };
+  }, [sessionId]);
+
   const flushStreamingBuffers = useCallback(() => {
     flushFrameRef.current = null;
     const text = pendingTextRef.current;

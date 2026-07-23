@@ -83,6 +83,9 @@ secrets.*
 # Icon build artifacts
 /ib-icon-source.png
 
+# Local image-generation outputs
+/image-gen-lab/ib-generated-images/
+
 # Internal dev notes not needed for public repo
 /API_GUI_ISSUES.md
 /IMPROVEMENTS_CHECKLIST.md

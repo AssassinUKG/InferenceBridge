@@ -54,6 +54,9 @@ pub struct ModelsConfig {
 pub struct ImageGenerationConfig {
     /// Capability truth stays false unless this is enabled and validation passes.
     pub enabled: bool,
+    /// Safety gate for the chat unload -> image job -> exact chat restore cycle.
+    /// Keep false until the recovery acceptance suite is certified on the host.
+    pub automatic_model_swap_enabled: bool,
     /// Absolute path to the pinned stable-diffusion.cpp `sd-cli` executable.
     pub runner_path: String,
     /// Absolute output directory. Empty uses the app support `images` directory.
@@ -281,6 +284,7 @@ impl Default for ImageGenerationConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            automatic_model_swap_enabled: false,
             runner_path: String::new(),
             output_dir: String::new(),
             default_bundle: "qwen-image-2512-q6".to_string(),

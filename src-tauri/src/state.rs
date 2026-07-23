@@ -142,6 +142,7 @@ pub struct AppState {
     pub last_parse_trace: Option<String>,
     pub last_launch_preview: Option<LaunchPreview>,
     pub last_known_good_config: Option<LaunchPreview>,
+    pub last_model_restore: Option<crate::commands::model::ModelRestoreSnapshot>,
     pub last_context_status: Option<ContextStatus>,
     pub last_generation_metrics: Option<RuntimePerformanceMetrics>,
     pub live_stream: Option<LiveStreamSnapshot>,
@@ -162,6 +163,7 @@ pub struct AppState {
     pub image_generation_progress: Option<ImageGenerationProgress>,
     pub image_generation_cancel: CancellationToken,
     pub image_generation_mutex: Arc<AsyncMutex<()>>,
+    pub image_generation_exclusive: Arc<AtomicBool>,
     pub cumulative_metrics: CumulativeMetrics,
 }
 
@@ -207,6 +209,7 @@ impl AppState {
             last_parse_trace: None,
             last_launch_preview: None,
             last_known_good_config: None,
+            last_model_restore: None,
             last_context_status: None,
             last_generation_metrics: None,
             live_stream: None,
@@ -227,6 +230,7 @@ impl AppState {
             image_generation_progress: None,
             image_generation_cancel: CancellationToken::new(),
             image_generation_mutex: Arc::new(AsyncMutex::new(())),
+            image_generation_exclusive: Arc::new(AtomicBool::new(false)),
             cumulative_metrics: CumulativeMetrics::default(),
         })
     }

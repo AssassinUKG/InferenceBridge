@@ -1406,6 +1406,10 @@ function App() {
               creatingSession={session.isCreating}
               onCreateSession={() => { void handleNewSession(); }}
               onOpenModelPicker={openModelPicker}
+              onOpenImageSettings={() => {
+                setActiveTab("settings");
+                window.dispatchEvent(new Event("ib-open-image-settings"));
+              }}
             />
           </div>
 

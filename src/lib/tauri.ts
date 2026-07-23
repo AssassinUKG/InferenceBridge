@@ -6,6 +6,7 @@ import type {
   ApiAccessInfo,
   ContextStatus,
   DebugApiResponse,
+  DetectedImageLabSetup,
   EffectiveProfileInfo,
   GpuStats,
   HubAccessStatus,
@@ -51,6 +52,9 @@ function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> 
 export const getImageGenerationStatus = () =>
   invoke<ImageGenerationCapabilityStatus>("get_image_generation_status");
 
+export const detectImageLabSetup = () =>
+  invoke<DetectedImageLabSetup>("detect_image_lab_setup");
+
 export const previewImageGeneration = (request: ImageGenerationRequest) =>
   invoke<ImageGenerationPreview>("preview_image_generation", { request });
 
@@ -59,6 +63,9 @@ export const generateImage = (request: ImageGenerationRequest) =>
 
 export const cancelImageGeneration = () =>
   invoke<void>("cancel_image_generation");
+
+export const readGeneratedImageDataUrl = (path: string) =>
+  invoke<string>("read_generated_image_data_url", { path });
 
 // Models
 

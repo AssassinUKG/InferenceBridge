@@ -702,6 +702,7 @@ async fn mark_model_reused_loaded(
     state: &SharedState,
     model_filename: &str,
     launch_preview: LaunchPreview,
+    restore_snapshot: ModelRestoreSnapshot,
 ) {
     let payload = crate::state::LoadProgress {
         stage: "loaded".to_string(),
@@ -714,6 +715,7 @@ async fn mark_model_reused_loaded(
         let mut s = state.write().await;
         s.loaded_model = Some(model_filename.to_string());
         s.last_launch_preview = Some(launch_preview);
+        s.last_model_restore = Some(restore_snapshot);
         s.model_load_state = crate::state::ModelLoadState::Loaded;
         s.model_load_progress = Some(payload.clone());
         s.app_handle.clone()
@@ -856,6 +858,66 @@ pub struct RuntimeLoadOverrides {
     pub extra_args: Option<Vec<String>>,
     pub attach_mmproj: Option<bool>,
     pub force_reload: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelRestoreSnapshot {
+    pub model_name: String,
+    pub context_size: Option<u32>,
+    pub overrides: RuntimeLoadOverrides,
+}
+
+impl ModelRestoreSnapshot {
+    fn from_launch_config(model_name: String, config: &LaunchConfig) -> Self {
+        Self {
+            model_name,
+            context_size: config.context_size,
+            overrides: RuntimeLoadOverrides {
+                gpu_layers: Some(config.gpu_layers),
+                threads: Some(config.threads),
+                threads_batch: Some(config.threads_batch),
+                batch_size: Some(config.batch_size),
+                ubatch_size: Some(config.ubatch_size),
+                flash_attn: Some(config.flash_attn),
+                use_mmap: Some(config.use_mmap),
+                use_mlock: Some(config.use_mlock),
+                cont_batching: Some(config.cont_batching),
+                parallel_slots: Some(config.parallel_slots),
+                main_gpu: Some(config.main_gpu),
+                defrag_thold: Some(config.defrag_thold),
+                rope_freq_scale: Some(config.rope_freq_scale),
+                cache_type_k: Some(config.cache_type_k.clone()),
+                cache_type_v: Some(config.cache_type_v.clone()),
+                kv_unified: Some(config.kv_unified),
+                no_warmup: Some(config.no_warmup),
+                ctx_shift: Some(config.ctx_shift),
+                hf_repo: config.hf_repo.clone(),
+                hf_file: config.hf_file.clone(),
+                fit_mode: config.fit_mode.clone(),
+                cache_ram_mb: config.cache_ram_mb,
+                ctxcp: config.ctxcp,
+                use_jinja: Some(config.use_jinja),
+                reasoning_mode: config.reasoning_mode.clone(),
+                reasoning_preserve: Some(config.reasoning_preserve),
+                template_mode: Some(config.template_mode.clone()),
+                template_name: config.template_name.clone(),
+                custom_template_path: config
+                    .template_file
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string()),
+                chat_template_kwargs_json: config.chat_template_kwargs_json.clone(),
+                draft_model_path: Some(config.draft_model_path.clone()),
+                spec_type: Some(config.spec_type.clone()),
+                spec_draft_n_max: Some(config.spec_draft_n_max),
+                draft_max_tokens: Some(config.draft_max_tokens),
+                draft_min_tokens: Some(config.draft_min_tokens),
+                draft_p_min: Some(config.draft_p_min),
+                extra_args: Some(config.extra_args.clone()),
+                attach_mmproj: Some(config.attach_mmproj),
+                force_reload: true,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -1004,6 +1066,48 @@ pub async fn backend_load_model_with_overrides(
     context_size: Option<u32>,
     overrides: RuntimeLoadOverrides,
 ) -> Result<String, String> {
+    backend_load_model_with_overrides_internal(state, model_name, context_size, overrides, false)
+        .await
+}
+
+pub async fn backend_restore_model_snapshot(
+    state: SharedState,
+    snapshot: ModelRestoreSnapshot,
+) -> Result<String, String> {
+    backend_load_model_with_overrides_internal(
+        state,
+        snapshot.model_name,
+        snapshot.context_size,
+        snapshot.overrides,
+        true,
+    )
+    .await
+}
+
+async fn backend_load_model_with_overrides_internal(
+    state: SharedState,
+    model_name: String,
+    context_size: Option<u32>,
+    overrides: RuntimeLoadOverrides,
+    image_restore: bool,
+) -> Result<String, String> {
+    let load_mutex = {
+        let s = state.read().await;
+        s.model_load_mutex.clone()
+    };
+    let _load_guard = load_mutex.lock().await;
+    {
+        let s = state.read().await;
+        if s.image_generation_exclusive
+            .load(std::sync::atomic::Ordering::Acquire)
+            && !image_restore
+        {
+            return Err(
+                "The GPU is reserved for image generation and chat restoration".to_string(),
+            );
+        }
+    }
+
     // Cancel any active inference before starting a new load.
     {
         let mut s = state.write().await;
@@ -1020,12 +1124,6 @@ pub async fn backend_load_model_with_overrides(
         // Fresh cancellation token for this load.
         s.model_load_cancel = tokio_util::sync::CancellationToken::new();
     }
-
-    let load_mutex = {
-        let s = state.read().await;
-        s.model_load_mutex.clone()
-    };
-    let _load_guard = load_mutex.lock().await;
 
     let transition = {
         let s = state.read().await;
@@ -1055,6 +1153,7 @@ pub async fn backend_load_model_with_overrides(
         model_filename,
         my_generation,
         launch_preview,
+        restore_snapshot,
         reused_existing,
         forced_jinja_for_tool_profile,
     ) = {
@@ -1451,8 +1550,18 @@ pub async fn backend_load_model_with_overrides(
             None
         };
 
+        let restore_snapshot =
+            ModelRestoreSnapshot::from_launch_config(model.filename.clone(), &config);
         if let Some((loaded, preview)) = reuse_existing {
-            (config, loaded, s.loading_generation, preview, true, false)
+            (
+                config,
+                loaded,
+                s.loading_generation,
+                preview,
+                restore_snapshot,
+                true,
+                false,
+            )
         } else {
             // If ctx is None (no one specified), use 0 as placeholder; it will be
             // updated from /slots or /props after health check succeeds.
@@ -1480,6 +1589,7 @@ pub async fn backend_load_model_with_overrides(
                 model.filename.clone(),
                 gen,
                 preview,
+                restore_snapshot,
                 false,
                 forced_jinja_for_tool_profile,
             )
@@ -1487,7 +1597,13 @@ pub async fn backend_load_model_with_overrides(
     }; // write lock released
 
     if reused_existing {
-        mark_model_reused_loaded(&state, &model_filename, launch_preview.clone()).await;
+        mark_model_reused_loaded(
+            &state,
+            &model_filename,
+            launch_preview.clone(),
+            restore_snapshot,
+        )
+        .await;
         return Ok(model_filename);
     }
 
@@ -1752,6 +1868,7 @@ pub async fn backend_load_model_with_overrides(
             launch_preview.parallel_slots,
         ));
         s.last_known_good_config = Some(launch_preview);
+        s.last_model_restore = Some(restore_snapshot);
         s.last_startup_duration_ms = Some(start.elapsed().as_millis() as u64);
     }
 
@@ -1786,6 +1903,9 @@ pub async fn backend_load_model_with_overrides(
             // request would always trigger an unnecessary reload).
             if let Some(preview) = s.last_launch_preview.as_mut() {
                 preview.context_size = Some(real_ctx);
+            }
+            if let Some(snapshot) = s.last_model_restore.as_mut() {
+                snapshot.context_size = Some(real_ctx);
             }
             tracing::info!(
                 real_ctx,
