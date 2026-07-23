@@ -33,6 +33,7 @@ pub enum StreamEvent {
     RawDelta(String),
     Token(String),
     ReasoningDelta(String),
+    ToolCallDelta(String),
     Done {
         full_text: String,
         tokens_predicted: u32,
@@ -485,9 +486,279 @@ pub async fn consume_sse_stream_with_timeouts(
     Ok(full_text)
 }
 
+#[derive(Debug, Default)]
+struct NativeToolCallAccumulator {
+    id: Option<String>,
+    name: String,
+    arguments: String,
+}
+
+#[derive(Debug, Default)]
+struct NativeChatAccumulator {
+    content: String,
+    reasoning: String,
+    tool_calls: std::collections::BTreeMap<usize, NativeToolCallAccumulator>,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    decode_tokens_per_second: Option<f64>,
+    prompt_tokens_per_second: Option<f64>,
+    finish_reason: Option<String>,
+}
+
+fn merge_native_chat_chunk(
+    value: &serde_json::Value,
+    accumulator: &mut NativeChatAccumulator,
+) -> (Option<String>, Option<String>, Option<String>) {
+    let timings = value
+        .get("timings")
+        .or_else(|| value.pointer("/usage/timings"));
+    accumulator.decode_tokens_per_second = timings
+        .and_then(|value| value.get("predicted_per_second"))
+        .or_else(|| value.get("predicted_per_second"))
+        .and_then(serde_json::Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .or(accumulator.decode_tokens_per_second);
+    accumulator.prompt_tokens_per_second = timings
+        .and_then(|value| value.get("prompt_per_second"))
+        .or_else(|| value.get("prompt_per_second"))
+        .and_then(serde_json::Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .or(accumulator.prompt_tokens_per_second);
+
+    if let Some(usage) = value.get("usage") {
+        accumulator.prompt_tokens = usage
+            .get("prompt_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(accumulator.prompt_tokens);
+        accumulator.completion_tokens = usage
+            .get("completion_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(accumulator.completion_tokens);
+    }
+
+    let Some(choice) = value.get("choices").and_then(|choices| choices.get(0)) else {
+        return (None, None, None);
+    };
+    if let Some(reason) = choice
+        .get("finish_reason")
+        .and_then(serde_json::Value::as_str)
+    {
+        accumulator.finish_reason = Some(reason.to_string());
+    }
+    let Some(delta) = choice.get("delta").or_else(|| choice.get("message")) else {
+        return (None, None, None);
+    };
+
+    let content = delta
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if let Some(content) = content.as_deref() {
+        accumulator.content.push_str(content);
+    }
+    let reasoning = delta
+        .get("reasoning_content")
+        .or_else(|| delta.get("reasoning"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    if let Some(reasoning) = reasoning.as_deref() {
+        accumulator.reasoning.push_str(reasoning);
+    }
+
+    let tool_call_delta = delta
+        .get("tool_calls")
+        .filter(|value| value.as_array().is_some_and(|calls| !calls.is_empty()))
+        .map(serde_json::Value::to_string);
+    if let Some(tool_calls) = delta
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+    {
+        for (fallback_index, tool_call) in tool_calls.iter().enumerate() {
+            let index = tool_call
+                .get("index")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(fallback_index);
+            let entry = accumulator.tool_calls.entry(index).or_default();
+            if let Some(id) = tool_call.get("id").and_then(serde_json::Value::as_str) {
+                entry.id = Some(id.to_string());
+            }
+            let function = tool_call.get("function").unwrap_or(tool_call);
+            if let Some(name) = function.get("name").and_then(serde_json::Value::as_str) {
+                entry.name.push_str(name);
+            }
+            if let Some(arguments) = function
+                .get("arguments")
+                .and_then(serde_json::Value::as_str)
+            {
+                entry.arguments.push_str(arguments);
+            }
+        }
+    }
+
+    (content, reasoning, tool_call_delta)
+}
+
+fn native_decode_rate(
+    accumulator: &NativeChatAccumulator,
+    first_output_at: Option<&std::time::Instant>,
+    stream_started: &std::time::Instant,
+) -> f64 {
+    if let Some(rate) = accumulator.decode_tokens_per_second {
+        return rate;
+    }
+    if accumulator.completion_tokens == 0 {
+        return 0.0;
+    }
+    let elapsed = first_output_at
+        .map(std::time::Instant::elapsed)
+        .unwrap_or_else(|| stream_started.elapsed())
+        .as_secs_f64();
+    if elapsed > 0.0 {
+        accumulator.completion_tokens as f64 / elapsed
+    } else {
+        0.0
+    }
+}
+
+fn native_chat_full_text(accumulator: &NativeChatAccumulator) -> String {
+    let mut full_text = String::new();
+    if !accumulator.reasoning.is_empty() {
+        full_text.push_str("<think>");
+        full_text.push_str(&accumulator.reasoning);
+        full_text.push_str("</think>\n");
+    }
+    full_text.push_str(&accumulator.content);
+    for tool_call in accumulator.tool_calls.values() {
+        let arguments = serde_json::from_str::<serde_json::Value>(&tool_call.arguments)
+            .unwrap_or_else(|_| serde_json::Value::String(tool_call.arguments.clone()));
+        let value = serde_json::json!({
+            "id": tool_call.id,
+            "name": tool_call.name,
+            "arguments": arguments,
+        });
+        full_text.push_str("<tool_call>");
+        full_text.push_str(&value.to_string());
+        full_text.push_str("</tool_call>");
+    }
+    full_text
+}
+
+/// Consume llama-server's native OpenAI chat SSE shape and expose the same
+/// normalized events as the legacy `/completion` decoder. This keeps GUI,
+/// Responses, and Messages streaming adapters independent of the transport.
+pub async fn consume_chat_sse_stream(
+    response: reqwest::Response,
+    tx: mpsc::Sender<StreamEvent>,
+    cancel: CancellationToken,
+) -> anyhow::Result<String> {
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut accumulator = NativeChatAccumulator::default();
+    let stream_started = std::time::Instant::now();
+    let mut first_output_at = None;
+
+    loop {
+        if tx.is_closed() {
+            cancel.cancel();
+            return Ok(native_chat_full_text(&accumulator));
+        }
+        if cancel.is_cancelled() {
+            break;
+        }
+        let Some(chunk) = stream.next().await else {
+            break;
+        };
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                let _ = tx.send(StreamEvent::Error(error.to_string())).await;
+                return Err(error.into());
+            }
+        };
+        let raw = String::from_utf8_lossy(&chunk);
+        let _ = tx.send(StreamEvent::RawDelta(raw.to_string())).await;
+        buffer.push_str(&raw);
+
+        while let Some(line_end) = buffer.find('\n') {
+            let line = buffer[..line_end].trim().to_string();
+            buffer.drain(..line_end + 1);
+            let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                continue;
+            };
+            if data.is_empty() {
+                continue;
+            }
+            if data == "[DONE]" {
+                let full_text = native_chat_full_text(&accumulator);
+                let decode_tokens_per_second =
+                    native_decode_rate(&accumulator, first_output_at.as_ref(), &stream_started);
+                let _ = tx
+                    .send(StreamEvent::Done {
+                        full_text: full_text.clone(),
+                        tokens_predicted: accumulator.completion_tokens,
+                        tokens_evaluated: accumulator.prompt_tokens,
+                        decode_tokens_per_second,
+                        prompt_tokens_per_second: accumulator.prompt_tokens_per_second,
+                        stopped_limit: Some(accumulator.finish_reason.as_deref() == Some("length")),
+                        stop_type: accumulator.finish_reason.clone(),
+                    })
+                    .await;
+                return Ok(full_text);
+            }
+            match serde_json::from_str::<serde_json::Value>(data) {
+                Ok(value) => {
+                    let (content, reasoning, tool_call_delta) =
+                        merge_native_chat_chunk(&value, &mut accumulator);
+                    if first_output_at.is_none()
+                        && (content.is_some() || reasoning.is_some() || tool_call_delta.is_some())
+                    {
+                        first_output_at = Some(std::time::Instant::now());
+                    }
+                    if let Some(content) = content {
+                        let _ = tx.send(StreamEvent::Token(content)).await;
+                    }
+                    if let Some(reasoning) = reasoning {
+                        let _ = tx.send(StreamEvent::ReasoningDelta(reasoning)).await;
+                    }
+                    if let Some(tool_call_delta) = tool_call_delta {
+                        let _ = tx.send(StreamEvent::ToolCallDelta(tool_call_delta)).await;
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(data, error = %error, "Failed to parse native chat SSE data");
+                }
+            }
+        }
+    }
+
+    let full_text = native_chat_full_text(&accumulator);
+    let decode_tokens_per_second =
+        native_decode_rate(&accumulator, first_output_at.as_ref(), &stream_started);
+    let _ = tx
+        .send(StreamEvent::Done {
+            full_text: full_text.clone(),
+            tokens_predicted: accumulator.completion_tokens,
+            tokens_evaluated: accumulator.prompt_tokens,
+            decode_tokens_per_second,
+            prompt_tokens_per_second: accumulator.prompt_tokens_per_second,
+            stopped_limit: Some(accumulator.finish_reason.as_deref() == Some("length")),
+            stop_type: accumulator.finish_reason,
+        })
+        .await;
+    Ok(full_text)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{emit_parsed_content, longest_partial_suffix, StreamEvent};
+    use super::{
+        emit_parsed_content, longest_partial_suffix, merge_native_chat_chunk,
+        native_chat_full_text, native_decode_rate, NativeChatAccumulator, StreamEvent,
+    };
     use tokio::sync::mpsc;
 
     #[test]
@@ -498,6 +769,95 @@ mod tests {
     #[test]
     fn longest_partial_suffix_keeps_partial_tag_after_unicode_prefix() {
         assert_eq!(longest_partial_suffix("\u{e9}<thi", &["<think>"]), 4);
+    }
+
+    #[test]
+    fn native_chat_accumulates_two_tool_calls_without_empty_think_tags() {
+        let mut accumulator = NativeChatAccumulator::default();
+        merge_native_chat_chunk(
+            &serde_json::json!({
+                "choices": [{
+                    "delta": {
+                        "reasoning_content": "",
+                        "tool_calls": [
+                            {"index": 0, "id": "call_weather", "function": {"name": "weather", "arguments": "{\"city\":"}},
+                            {"index": 1, "id": "call_time", "function": {"name": "clock", "arguments": "{\"zone\":"}}
+                        ]
+                    }
+                }]
+            }),
+            &mut accumulator,
+        );
+        merge_native_chat_chunk(
+            &serde_json::json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [
+                            {"index": 0, "function": {"arguments": "\"London\"}"}},
+                            {"index": 1, "function": {"arguments": "\"Europe/London\"}"}}
+                        ]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {"prompt_tokens": 21, "completion_tokens": 9},
+                "timings": {"predicted_per_second": 42.5, "prompt_per_second": 812.0}
+            }),
+            &mut accumulator,
+        );
+
+        let text = native_chat_full_text(&accumulator);
+        assert!(!text.contains("<think>"));
+        assert!(text.contains("\"name\":\"weather\""));
+        assert!(text.contains("\"city\":\"London\""));
+        assert!(text.contains("\"name\":\"clock\""));
+        assert!(text.contains("\"zone\":\"Europe/London\""));
+        assert_eq!(accumulator.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(accumulator.prompt_tokens, 21);
+        assert_eq!(accumulator.completion_tokens, 9);
+        assert_eq!(accumulator.decode_tokens_per_second, Some(42.5));
+        assert_eq!(accumulator.prompt_tokens_per_second, Some(812.0));
+    }
+
+    #[test]
+    fn native_chat_reads_llama_timing_only_usage_chunk() {
+        let mut accumulator = NativeChatAccumulator::default();
+        let result = merge_native_chat_chunk(
+            &serde_json::json!({
+                "choices": [],
+                "usage": {
+                    "completion_tokens": 162,
+                    "prompt_tokens": 3014,
+                    "total_tokens": 3176
+                },
+                "timings": {
+                    "prompt_per_second": 250.5,
+                    "predicted_per_second": 36.75
+                }
+            }),
+            &mut accumulator,
+        );
+
+        assert_eq!(result, (None, None, None));
+        assert_eq!(accumulator.prompt_tokens, 3014);
+        assert_eq!(accumulator.completion_tokens, 162);
+        assert_eq!(accumulator.prompt_tokens_per_second, Some(250.5));
+        assert_eq!(accumulator.decode_tokens_per_second, Some(36.75));
+    }
+
+    #[test]
+    fn native_chat_measures_a_nonzero_rate_when_timings_are_missing() {
+        let accumulator = NativeChatAccumulator {
+            completion_tokens: 10,
+            ..NativeChatAccumulator::default()
+        };
+        let first_output_at = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        let stream_started = first_output_at;
+
+        let rate = native_decode_rate(&accumulator, Some(&first_output_at), &stream_started);
+        assert!(
+            rate > 4.0 && rate <= 5.0,
+            "unexpected measured rate: {rate}"
+        );
     }
 
     #[tokio::test]

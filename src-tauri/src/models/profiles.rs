@@ -85,10 +85,13 @@ impl ModelProfile {
     pub fn detect_with_arch(model_name: &str, architecture: Option<&str>) -> Self {
         let mut profile = Self::detect_by_name(model_name);
 
-        // If the filename told us nothing, try to recover the family from the
-        // embedded architecture identifier.
-        if profile.family == ModelFamily::Generic {
-            if let Some(arch_profile) = architecture.and_then(Self::detect_by_architecture) {
+        if let Some(arch_profile) = architecture.and_then(Self::detect_by_architecture) {
+            let architecture_is_qwen3_5 = arch_profile.family == ModelFamily::Qwen3_5;
+
+            // Normally architecture is a fallback. qwen35/qwen3_5 is the one
+            // case where it is more precise than common filenames such as
+            // `Qwen3.6-*` (which name detection otherwise groups as Qwen3).
+            if profile.family == ModelFamily::Generic || architecture_is_qwen3_5 {
                 let preserved_vision = profile.supports_vision;
                 profile = arch_profile;
                 profile.supports_vision = profile.supports_vision || preserved_vision;
@@ -102,7 +105,10 @@ impl ModelProfile {
     /// only maps to coarse families (the filename handles finer variants).
     fn detect_by_architecture(architecture: &str) -> Option<Self> {
         let arch = architecture.to_lowercase();
-        let profile = if arch.starts_with("qwen3") {
+        let normalized = arch.replace(['-', '.'], "_");
+        let profile = if matches!(normalized.as_str(), "qwen35" | "qwen3_5") {
+            Self::qwen3_5()
+        } else if arch.starts_with("qwen3") {
             Self::qwen3(&arch)
         } else if arch.starts_with("qwen2") || arch.starts_with("qwen") {
             Self::qwen2_5()
@@ -126,7 +132,12 @@ impl ModelProfile {
         let lower = model_name.to_lowercase();
         let supports_vision = Self::infer_vision_support(&lower);
 
-        let mut profile = if lower.contains("qwen3.5") {
+        let mut profile = if lower.contains("qwen3.5")
+            || lower.contains("qwen3_5")
+            || lower.contains("qwen35")
+            || lower.contains("tess-4")
+            || lower.contains("tess_4")
+        {
             Self::qwen3_5()
         } else if lower.contains("qwen3") {
             Self::qwen3(&lower)
@@ -192,10 +203,10 @@ impl ModelProfile {
             || lower.contains("idefics")
             // Qwen2-VL and Qwen2.5-VL (also caught by -vl above, but explicit for clarity)
             || normalized.contains("qwen2-vl")
-            // Qwen3.5 35B-A3B multimodal variants are commonly published as plain GGUF
-            // filenames without an explicit `vision` or `-vl` marker.
+            // Qwen3.5 35B-A3B and every Qwen3.6 variant use unified multimodal
+            // architectures despite commonly omitting `vision` or `-vl` in GGUF names.
             || normalized.contains("qwen3.5-35b-a3b")
-            || normalized.contains("qwen3.6-35b-a3b")
+            || normalized.contains("qwen3.6")
             // DiffusionGemma is a multimodal diffusion model with image understanding support.
             || normalized.contains("diffusiongemma")
             || normalized.contains("diffusion-gemma")
@@ -208,19 +219,24 @@ impl ModelProfile {
             think_tag_style: ThinkTagStyle::Qwen,
             interleaved_think_tool: true,
             supports_parallel_tools: true,
-            supports_vision: false,
+            // qwen35 is the unified multimodal Qwen3.5/Qwen3.6 architecture.
+            // Runtime readiness still requires a matching mmproj sidecar.
+            supports_vision: true,
             default_max_output_tokens: Some(8192),
-            default_context_window: None, // let llama-server use model metadata
+            // 32K is the practical local default. The GGUF-advertised maximum
+            // remains available when the user explicitly requests a larger
+            // context.
+            default_context_window: Some(32768),
             max_context_window: Some(262144),
             parser_type: ParserType::QwenStateMachine,
             renderer_type: RendererType::QwenChat,
             stop_markers: vec!["</tool_call>".into(), "</function>".into()],
             allow_fallback_extraction: true,
-            default_presence_penalty: Some(1.3),
+            default_presence_penalty: Some(1.5),
             default_temperature: Some(0.7),
             default_top_p: Some(0.8),
             default_top_k: Some(20),
-            default_min_p: Some(0.05),
+            default_min_p: Some(0.0),
             disable_thinking_for_tools: true,
         }
     }
@@ -532,6 +548,43 @@ mod tests {
         assert_eq!(profile.family, ModelFamily::Qwen3_5);
         assert_eq!(profile.parser_type, ParserType::QwenStateMachine);
         assert!(profile.disable_thinking_for_tools);
+        assert_eq!(profile.default_context_window, Some(32768));
+        assert_eq!(profile.default_temperature, Some(0.7));
+        assert_eq!(profile.default_top_p, Some(0.8));
+        assert_eq!(profile.default_top_k, Some(20));
+        assert_eq!(profile.default_min_p, Some(0.0));
+        assert_eq!(profile.default_presence_penalty, Some(1.5));
+    }
+
+    #[test]
+    fn tess_4_filename_uses_qwen3_5_tool_profile() {
+        let profile = ModelProfile::detect("Tess-4-27B-Q4_K_M.gguf");
+        assert_eq!(profile.family, ModelFamily::Qwen3_5);
+        assert_eq!(profile.tool_call_format, ToolCallFormat::QwenXml);
+        assert_eq!(profile.parser_type, ParserType::QwenStateMachine);
+        assert_eq!(profile.renderer_type, RendererType::QwenChat);
+        assert!(profile.supports_vision);
+    }
+
+    #[test]
+    fn qwen35_architecture_is_authoritative_for_tess_and_qwen36_names() {
+        for name in ["Tess-4-27B-Q4_K_M.gguf", "Qwen3.6-27B-Q4_K_M.gguf"] {
+            let profile = ModelProfile::detect_with_arch(name, Some("qwen35"));
+            assert_eq!(profile.family, ModelFamily::Qwen3_5, "{name}");
+            assert_eq!(profile.tool_call_format, ToolCallFormat::QwenXml, "{name}");
+            assert_eq!(profile.parser_type, ParserType::QwenStateMachine, "{name}");
+        }
+    }
+
+    #[test]
+    fn qwen3_5_architecture_aliases_map_to_qwen3_5() {
+        for architecture in ["qwen35", "qwen3_5", "qwen3.5", "qwen3-5"] {
+            assert_eq!(
+                ModelProfile::detect_with_arch("renamed.gguf", Some(architecture)).family,
+                ModelFamily::Qwen3_5,
+                "{architecture}"
+            );
+        }
     }
 
     #[test]
@@ -589,6 +642,12 @@ mod tests {
         let profile = ModelProfile::detect(
             "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved.Q4_K_M.gguf",
         );
+        assert!(profile.supports_vision);
+    }
+
+    #[test]
+    fn detect_qwen3_6_27b_plain_gguf_as_vision_capable() {
+        let profile = ModelProfile::detect("Qwen3.6-27B-UD-IQ3_XXS.gguf");
         assert!(profile.supports_vision);
     }
 

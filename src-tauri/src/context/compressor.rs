@@ -101,15 +101,15 @@ pub async fn summarize_messages_with_model(
         }
     }
 
-    let (model_name, port) = {
+    let (profile, port) = {
         let s = state.read().await;
         let Some(model_name) = s.loaded_model.clone() else {
             return Ok(None);
         };
-        (model_name, s.process.port())
+        let profile = s.effective_profile_for_model(&model_name);
+        (profile, s.process.port())
     };
 
-    let profile = crate::models::overrides::detect_effective_profile(&model_name);
     let prompt_messages = summarization_prompt_messages(messages);
     let prompt = render_prompt(&prompt_messages, &profile);
 

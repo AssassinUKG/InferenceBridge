@@ -208,7 +208,11 @@ fn extract_hermes_calls(text: &mut String, calls: &mut Vec<ToolCall>) {
                     value.get("arguments"),
                 ) {
                     calls.push(ToolCall {
-                        id: uuid::Uuid::new_v4().to_string(),
+                        id: value
+                            .get("id")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
                         name: name.to_string(),
                         arguments: args.clone(),
                         raw_text: Some(text[start..after + end + "</tool_call>".len()].to_string()),
@@ -873,6 +877,7 @@ fn infer_bare_tool_call(value: serde_json::Value) -> Option<(String, serde_json:
         .get("name")
         .or_else(|| value.get("tool"))
         .or_else(|| value.get("tool_name"))
+        .or_else(|| value.get("action"))
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -882,6 +887,7 @@ fn infer_bare_tool_call(value: serde_json::Value) -> Option<(String, serde_json:
             .or_else(|| value.get("input"))
             .or_else(|| value.get("tool_argument"))
             .or_else(|| value.get("tool_arguments"))
+            .or_else(|| value.get("action_input"))
             .cloned()
             .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
         return Some((name.to_string(), arguments));
@@ -1283,5 +1289,23 @@ Done."#;
         let (calls, _) = extract_tool_calls_for_profile(text, &qwen_profile());
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "get_weather");
+    }
+
+    #[test]
+    fn extracts_action_style_tool_call_instead_of_showing_raw_json() {
+        let text = r#"{
+  "action": "dalle.text2im",
+  "action_input": {
+    "prompt": "A cinematic cyberpunk city"
+  },
+  "thought": "I will call the image tool."
+}."#;
+
+        let (calls, remaining) = extract_tool_calls_for_profile(text, &qwen_profile());
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "dalle.text2im");
+        assert_eq!(calls[0].arguments["prompt"], "A cinematic cyberpunk city");
+        assert_eq!(remaining, ".");
     }
 }

@@ -8,7 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test": "node tests/inferencebridge.test.cjs",
+    "test": "node --test tests/chatNames.test.mjs tests/chatPresentation.test.mjs tests/conversationUi.test.mjs tests/modelHubLayout.test.mjs tests/liveStreams.test.mjs tests/modelLoadProfiles.test.mjs tests/benchmarkData.test.mjs tests/benchmarkMatrix.test.mjs tests/downloads.test.mjs && node tests/inferencebridge.test.cjs",
     "test:api": "node tests/inferencebridge.test.cjs"
   },
   "devDependencies": {
@@ -26,9 +26,17 @@
     "vite": "^8.0.12"
   },
   "dependencies": {
+    "@tauri-apps/plugin-shell": "^2.3.5",
+    "dompurify": "^3.4.12",
+    "katex": "^0.17.0",
+    "lucide-react": "^1.24.0",
+    "mermaid": "^11.16.0",
     "react": "^19.2.6",
     "react-dom": "^19.2.6",
     "react-markdown": "^10.1.0",
-    "remark-gfm": "^4.0.1"
+    "rehype-highlight": "^7.0.2",
+    "rehype-katex": "^7.0.1",
+    "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0"
   }
 }

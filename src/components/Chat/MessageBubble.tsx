@@ -1,23 +1,21 @@
-import { useState } from "react";
-import type { MessageInfo } from "../../lib/types";
-import { MarkdownContent, CopyButton } from "./MarkdownContent";
+import type { MessageInfo, ToolCallInfo } from "../../lib/types";
+import { CopyButton, MarkdownContent } from "./MarkdownContent";
+import { ReasoningPanel } from "./ReasoningPanel";
+import { ToolActivityCard } from "./ToolActivityCard";
 
 interface Props {
   message: MessageInfo;
+  onOpenHtml?: (html: string) => void;
 }
 
-function parseThinkBlocks(content: string): Array<{ type: "think" | "text"; text: string }> {
+function splitLegacyReasoning(content: string) {
   const parts: Array<{ type: "think" | "text"; text: string }> = [];
   const orphanClose = ["</think>", "<|/think|>"]
     .map((tag) => ({ tag, index: content.indexOf(tag) }))
     .filter((item) => item.index >= 0)
     .sort((a, b) => a.index - b.index)[0];
 
-  if (
-    orphanClose &&
-    !content.includes("<think>") &&
-    !content.includes("<|think|>")
-  ) {
+  if (orphanClose && !content.includes("<think>") && !content.includes("<|think|>")) {
     const reasoning = content.slice(0, orphanClose.index).trim();
     const text = content.slice(orphanClose.index + orphanClose.tag.length);
     if (reasoning) parts.push({ type: "think", text: reasoning });
@@ -25,144 +23,108 @@ function parseThinkBlocks(content: string): Array<{ type: "think" | "text"; text
     return parts;
   }
 
-  const re = /<think>([\s\S]*?)<\/think>|<\|think\|>([\s\S]*?)<\|\/think\|>/g;
+  const expression = /<think>([\s\S]*?)<\/think>|<\|think\|>([\s\S]*?)<\|\/think\|>/g;
   let last = 0;
   let match: RegExpExecArray | null;
-  while ((match = re.exec(content)) !== null) {
-    if (match.index > last) {
-      parts.push({ type: "text", text: content.slice(last, match.index) });
-    }
+  while ((match = expression.exec(content)) !== null) {
+    if (match.index > last) parts.push({ type: "text", text: content.slice(last, match.index) });
     parts.push({ type: "think", text: (match[1] ?? match[2] ?? "").trim() });
     last = match.index + match[0].length;
   }
-  if (last < content.length) {
-    parts.push({ type: "text", text: content.slice(last) });
-  }
+  if (last < content.length) parts.push({ type: "text", text: content.slice(last) });
   return parts;
 }
 
-function ThinkBlock({ text }: { text: string }) {
-  const [open, setOpen] = useState(false);
-  return (
-    <div
-      className="my-1.5 rounded"
-      style={{
-        border: "1px solid rgba(167,139,250,0.2)",
-        background: "rgba(167,139,250,0.05)",
-      }}
-    >
-      <button
-        onClick={() => setOpen(!open)}
-        className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-xs"
-        style={{ color: "#a78bfa", cursor: "pointer", background: "none", border: "none" }}
-      >
-        <span
-          style={{
-            fontSize: "10px",
-            transition: "transform 0.15s",
-            transform: open ? "rotate(90deg)" : "none",
-          }}
-        >
-          {">"}
-        </span>
-        Thinking
-      </button>
-      {open && (
-        <div className="px-3 pb-3" style={{ borderTop: "1px solid rgba(167,139,250,0.15)" }}>
-          <div style={{ color: "rgba(167,139,250,0.8)", fontSize: "12px" }}>
-            <MarkdownContent content={text} />
-          </div>
-        </div>
-      )}
-    </div>
-  );
+function extractLegacyToolCards(content: string) {
+  const calls: ToolCallInfo[] = [];
+  let visible = content;
+  const expression = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
+  visible = visible.replace(expression, (_full, body: string) => {
+    try {
+      const parsed = JSON.parse(body) as { id?: string; name?: string; arguments?: unknown };
+      if (typeof parsed.name === "string" && parsed.name.trim()) {
+        calls.push({
+          id: -(calls.length + 1),
+          call_id: typeof parsed.id === "string" ? parsed.id : null,
+          name: parsed.name,
+          arguments: typeof parsed.arguments === "string" ? parsed.arguments : JSON.stringify(parsed.arguments ?? {}),
+          result: null,
+        });
+        return "";
+      }
+    } catch {
+      // This is display-only legacy recovery; malformed text stays visible.
+    }
+    return _full;
+  });
+  return { visible: visible.trim(), calls };
 }
 
-export function MessageBubble({ message }: Props) {
+export function MessageBubble({ message, onOpenHtml }: Props) {
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
-  const content = message.content ?? "";
-  const imageSrc =
-    message.image_base64 ??
-    (typeof content === "string" && content.startsWith("data:image/") ? content : null);
-  const hasImage = !!imageSrc;
-  const textContent = imageSrc === content ? "" : content;
+  const rawContent = message.content ?? "";
+  const imageSrc = message.image_base64 ?? (rawContent.startsWith("data:image/") ? rawContent : null);
+  const contentWithoutImage = imageSrc === rawContent ? "" : rawContent;
+  const legacyParts = !isUser && !message.display_content &&
+    (contentWithoutImage.includes("<think>") || contentWithoutImage.includes("</think>") || contentWithoutImage.includes("<|think|>") || contentWithoutImage.includes("<|/think|>"))
+    ? splitLegacyReasoning(contentWithoutImage)
+    : null;
+  const legacyVisible = legacyParts?.filter((part) => part.type === "text").map((part) => part.text).join("") ?? contentWithoutImage;
+  const legacyReasoning = legacyParts?.filter((part) => part.type === "think").map((part) => part.text).join("\n\n") ?? "";
+  const storedCalls = message.tool_calls ?? [];
+  const legacyTools = storedCalls.length === 0 ? extractLegacyToolCards(message.display_content ?? legacyVisible) : null;
+  const textContent = legacyTools?.visible ?? message.display_content ?? legacyVisible;
+  const reasoning = message.reasoning_content ?? legacyReasoning;
+  const toolCalls = storedCalls.length > 0 ? storedCalls : legacyTools?.calls ?? [];
+  const copyText = textContent.trim();
 
-  const hasThinkTags =
-    !isUser &&
-    (textContent.includes("<think>") ||
-      textContent.includes("</think>") ||
-      textContent.includes("<|think|>") ||
-      textContent.includes("<|/think|>"));
-  const parts = hasThinkTags ? parseThinkBlocks(textContent) : null;
-  const plainTextForCopy = (parts ?? [{ type: "text" as const, text: textContent }])
-    .filter((part) => part.type === "text")
-    .map((part) => part.text)
-    .join("")
-    .trim();
+  if (isSystem) {
+    return (
+      <div className="my-4 rounded-lg border border-white/8 bg-black/10 px-3 py-2 text-xs leading-5 text-[var(--text-2)]" data-context-copy={textContent || undefined} data-context-label="system message">
+        <span className="mr-2 font-semibold text-[var(--text-1)]">System</span>
+        {textContent}
+      </div>
+    );
+  }
 
-  const roleLabel = isSystem ? "SYSTEM" : isUser ? "USER" : "ASSISTANT";
+  if (isUser) {
+    return (
+      <article className="group flex justify-end py-3" data-context-copy={copyText || undefined} data-context-label="prompt">
+        <div className="max-w-[82%] sm:max-w-[72%]">
+          <div className="overflow-hidden rounded-[20px] bg-[var(--surface-3)] px-4 py-2.5 text-[15px] leading-6 text-[var(--text-0)]">
+            {imageSrc && <img src={imageSrc} alt="User attachment" className={`max-h-[360px] w-auto max-w-full rounded-xl object-contain ${textContent ? "mb-2" : ""}`} />}
+            {textContent && <p className="whitespace-pre-wrap break-words">{textContent}</p>}
+            {!imageSrc && !textContent && <span className="italic text-[var(--text-2)]">Empty message</span>}
+          </div>
+          <div className="mt-1 flex h-7 items-center justify-end gap-2 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+            {message.token_count != null && message.token_count > 0 && <span className="text-[10px] text-[var(--text-3)]">{message.token_count} tokens</span>}
+            {copyText && <CopyButton text={copyText} small />}
+          </div>
+        </div>
+      </article>
+    );
+  }
 
   return (
-    <div className={`group flex min-w-0 gap-3 px-4 py-3 ${isUser ? "" : isSystem ? "bg-gray-950/20" : "bg-gray-800/30"}`}>
-      {!isSystem && (
-        <div
-          className={`mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-xs ${
-            isUser ? "bg-blue-600/30 text-blue-300" : "bg-purple-600/30 text-purple-300"
-          }`}
-        >
-          {isUser ? "U" : "AI"}
-        </div>
-      )}
-
-      <div className="min-w-0 flex-1 overflow-visible">
-        <div
-          className="mb-1 text-[11px] font-semibold uppercase tracking-[0.14em]"
-          style={{ color: isSystem ? "#f87171" : isUser ? "#60a5fa" : "#34d399" }}
-        >
-          {roleLabel}
-        </div>
-        {hasImage && (
-          <img
-            src={imageSrc ?? undefined}
-            alt="attachment"
-            className="mb-2 max-h-64 max-w-xs rounded border border-gray-700"
-          />
-        )}
-
-        {hasThinkTags && parts ? (
-          <div>
-            {parts.map((part, index) =>
-              part.type === "think" ? (
-                <ThinkBlock key={index} text={part.text} />
-              ) : (
-                <MarkdownContent key={index} content={part.text} />
-              )
-            )}
+    <article className="group flex gap-3 py-4" data-context-copy={copyText || undefined} data-context-label="response">
+      <div className="ib-brand-mark mt-0.5 h-7 w-7 text-[9px]">IB</div>
+      <div className="min-w-0 flex-1">
+        <div className="mb-1 text-[13px] font-semibold text-[var(--text-0)]">InferenceBridge</div>
+        {imageSrc && <img src={imageSrc} alt="Assistant attachment" className="mb-3 max-h-[360px] max-w-full rounded-xl object-contain" />}
+        {reasoning && <ReasoningPanel reasoning={reasoning} storageKey={String(message.id)} />}
+        {textContent ? <MarkdownContent content={textContent} onOpenHtml={onOpenHtml} /> : null}
+        {toolCalls.length > 0 && (
+          <div className="mt-3" aria-label="Tool selections">
+            {toolCalls.map((call) => <ToolActivityCard key={`${message.id}-${call.id}`} call={call} />)}
           </div>
-        ) : textContent && isUser ? (
-          <p className="min-w-0 whitespace-pre-wrap break-words text-sm leading-relaxed text-gray-300">
-            {textContent}
-          </p>
-        ) : textContent ? (
-          <MarkdownContent content={textContent} />
-        ) : null}
-
-        {!hasImage && !textContent && (
-          <p className="text-sm italic text-gray-500">Empty message</p>
         )}
-
-        <div className="mt-1 flex items-center justify-between gap-2">
-          {message.token_count != null && message.token_count > 0 && (
-            <span className="text-xs text-gray-600">{message.token_count} tokens</span>
-          )}
-          {!isUser && plainTextForCopy && (
-            <span className="ml-auto opacity-0 transition-opacity group-hover:opacity-100">
-              <CopyButton text={plainTextForCopy} small />
-            </span>
-          )}
+        {!imageSrc && !textContent && toolCalls.length === 0 && <p className="text-sm italic text-[var(--text-2)]">Empty message</p>}
+        <div className="mt-1 flex h-8 items-center gap-2 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100">
+          {copyText && <CopyButton text={copyText} small />}
+          {message.token_count != null && message.token_count > 0 && <span className="text-[10px] text-[var(--text-3)]">{message.token_count} tokens</span>}
         </div>
       </div>
-    </div>
+    </article>
   );
 }

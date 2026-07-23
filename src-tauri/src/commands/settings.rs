@@ -511,7 +511,8 @@ pub async fn list_runtime_packs() -> Result<Vec<RuntimePackInfo>, String> {
         let result = download::find_release_asset(&pattern).await;
         match result {
             Ok((tag, _url, size)) => {
-                let update_available = installed_version.as_deref() != Some(tag.as_str());
+                let update_available =
+                    download::release_is_newer(installed_version.as_deref(), &tag);
                 packs.push(RuntimePackInfo {
                     id: backend.to_string(),
                     name: name.to_string(),

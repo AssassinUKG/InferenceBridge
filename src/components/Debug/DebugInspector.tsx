@@ -1,5 +1,19 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { listen } from "@tauri-apps/api/event";
+import {
+  Box,
+  ChevronDown,
+  ChevronRight,
+  Copy,
+  LoaderCircle,
+  Play,
+  RefreshCw,
+  Server,
+  Settings,
+  Square,
+  Terminal,
+  Trash2,
+} from "lucide-react";
 import type {
   ApiServerAction,
   DebugApiResponse,
@@ -12,7 +26,7 @@ import type {
 } from "../../lib/types";
 import * as api from "../../lib/tauri";
 
-type DebugTab = "api" | "doctor" | "profile" | "launch" | "docs" | "logs" | "prompt" | "trace";
+type DebugTab = "server" | "api" | "doctor" | "profile" | "launch" | "docs" | "logs" | "prompt" | "trace";
 type Example = {
   label: string;
   method: string;
@@ -29,9 +43,12 @@ interface Props {
   onSetApiServerRunning: (running: boolean) => Promise<void> | void;
   apiAction?: ApiServerAction;
   onOpenSettings: () => void;
+  modelPickerOpen: boolean;
+  onOpenModelPicker: (trigger: HTMLElement | null) => void;
 }
 
 const TABS: Array<{ key: DebugTab; label: string }> = [
+  { key: "server", label: "Local Server" },
   { key: "api", label: "API Editor" },
   { key: "doctor", label: "Doctor" },
   { key: "profile", label: "Profile" },
@@ -41,6 +58,25 @@ const TABS: Array<{ key: DebugTab; label: string }> = [
   { key: "prompt", label: "Raw Prompt" },
   { key: "trace", label: "Parse Trace" },
 ];
+
+const SUPPORTED_ENDPOINTS = [
+  { method: "GET", path: "/v1/health" },
+  { method: "GET", path: "/v1/models" },
+  { method: "POST", path: "/v1/models/load" },
+  { method: "POST", path: "/v1/models/unload" },
+  { method: "POST", path: "/v1/models/stats" },
+  { method: "POST", path: "/v1/chat/completions" },
+  { method: "POST", path: "/v1/responses" },
+  { method: "POST", path: "/v1/completions" },
+  { method: "POST", path: "/v1/messages" },
+  { method: "POST", path: "/v1/embeddings" },
+  { method: "POST", path: "/v1/rerank" },
+  { method: "GET", path: "/v1/context/status" },
+  { method: "GET", path: "/v1/runtime/status" },
+  { method: "GET", path: "/v1/runtime/doctor" },
+  { method: "GET", path: "/v1/metrics" },
+  { method: "POST", path: "/v1/inference/cancel" },
+] as const;
 
 function Divider() {
   return <div style={{ height: "1px", background: "var(--border)" }} />;
@@ -117,12 +153,12 @@ function ActionButton({
     <button
       onClick={onClick}
       disabled={disabled}
-      className="rounded px-3 py-1.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-50"
+      className="rounded-lg px-3 py-1.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-50"
       style={
         primary
           ? {
-              background: "#22d3ee",
-              color: "#0a0a0a",
+              background: "#f4f4f4",
+              color: "#171717",
               border: "none",
               cursor: disabled ? "not-allowed" : "pointer",
             }
@@ -433,8 +469,10 @@ export function DebugInspector({
   onSetApiServerRunning,
   apiAction = null,
   onOpenSettings,
+  modelPickerOpen,
+  onOpenModelPicker,
 }: Props) {
-  const [activeTab, setActiveTab] = useState<DebugTab>("api");
+  const [activeTab, setActiveTab] = useState<DebugTab>("server");
   const [method, setMethod] = useState("GET");
   const [path, setPath] = useState("/v1/health");
   const [headersText, setHeadersText] = useState(JSON.stringify({ Accept: "application/json", "Content-Type": "application/json" }, null, 2));
@@ -452,8 +490,13 @@ export function DebugInspector({
   const [effectiveProfile, setEffectiveProfile] = useState<EffectiveProfileInfo | null>(null);
   const [runtimeDoctor, setRuntimeDoctor] = useState<RuntimeDoctorReport | null>(null);
   const [selectedProfileModel, setSelectedProfileModel] = useState("");
+  const [selectedServerModel, setSelectedServerModel] = useState<string | null>(null);
+  const [serverEndpointsOpen, setServerEndpointsOpen] = useState(false);
+  const [serverLogsOpen, setServerLogsOpen] = useState(true);
+  const [workspaceVisible, setWorkspaceVisible] = useState(false);
   const [autoRefreshLogs, setAutoRefreshLogs] = useState(true);
   const [tabError, setTabError] = useState<string | null>(null);
+  const workspaceRootRef = useRef<HTMLDivElement | null>(null);
 
   const activeModel = processStatus?.model ?? null;
   const serveState = processStatus?.api_state ?? "Idle";
@@ -474,8 +517,33 @@ export function DebugInspector({
   const serveActive = serveRunning || serveStarting || serveStopping || serveReachable;
   const serveBusy = serveStarting || serveStopping;
   const selectedModel = selectedProfileModel || activeModel || models[0]?.filename || null;
+  const activeModelInfo = useMemo(
+    () => (activeModel ? models.find((model) => model.filename === activeModel) ?? null : null),
+    [activeModel, models]
+  );
+  const selectedServerModelInfo = useMemo(
+    () => (selectedServerModel ? models.find((model) => model.filename === selectedServerModel) ?? null : null),
+    [models, selectedServerModel]
+  );
   const examples = useMemo(() => exampleList(activeModel, selectedModel), [activeModel, selectedModel]);
   const parsedTrace = useMemo(() => parseTraceJson(parseTrace), [parseTrace]);
+  const logsSurfaceActive =
+    workspaceVisible &&
+    (activeTab === "logs" || (activeTab === "server" && serverLogsOpen));
+
+  useEffect(() => {
+    const node = workspaceRootRef.current;
+    if (!node) return;
+    const observer = new IntersectionObserver(([entry]) => {
+      setWorkspaceVisible(entry.isIntersecting);
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    setSelectedServerModel(activeModel);
+  }, [activeModel]);
 
   useEffect(() => {
     if (!selectedProfileModel && (activeModel || models[0]?.filename)) {
@@ -541,13 +609,13 @@ export function DebugInspector({
   };
 
   useEffect(() => {
-    if (activeTab === "logs") refreshLogs();
+    if (logsSurfaceActive) refreshLogs();
     if (activeTab === "doctor") refreshDoctor();
     if (activeTab === "prompt") refreshPrompt();
     if (activeTab === "trace") refreshTrace();
     if (activeTab === "launch") refreshLaunch();
     if (activeTab === "profile") refreshProfile(selectedProfileModel || activeModel || undefined);
-  }, [activeTab]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [activeTab, logsSurfaceActive]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (activeTab !== "profile") return;
@@ -555,19 +623,19 @@ export function DebugInspector({
   }, [selectedProfileModel, activeModel]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
-    if (activeTab !== "logs" || !autoRefreshLogs) return;
+    if (!logsSurfaceActive || !autoRefreshLogs) return;
     const timer = window.setInterval(() => {
       refreshLogs();
     }, 3000);
     return () => window.clearInterval(timer);
-  }, [activeTab, autoRefreshLogs]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [logsSurfaceActive, autoRefreshLogs]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Live: llama-server pushes a `llama-server-log` event per output line.
   // Coalesce bursts into a debounced refresh so the console tracks the server
   // in ~real time without refetching the buffer on every single line. The 3s
   // poll above stays as a backstop.
   useEffect(() => {
-    if (activeTab !== "logs" || !autoRefreshLogs) return;
+    if (!logsSurfaceActive || !autoRefreshLogs) return;
     let timer: number | undefined;
     const unlisten = listen("llama-server-log", () => {
       if (timer != null) return;
@@ -580,12 +648,26 @@ export function DebugInspector({
       if (timer != null) window.clearTimeout(timer);
       unlisten.then((fn) => fn());
     };
-  }, [activeTab, autoRefreshLogs]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [logsSurfaceActive, autoRefreshLogs]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadExample = (example: Example) => {
     setMethod(example.method);
     setPath(example.path);
     setBodyText(example.body ?? "");
+  };
+
+  const openSupportedEndpoint = (endpoint: (typeof SUPPORTED_ENDPOINTS)[number]) => {
+    const matchingExample = examples.find(
+      (example) => example.method === endpoint.method && example.path === endpoint.path
+    );
+    if (matchingExample) {
+      loadExample(matchingExample);
+    } else {
+      setMethod(endpoint.method);
+      setPath(endpoint.path);
+      setBodyText("");
+    }
+    setActiveTab("api");
   };
 
   const sendRequest = async () => {
@@ -650,8 +732,434 @@ export function DebugInspector({
     return matchesLevel && matchesQuery;
   });
 
+  const serveDisplayState = serveRunning
+    ? "Running"
+    : serveStopping
+      ? "Stopping"
+      : modelTransitionActive
+        ? processStatus?.model_load_state ?? "Loading"
+        : serveStarting
+          ? "Starting"
+          : serveState === "Error"
+            ? "Unreachable"
+            : "Stopped";
+  const serveTone = serveRunning
+    ? "#34d399"
+    : serveStarting || serveStopping || modelTransitionActive
+      ? "#fbbf24"
+      : serveState === "Error"
+        ? "#f87171"
+        : "var(--text-2)";
+  const selectedServerModelIsActive =
+    !!selectedServerModel && selectedServerModel === activeModel;
+  const selectedContext =
+    processStatus?.last_launch_preview?.context_size ??
+    selectedServerModelInfo?.context_window ??
+    null;
+  const selectedCapabilities = selectedServerModelInfo
+    ? [
+        selectedServerModelInfo.supports_tools ? "Tools" : null,
+        selectedServerModelInfo.supports_reasoning ? "Reasoning" : null,
+        selectedServerModelInfo.supports_vision ? "Vision" : null,
+      ].filter((capability): capability is string => capability != null)
+    : [];
+
+  if (activeTab === "server") {
+    return (
+      <div ref={workspaceRootRef} className="flex h-full min-h-0 flex-col overflow-hidden" style={{ background: "var(--bg)" }}>
+        <header
+          className="flex min-h-[46px] shrink-0 flex-wrap items-center gap-2 px-3 py-1.5"
+          style={{ background: "var(--surface-1)", borderBottom: "1px solid var(--border)" }}
+        >
+          <button
+            type="button"
+            onClick={() => onSetApiServerRunning(!serveActive)}
+            disabled={serveBusy}
+            className="flex h-8 shrink-0 items-center gap-2 rounded-lg px-2.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-55"
+            style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: serveTone }}
+            title={processStatus?.api_error ?? `API server ${serveDisplayState.toLowerCase()}`}
+          >
+            {serveBusy ? (
+              <LoaderCircle size={14} className="animate-spin" />
+            ) : serveActive ? (
+              <Square size={12} fill="currentColor" />
+            ) : (
+              <Play size={14} fill="currentColor" />
+            )}
+            <span>Status: {serveDisplayState}</span>
+            <span
+              className="relative h-4 w-7 rounded-full"
+              style={{ background: serveActive ? "rgba(52,211,153,0.28)" : "rgba(255,255,255,0.10)" }}
+              aria-hidden="true"
+            >
+              <span
+                className="absolute top-0.5 h-3 w-3 rounded-full transition-all"
+                style={{ left: serveActive ? "14px" : "2px", background: serveActive ? "#34d399" : "var(--text-2)" }}
+              />
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={onOpenSettings}
+            className="flex h-8 shrink-0 items-center gap-2 rounded-lg px-2.5 text-xs font-medium transition hover:bg-white/5"
+            style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}
+          >
+            <Settings size={14} />
+            Server Settings
+          </button>
+
+          <div className="ml-auto flex min-w-0 items-center gap-2">
+            <span className="hidden text-[11px] font-medium lg:inline" style={{ color: serveReachable ? "#34d399" : "var(--text-2)" }}>
+              {serveReachable ? "Reachable at" : "Configured at"}
+            </span>
+            <code className="max-w-[260px] truncate rounded-md px-2 py-1 text-[11px]" title={apiUrl} style={{ background: "var(--surface-2)", color: "var(--text-0)" }}>
+              {apiUrl}
+            </code>
+            <button
+              type="button"
+              onClick={() => navigator.clipboard.writeText(apiUrl)}
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition hover:bg-white/5"
+              style={{ border: "1px solid var(--border)", color: "var(--text-1)" }}
+              aria-label="Copy API URL"
+              title="Copy API URL"
+            >
+              <Copy size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={(event) => onOpenModelPicker(event.currentTarget)}
+              aria-haspopup="dialog"
+              aria-controls="rich-model-picker"
+              aria-expanded={modelPickerOpen}
+              className="flex h-8 shrink-0 items-center gap-2 rounded-lg px-3 text-xs font-semibold transition hover:bg-white"
+              style={{ background: "var(--accent)", color: "var(--accent-contrast)", border: "1px solid transparent" }}
+            >
+              <ChevronDown size={14} />
+              Choose model
+            </button>
+          </div>
+        </header>
+
+        <nav
+          className="flex shrink-0 items-center gap-1 overflow-x-auto px-2 py-1.5"
+          style={{ background: "var(--surface-1)", borderBottom: "1px solid var(--border)" }}
+          aria-label="Developer tools"
+          role="tablist"
+        >
+          {TABS.map((tab) => (
+            <button
+              key={tab.key}
+              type="button"
+              role="tab"
+              aria-selected={activeTab === tab.key}
+              onClick={() => setActiveTab(tab.key)}
+              className="shrink-0 rounded-md px-2.5 py-1 text-xs font-medium transition"
+              style={{
+                background: activeTab === tab.key ? "rgba(255,255,255,0.10)" : "transparent",
+                color: activeTab === tab.key ? "var(--text-0)" : "var(--text-1)",
+                border: activeTab === tab.key ? "1px solid var(--border-mid)" : "1px solid transparent",
+              }}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </nav>
+
+        {processStatus?.api_error && !modelTransitionActive && (
+          <div
+            className="shrink-0 px-3 py-2 text-xs"
+            style={{
+              background: serveReachable ? "rgba(251,191,36,0.08)" : "rgba(248,113,113,0.08)",
+              borderBottom: `1px solid ${serveReachable ? "rgba(251,191,36,0.20)" : "rgba(248,113,113,0.20)"}`,
+              color: serveReachable ? "#fde68a" : "#fca5a5",
+            }}
+          >
+            {processStatus.api_error}
+          </div>
+        )}
+        {tabError && (
+          <div className="shrink-0 px-3 py-2 text-xs" style={{ background: "rgba(248,113,113,0.08)", borderBottom: "1px solid rgba(248,113,113,0.20)", color: "#fca5a5" }}>
+            {tabError}
+          </div>
+        )}
+
+        <div className="grid min-h-0 flex-1 grid-cols-1 overflow-hidden lg:grid-cols-[minmax(0,1fr)_280px]">
+          <section className="flex min-h-0 flex-col overflow-hidden">
+            <div className="flex h-10 shrink-0 items-center justify-between px-3" style={{ borderBottom: "1px solid var(--border)" }}>
+              <div className="flex items-center gap-2 text-xs font-semibold" style={{ color: "var(--text-0)" }}>
+                <Server size={14} />
+                Loaded model
+                <span className="rounded-full px-1.5 py-0.5 text-[10px]" style={{ background: "var(--surface-2)", color: "var(--text-2)" }}>
+                  {activeModel ? 1 : 0}
+                </span>
+              </div>
+              <span className="text-[11px]" style={{ color: "var(--text-2)" }}>
+                {processStatus?.backend ?? "Runtime idle"}
+              </span>
+            </div>
+
+            <div className="min-h-0 flex-1 overflow-y-auto p-3">
+              {activeModel ? (
+                <button
+                  type="button"
+                  onClick={() => setSelectedServerModel(activeModel)}
+                  className="w-full rounded-lg p-3 text-left transition"
+                  style={{
+                    background: selectedServerModelIsActive ? "rgba(255,255,255,0.075)" : "var(--surface-1)",
+                    border: selectedServerModelIsActive ? "1px solid var(--border-mid)" : "1px solid var(--border)",
+                  }}
+                  aria-pressed={selectedServerModelIsActive}
+                >
+                  <div className="flex min-w-0 items-start gap-3">
+                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg" style={{ background: "var(--surface-2)", color: serveRunning ? "#34d399" : "var(--text-1)" }}>
+                      <Box size={17} />
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex min-w-0 flex-wrap items-center gap-2">
+                        <span className="min-w-0 truncate text-sm font-semibold" title={activeModel} style={{ color: "var(--text-0)" }}>
+                          {activeModel}
+                        </span>
+                        <span className="rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em]" style={{ background: "rgba(52,211,153,0.10)", border: "1px solid rgba(52,211,153,0.20)", color: "#34d399" }}>
+                          Active
+                        </span>
+                      </div>
+                      <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]" style={{ color: "var(--text-2)" }}>
+                        <span>{activeModelInfo?.family || "Loaded via API"}</span>
+                        {activeModelInfo?.quant && <span>{activeModelInfo.quant}</span>}
+                        {!!activeModelInfo?.size_gb && <span>{activeModelInfo.size_gb.toFixed(1)} GB</span>}
+                        {processStatus?.last_launch_preview?.context_size && (
+                          <span>{processStatus.last_launch_preview.context_size.toLocaleString()} ctx</span>
+                        )}
+                      </div>
+                      {activeModelInfo && (
+                        <div className="mt-2 flex flex-wrap gap-1">
+                          {activeModelInfo.supports_tools && <span className="rounded px-1.5 py-0.5 text-[10px]" style={{ background: "var(--surface-2)", color: "var(--text-1)" }}>Tools</span>}
+                          {activeModelInfo.supports_reasoning && <span className="rounded px-1.5 py-0.5 text-[10px]" style={{ background: "var(--surface-2)", color: "var(--text-1)" }}>Reasoning</span>}
+                          {activeModelInfo.supports_vision && <span className="rounded px-1.5 py-0.5 text-[10px]" style={{ background: "var(--surface-2)", color: "var(--text-1)" }}>Vision</span>}
+                        </div>
+                      )}
+                    </div>
+                    <div className="shrink-0 text-right text-[11px]" style={{ color: "var(--text-2)" }}>
+                      <div style={{ color: serveTone }}>{processStatus?.model_load_state ?? "Loaded"}</div>
+                      <div className="mt-1">{processStatus?.active_requests ?? 0} active</div>
+                    </div>
+                  </div>
+                  {modelTransitionActive && modelTransition && (
+                    <div className="mt-3">
+                      <div className="mb-1 flex items-center justify-between gap-3 text-[10px]" style={{ color: "#fde68a" }}>
+                        <span className="truncate">{modelTransition.message}</span>
+                        <span>{Math.round(modelTransition.progress * 100)}%</span>
+                      </div>
+                      <div className="h-1 overflow-hidden rounded-full" style={{ background: "rgba(255,255,255,0.08)" }}>
+                        <div className="h-full rounded-full bg-amber-400" style={{ width: `${Math.max(2, Math.min(100, modelTransition.progress * 100))}%` }} />
+                      </div>
+                    </div>
+                  )}
+                </button>
+              ) : (
+                <div className="flex h-full min-h-[180px] flex-col items-center justify-center text-center">
+                  <span className="flex h-12 w-12 items-center justify-center rounded-xl" style={{ background: "var(--surface-1)", border: "1px solid var(--border)", color: "var(--text-2)" }}>
+                    {modelTransitionActive ? <LoaderCircle size={21} className="animate-spin" /> : <Box size={21} />}
+                  </span>
+                  <p className="mt-3 text-sm font-semibold" style={{ color: "var(--text-0)" }}>
+                    {modelTransitionActive ? processStatus?.model_load_state ?? "Loading model" : "No model loaded"}
+                  </p>
+                  <p className="mt-1 max-w-[360px] text-xs leading-5" style={{ color: "var(--text-2)" }}>
+                    {modelTransitionActive
+                      ? modelTransition?.message ?? "Preparing the local runtime."
+                      : "Load a local model to serve it through the OpenAI-compatible API."}
+                  </p>
+                  {!modelTransitionActive && (
+                    <button
+                      type="button"
+                      onClick={(event) => onOpenModelPicker(event.currentTarget)}
+                      aria-haspopup="dialog"
+                      aria-controls="rich-model-picker"
+                      aria-expanded={modelPickerOpen}
+                      className="mt-4 flex h-8 items-center gap-2 rounded-lg px-3 text-xs font-semibold transition hover:bg-white"
+                      style={{ background: "var(--accent)", color: "var(--accent-contrast)" }}
+                    >
+                      <ChevronDown size={14} />
+                      Choose a model
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
+          </section>
+
+          <aside className="hidden min-h-0 flex-col overflow-hidden lg:flex" style={{ background: "var(--surface-1)", borderLeft: "1px solid var(--border)" }}>
+            <div className="flex h-10 shrink-0 items-center px-3 text-xs font-semibold" style={{ borderBottom: "1px solid var(--border)", color: "var(--text-0)" }}>
+              Model & runtime
+            </div>
+            {selectedServerModel ? (
+              <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
+                <div className="border-b py-2" style={{ borderColor: "var(--border)" }}>
+                  <p className="break-words text-xs font-semibold leading-5" style={{ color: "var(--text-0)" }}>{selectedServerModel}</p>
+                  <p className="mt-1 text-[11px]" style={{ color: selectedServerModelIsActive ? "#34d399" : "var(--text-2)" }}>
+                    {selectedServerModelIsActive ? "Active runtime model" : "Not active"}
+                  </p>
+                </div>
+                {([
+                  { label: "Family", value: selectedServerModelInfo?.family || "Unknown" },
+                  { label: "Quant", value: selectedServerModelInfo?.quant || "Unknown" },
+                  { label: "Size on disk", value: selectedServerModelInfo?.size_gb ? `${selectedServerModelInfo.size_gb.toFixed(1)} GB` : "Unknown" },
+                  { label: "Provider", value: selectedServerModelInfo?.provider_name || "Managed runtime" },
+                  { label: "Backend", value: processStatus?.backend || "Unknown" },
+                  { label: "Context", value: selectedContext ? selectedContext.toLocaleString() : "Unknown" },
+                  { label: "Runtime", value: processStatus?.state || "Idle" },
+                  { label: "Requests", value: `${processStatus?.active_requests ?? 0} active / ${processStatus?.queued_requests ?? 0} queued` },
+                  { label: "Slots", value: `${processStatus?.slot_count ?? processStatus?.parallel_slots ?? 0}` },
+                  { label: "Startup", value: processStatus?.startup_duration_ms != null ? `${processStatus.startup_duration_ms} ms` : "Unknown" },
+                  { label: "llama.cpp", value: processStatus?.server_version || "Unknown" },
+                ] as Array<{ label: string; value: string }>).map((item) => (
+                  <div key={item.label} className="grid grid-cols-[88px_minmax(0,1fr)] gap-2 border-b py-2 text-[11px]" style={{ borderColor: "var(--border)" }}>
+                    <span style={{ color: "var(--text-2)" }}>{item.label}</span>
+                    <span className="min-w-0 break-words text-right" title={item.value} style={{ color: "var(--text-0)" }}>{item.value}</span>
+                  </div>
+                ))}
+                <div className="py-2">
+                  <div className="text-[11px]" style={{ color: "var(--text-2)" }}>Capabilities</div>
+                  <div className="mt-2 flex flex-wrap gap-1">
+                    {selectedCapabilities.length > 0 ? selectedCapabilities.map((capability) => (
+                      <span key={capability} className="rounded px-1.5 py-0.5 text-[10px]" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}>
+                        {capability}
+                      </span>
+                    )) : <span className="text-[11px]" style={{ color: "var(--text-3)" }}>None reported</span>}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="flex min-h-0 flex-1 items-center justify-center px-4 text-center text-xs" style={{ color: "var(--text-2)" }}>
+                No model selected
+              </div>
+            )}
+          </aside>
+        </div>
+
+        <section className="shrink-0" style={{ background: "var(--surface-1)", borderTop: "1px solid var(--border)" }}>
+          <button
+            type="button"
+            onClick={() => setServerEndpointsOpen((open) => !open)}
+            className="flex h-10 w-full items-center gap-2 px-3 text-left text-xs font-medium transition hover:bg-white/[0.03]"
+            style={{ color: "var(--text-1)" }}
+            aria-expanded={serverEndpointsOpen}
+          >
+            {serverEndpointsOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            <span className="font-semibold" style={{ color: "var(--text-0)" }}>Supported endpoints</span>
+            <span className="rounded-full px-1.5 py-0.5 text-[10px]" style={{ background: "var(--surface-2)", color: "var(--text-2)" }}>
+              {SUPPORTED_ENDPOINTS.length}
+            </span>
+            <span className="ml-auto text-[11px]" style={{ color: "var(--text-3)" }}>Select a route to open it in API Editor</span>
+          </button>
+          {serverEndpointsOpen && (
+            <div className="grid max-h-[136px] grid-cols-1 gap-1 overflow-y-auto border-t p-2 sm:grid-cols-2 xl:grid-cols-3" style={{ borderColor: "var(--border)" }}>
+              {SUPPORTED_ENDPOINTS.map((endpoint) => (
+                <button
+                  key={`${endpoint.method}-${endpoint.path}`}
+                  type="button"
+                  onClick={() => openSupportedEndpoint(endpoint)}
+                  className="flex min-w-0 items-center gap-2 rounded-md px-2 py-1.5 text-left transition hover:bg-white/5"
+                  style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}
+                >
+                  <span className="w-9 shrink-0 text-[10px] font-bold" style={{ color: endpoint.method === "GET" ? "#34d399" : "#60a5fa" }}>{endpoint.method}</span>
+                  <code className="min-w-0 truncate text-[10px]" title={endpoint.path} style={{ color: "var(--text-1)" }}>{endpoint.path}</code>
+                </button>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <section
+          className={`ib-api-log-dock flex shrink-0 flex-col overflow-hidden ${serverLogsOpen ? "is-open" : ""}`}
+          style={{ background: "#171717", borderTop: "1px solid var(--border)" }}
+        >
+          <div className="flex h-10 shrink-0 items-center gap-2 px-3">
+            <button
+              type="button"
+              onClick={() => setServerLogsOpen((open) => !open)}
+              className="flex min-w-0 items-center gap-2 text-xs font-semibold"
+              style={{ color: "var(--text-0)" }}
+              aria-expanded={serverLogsOpen}
+            >
+              {serverLogsOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+              <Terminal size={14} />
+              Developer logs
+              <span className="text-[10px] font-normal" style={{ color: "var(--text-3)" }}>{filteredLogs.length}</span>
+            </button>
+            <div className="ml-auto flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => setAutoRefreshLogs((current) => !current)}
+                className="rounded-md px-2 py-1 text-[10px] transition hover:bg-white/5"
+                style={{ color: autoRefreshLogs ? "#34d399" : "var(--text-2)" }}
+                title="Toggle automatic log refresh"
+              >
+                Auto {autoRefreshLogs ? "on" : "off"}
+              </button>
+              <button type="button" onClick={refreshLogs} className="flex h-7 w-7 items-center justify-center rounded-md transition hover:bg-white/5" style={{ color: "var(--text-2)" }} aria-label="Refresh developer logs" title="Refresh">
+                <RefreshCw size={13} />
+              </button>
+              <button
+                type="button"
+                onClick={async () => {
+                  await api.clearLogs();
+                  await refreshLogs();
+                }}
+                className="flex h-7 w-7 items-center justify-center rounded-md transition hover:bg-white/5"
+                style={{ color: "var(--text-2)" }}
+                aria-label="Clear developer logs"
+                title="Clear"
+              >
+                <Trash2 size={13} />
+              </button>
+            </div>
+          </div>
+          {serverLogsOpen && (
+            <>
+              <div className="flex shrink-0 items-center gap-2 border-y px-3 py-1.5" style={{ borderColor: "var(--border)", background: "var(--surface-1)" }}>
+                <select
+                  value={logLevel}
+                  onChange={(event) => setLogLevel(event.target.value)}
+                  className="h-7 rounded-md px-2 text-[10px] outline-none"
+                  style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}
+                >
+                  <option value="ALL">ALL</option>
+                  <option value="INFO">INFO</option>
+                  <option value="WARN">WARN</option>
+                  <option value="ERROR">ERROR</option>
+                  <option value="DEBUG">DEBUG</option>
+                </select>
+                <input
+                  value={logQuery}
+                  onChange={(event) => setLogQuery(event.target.value)}
+                  placeholder="Filter logs..."
+                  className="h-7 min-w-0 flex-1 rounded-md px-2 text-[10px] outline-none"
+                  style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-0)" }}
+                />
+              </div>
+              <div className="min-h-0 flex-1 overflow-auto px-3 py-2 font-mono text-[10px] leading-[1.65]">
+                {filteredLogs.length === 0 ? (
+                  <div style={{ color: "var(--text-3)" }}>No developer logs match the current filter.</div>
+                ) : filteredLogs.map((entry, index) => (
+                  <div key={`${entry.timestamp}-${index}`} className="grid grid-cols-[142px_46px_minmax(110px,180px)_minmax(0,1fr)] gap-2 border-b py-0.5" style={{ borderColor: "rgba(255,255,255,0.035)" }}>
+                    <span className="truncate" title={entry.timestamp} style={{ color: "var(--text-3)" }}>{entry.timestamp}</span>
+                    <span style={{ color: entry.level === "ERROR" ? "#f87171" : entry.level === "WARN" ? "#fbbf24" : entry.level === "INFO" ? "#34d399" : "#60a5fa" }}>[{entry.level}]</span>
+                    <span className="truncate" title={entry.target} style={{ color: "var(--text-2)" }}>{entry.target}</span>
+                    <span className="min-w-0 whitespace-pre-wrap break-words" style={{ color: "var(--text-1)" }}>{entry.message}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </section>
+      </div>
+    );
+  }
+
   return (
-    <div className="h-full overflow-y-auto">
+    <div ref={workspaceRootRef} className="h-full overflow-y-auto">
       <div className="flex flex-col gap-3 p-3">
         <Panel
           title="Developer Console"
@@ -767,16 +1275,21 @@ export function DebugInspector({
         <section
           className="flex flex-wrap items-center gap-1 rounded-md px-2 py-2"
           style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}
+          role="tablist"
+          aria-label="Developer tools"
         >
           {TABS.map((tab) => (
             <button
               key={tab.key}
+              type="button"
+              role="tab"
+              aria-selected={activeTab === tab.key}
               onClick={() => setActiveTab(tab.key)}
               className="rounded px-3 py-1.5 text-sm font-medium transition"
               style={{
-                background: activeTab === tab.key ? "rgba(34,211,238,0.12)" : "transparent",
-                color: activeTab === tab.key ? "#a5f3fc" : "var(--text-1)",
-                border: activeTab === tab.key ? "1px solid rgba(34,211,238,0.24)" : "1px solid transparent",
+                background: activeTab === tab.key ? "rgba(255,255,255,0.10)" : "transparent",
+                color: activeTab === tab.key ? "var(--text-0)" : "var(--text-1)",
+                border: activeTab === tab.key ? "1px solid var(--border-mid)" : "1px solid transparent",
                 cursor: "pointer",
               }}
             >
@@ -813,9 +1326,9 @@ export function DebugInspector({
                       <span
                         className="rounded px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.12em]"
                         style={{
-                          background: "rgba(34,211,238,0.08)",
-                          border: "1px solid rgba(34,211,238,0.18)",
-                          color: "#22d3ee",
+                          background: "rgba(255,255,255,0.07)",
+                          border: "1px solid var(--border)",
+                          color: "var(--text-1)",
                         }}
                       >
                         Example

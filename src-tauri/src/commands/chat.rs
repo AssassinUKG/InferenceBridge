@@ -5,11 +5,20 @@ use crate::engine::client::{CompletionRequest, ImageData, LlamaClient};
 use crate::engine::streaming::{self, StreamEvent};
 use crate::models::profiles::{ModelFamily, ModelProfile};
 use crate::normalize::images::normalize_inline_image_payload;
+use crate::session::db::MessageInfo;
 use crate::state::{
-    append_live_stream_delta, begin_live_generation, cancel_all_generations, SharedState,
+    append_live_stream_delta_for_request, begin_live_generation, cancel_all_generations,
+    finish_generation_for_request, GenerationHandle, SharedState,
 };
 use crate::templates::engine::{render_prompt, ChatMessage};
 use serde_json::json;
+
+#[derive(Debug, Clone)]
+struct PreparedMessage {
+    role: String,
+    content: String,
+    image_base64: Option<String>,
+}
 
 fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
@@ -31,10 +40,10 @@ fn launch_preview_matches_model(model_name: &str, preview_model_path: &str) -> b
 }
 
 fn apply_thinking_preference(
-    mut messages: Vec<ChatMessage>,
+    mut messages: Vec<PreparedMessage>,
     profile: &ModelProfile,
     show_thinking: Option<bool>,
-) -> Vec<ChatMessage> {
+) -> Vec<PreparedMessage> {
     if profile.family == ModelFamily::Gemma4 {
         match show_thinking {
             Some(true) => {
@@ -45,11 +54,12 @@ fn apply_thinking_preference(
                 } else {
                     messages.insert(
                         0,
-                        ChatMessage {
+                        PreparedMessage {
                             role: "system".to_string(),
                             content:
                                 "<|think|>\nYou may use internal reasoning before the final answer."
                                     .to_string(),
+                            image_base64: None,
                         },
                     );
                 }
@@ -57,9 +67,10 @@ fn apply_thinking_preference(
             Some(false) => {
                 messages.insert(
                     0,
-                    ChatMessage {
+                    PreparedMessage {
                         role: "system".to_string(),
                         content: "Respond directly. Do not emit hidden reasoning or thought-channel content.".to_string(),
+                        image_base64: None,
                     },
                 );
             }
@@ -73,8 +84,12 @@ fn apply_thinking_preference(
     };
 
     match (profile.family, show_thinking) {
-        (ModelFamily::Qwen3_5 | ModelFamily::Qwen3, Some(true)) => {}
-        (ModelFamily::Qwen3_5 | ModelFamily::Qwen3, Some(false)) => {
+        // Qwen3.5/Tess reasoning is selected at llama-server launch with
+        // --reasoning. The GUI switch is display-only and must never rewrite
+        // the native embedded-template input.
+        (ModelFamily::Qwen3_5, _) => {}
+        (ModelFamily::Qwen3, Some(true)) => {}
+        (ModelFamily::Qwen3, Some(false)) => {
             last.content = format!(
                 "Respond directly without emitting <think> blocks. Return only the final answer.\n\n{}",
                 last.content
@@ -92,15 +107,42 @@ fn apply_thinking_preference(
     messages
 }
 
+fn prepare_messages(
+    db_messages: &[MessageInfo],
+    profile: &ModelProfile,
+    show_thinking: Option<bool>,
+) -> Vec<PreparedMessage> {
+    let messages = db_messages
+        .iter()
+        .map(|message| {
+            let image_base64 = message.image_base64.as_deref().and_then(|image| {
+                match normalize_inline_image_payload(image) {
+                    Ok(normalized) => Some(normalized),
+                    Err(error) => {
+                        tracing::warn!(message_id = message.id, %error, "Skipping invalid stored image payload");
+                        None
+                    }
+                }
+            });
+
+            PreparedMessage {
+                role: message.role.clone(),
+                content: message.content.clone().unwrap_or_default(),
+                image_base64,
+            }
+        })
+        .collect();
+
+    apply_thinking_preference(messages, profile, show_thinking)
+}
+
 async fn begin_generation(
     state: &SharedState,
     source: &str,
     session_id: Option<String>,
     model: String,
-) -> tokio_util::sync::CancellationToken {
-    begin_live_generation(state, source, session_id, model)
-        .await
-        .cancel
+) -> GenerationHandle {
+    begin_live_generation(state, source, session_id, model).await
 }
 
 fn build_openai_content_parts(text: &str, image_base64: Option<&str>) -> serde_json::Value {
@@ -120,6 +162,58 @@ fn build_openai_content_parts(text: &str, image_base64: Option<&str>) -> serde_j
         }));
     }
     serde_json::Value::Array(parts)
+}
+
+fn build_openai_messages(messages: &[PreparedMessage]) -> Vec<serde_json::Value> {
+    messages
+        .iter()
+        .map(|message| {
+            json!({
+                "role": message.role,
+                "content": if let Some(image_base64) = message.image_base64.as_deref() {
+                    build_openai_content_parts(
+                        &strip_legacy_image_markers(&message.content),
+                        Some(image_base64),
+                    )
+                } else {
+                    serde_json::Value::String(message.content.clone())
+                },
+            })
+        })
+        .collect()
+}
+
+fn prepared_to_api_messages(
+    messages: &[PreparedMessage],
+) -> Vec<crate::api::completions::ApiMessage> {
+    messages
+        .iter()
+        .map(|message| {
+            let content = if let Some(image_base64) = message.image_base64.as_ref() {
+                let mut parts = Vec::new();
+                let text = strip_legacy_image_markers(&message.content);
+                if !text.trim().is_empty() {
+                    parts.push(crate::api::completions::ApiContentPart::Text { text });
+                }
+                parts.push(crate::api::completions::ApiContentPart::ImageUrl {
+                    image_url: crate::api::completions::ApiImageUrl::Object {
+                        url: format!("data:image/png;base64,{image_base64}"),
+                    },
+                });
+                crate::api::completions::ApiMessageContent::Parts(parts)
+            } else {
+                crate::api::completions::ApiMessageContent::Text(message.content.clone())
+            };
+            crate::api::completions::ApiMessage {
+                role: message.role.clone(),
+                content: Some(content),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+                refusal: None,
+            }
+        })
+        .collect()
 }
 
 fn strip_legacy_image_markers(text: &str) -> String {
@@ -156,7 +250,28 @@ fn openai_usage_tokens(value: &serde_json::Value, key: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_openai_content_parts, strip_legacy_image_markers};
+    use super::{
+        build_openai_content_parts, build_openai_messages, prepare_messages,
+        prepared_to_api_messages, strip_legacy_image_markers,
+    };
+    use crate::models::profiles::ModelProfile;
+    use crate::session::db::MessageInfo;
+
+    fn message(id: i64, role: &str, content: &str, image_base64: Option<&str>) -> MessageInfo {
+        MessageInfo {
+            id,
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            display_content: None,
+            reasoning_content: None,
+            image_base64: image_base64.map(str::to_string),
+            token_count: Some(0),
+            tokens_evaluated: None,
+            tokens_predicted: None,
+            created_at: "2026-07-14T00:00:00Z".to_string(),
+            tool_calls: Vec::new(),
+        }
+    }
 
     #[test]
     fn strips_legacy_image_markers_for_openai_image_parts() {
@@ -174,20 +289,100 @@ mod tests {
         assert_eq!(array[0]["type"], "text");
         assert_eq!(array[1]["type"], "image_url");
     }
-}
 
-async fn finish_generation(state: &SharedState, status: &str) {
-    let mut s = state.write().await;
-    if let Some(active) = s.active_generation.as_mut() {
-        active.status = status.to_string();
+    #[test]
+    fn gemma_thinking_guidance_does_not_shift_pasted_image_to_assistant() {
+        let history = vec![
+            message(1, "user", "hello", None),
+            message(2, "assistant", "Hello!", None),
+            message(3, "user", "how are you today?", None),
+            message(4, "assistant", "I'm doing great.", None),
+            message(
+                -1,
+                "user",
+                "what is in this image?",
+                Some("data:image/png;base64,QUFBQQ=="),
+            ),
+        ];
+        let profile = ModelProfile::detect("Gemma4-26B-A4B-QAT-Q4_K_M.gguf");
+
+        let prepared = prepare_messages(&history, &profile, Some(false));
+        let openai_messages = build_openai_messages(&prepared);
+
+        assert_eq!(openai_messages.len(), history.len() + 1);
+        let roles = openai_messages
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            roles,
+            vec!["system", "user", "assistant", "user", "assistant", "user"]
+        );
+        assert_eq!(openai_messages[1]["content"], "hello");
+        assert_eq!(openai_messages[2]["content"], "Hello!");
+        assert_eq!(openai_messages[3]["content"], "how are you today?");
+        assert_eq!(openai_messages[4]["content"], "I'm doing great.");
+
+        let image_owners = openai_messages
+            .iter()
+            .filter(|message| {
+                message["content"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|part| part["type"] == "image_url"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(image_owners.len(), 1);
+        assert_eq!(image_owners[0]["role"], "user");
+
+        let final_parts = openai_messages.last().unwrap()["content"]
+            .as_array()
+            .expect("final user message should contain multimodal parts");
+        assert_eq!(final_parts[0]["type"], "text");
+        assert_eq!(final_parts[0]["text"], "what is in this image?");
+        assert_eq!(final_parts[1]["type"], "image_url");
+        assert_eq!(
+            final_parts[1]["image_url"]["url"],
+            "data:image/png;base64,QUFBQQ=="
+        );
+        assert!(openai_messages
+            .iter()
+            .filter(|message| message["role"] == "assistant")
+            .all(|message| message["content"].is_string()));
     }
-    if let Some(stream) = s.live_stream.as_mut() {
-        stream.status = status.to_string();
+
+    #[test]
+    fn qwen35_show_thinking_is_display_only() {
+        let history = vec![message(1, "user", "Explain this directly", None)];
+        let profile = ModelProfile::detect("Tess-4-27B-Q4_K_M.gguf");
+
+        let hidden = prepare_messages(&history, &profile, Some(false));
+        let shown = prepare_messages(&history, &profile, Some(true));
+
+        assert_eq!(hidden[0].content, "Explain this directly");
+        assert_eq!(shown[0].content, "Explain this directly");
     }
-    if let (Some(handle), Some(snapshot)) = (s.app_handle.clone(), s.live_stream.clone()) {
-        let _ = handle.emit("llm-stream-done", snapshot);
+
+    #[test]
+    fn qwen35_native_history_retains_older_image_for_readiness_checks() {
+        let history = vec![
+            message(
+                1,
+                "user",
+                "inspect this",
+                Some("data:image/png;base64,QUFBQQ=="),
+            ),
+            message(2, "assistant", "I can see it.", None),
+            message(3, "user", "now explain the result", None),
+        ];
+        let profile = ModelProfile::detect("Tess-4-27B-Q4_K_M.gguf");
+        let prepared = prepare_messages(&history, &profile, Some(false));
+
+        assert!(prepared
+            .iter()
+            .any(|message| message.image_base64.is_some()));
+        let native = prepared_to_api_messages(&prepared);
+        assert!(crate::api::completions::api_messages_have_images(&native));
     }
-    s.active_generation = None;
 }
 
 async fn schedule_context_follow_up(state: SharedState, session_id: String) {
@@ -349,6 +544,9 @@ pub async fn send_message(
     temperature: Option<f32>,
     top_p: Option<f32>,
     top_k: Option<i32>,
+    min_p: Option<f32>,
+    presence_penalty: Option<f32>,
+    repeat_penalty: Option<f32>,
     max_tokens: Option<u32>,
     seed: Option<i64>,
     image_base64: Option<String>,
@@ -361,23 +559,55 @@ pub async fn send_message(
         .map(normalize_inline_image_payload)
         .transpose()
         .map_err(|e| format!("Invalid pasted image: {e}"))?;
+    let live_input = match (content.trim().is_empty(), image_base64.is_some()) {
+        (true, true) => "[image attached]".to_string(),
+        (false, true) => format!("{content}\n[image attached]"),
+        _ => content.clone(),
+    };
 
-    let (model_name, profile, vision_runtime_ready) = {
+    let (
+        model_name,
+        profile,
+        vision_runtime_ready,
+        server_defaults,
+        launch_defaults,
+        context_limit,
+    ) = {
         let s = state.read().await;
         let Some(model_name) = s.loaded_model.clone() else {
             return Err("No model loaded".to_string());
         };
-        let profile = crate::models::overrides::detect_effective_profile(&model_name);
-        let vision_runtime_ready = if normalized_inline_image.is_some() {
-            s.last_launch_preview
-                .as_ref()
-                .filter(|preview| launch_preview_matches_model(&model_name, &preview.model_path))
-                .and_then(|preview| preview.mmproj_path.as_ref())
-                .is_some()
-        } else {
-            true
-        };
-        (model_name, profile, vision_runtime_ready)
+        let profile = s.effective_profile_for_model(&model_name);
+        let vision_runtime_ready = s
+            .last_launch_preview
+            .as_ref()
+            .filter(|preview| launch_preview_matches_model(&model_name, &preview.model_path))
+            .and_then(|preview| preview.mmproj_path.as_ref())
+            .is_some();
+        let server_defaults = (
+            s.config.server.default_temperature,
+            s.config.server.default_top_p,
+            s.config.server.default_top_k,
+            s.config.server.default_max_tokens,
+        );
+        let context_limit = s
+            .model_stats
+            .as_ref()
+            .map(|stats| stats.context_size)
+            .or_else(|| {
+                s.last_launch_preview
+                    .as_ref()
+                    .and_then(|preview| preview.context_size)
+            })
+            .or(profile.default_context_window);
+        (
+            model_name,
+            profile,
+            vision_runtime_ready,
+            server_defaults,
+            s.active_sampling_defaults(),
+            context_limit,
+        )
     };
 
     if normalized_inline_image.is_some() && !profile.supports_vision {
@@ -401,20 +631,70 @@ pub async fn send_message(
         id: -1,
         role: "user".to_string(),
         content: Some(content.clone()),
+        display_content: None,
+        reasoning_content: None,
         image_base64: image_base64.clone(),
         token_count: Some(0),
         tokens_evaluated: None,
         tokens_predicted: None,
         created_at: now_rfc3339(),
+        tool_calls: Vec::new(),
     });
+
+    let prepared_messages = prepare_messages(&db_messages, &profile, show_thinking);
+    let has_any_image = prepared_messages
+        .iter()
+        .any(|message| message.image_base64.is_some());
+    if has_any_image && !profile.supports_vision {
+        return Err(format!(
+            "The loaded model `{model_name}` does not advertise vision support, but this conversation contains image input."
+        ));
+    }
+    if has_any_image && !vision_runtime_ready {
+        return Err(format!(
+            "This conversation contains image input, but `{model_name}` was started without a matching mmproj sidecar. Reload a vision-ready model before continuing."
+        ));
+    }
+
+    // Persist the accepted user turn before inference starts. This preserves it
+    // across generation errors/cancellation and lets the UI reconcile safely.
+    {
+        let s = state.read().await;
+        let db = s.session_db.lock().map_err(|e| e.to_string())?;
+        db.add_message(&session_id, "user", &content, 0, image_base64.as_deref())
+            .map_err(|e| e.to_string())?;
+    }
+
+    if let Some(capability_response) =
+        crate::normalize::capability_truth::unavailable_request_response(
+            &content,
+            &crate::normalize::capability_truth::RuntimeCapabilities::desktop_chat(),
+        )
+    {
+        let assistant_message_id = {
+            let s = state.read().await;
+            let db = s.session_db.lock().map_err(|e| e.to_string())?;
+            db.add_message(&session_id, "assistant", &capability_response, 0, None)
+                .map_err(|e| e.to_string())?
+        };
+        {
+            let s = state.read().await;
+            let db = s.session_db.lock().map_err(|e| e.to_string())?;
+            db.update_message_presentation(assistant_message_id, Some(&capability_response), None)
+                .map_err(|e| e.to_string())?;
+        }
+        let _ = app.emit("stream-token", &capability_response);
+        let _ = app.emit("stream-done", 0.0f64);
+        return Ok(capability_response);
+    }
 
     let mut image_data = Vec::new();
     let mut next_image_id = 1u32;
-    let messages: Vec<ChatMessage> = db_messages
+    let messages: Vec<ChatMessage> = prepared_messages
         .iter()
         .map(|message| {
-            let mut message_content = message.content.clone().unwrap_or_default();
-            if let Some(image_uri) = &message.image_base64 {
+            let mut message_content = message.content.clone();
+            if let Some(image_base64) = &message.image_base64 {
                 let image_id = next_image_id;
                 next_image_id += 1;
                 let marker = format!("[img-{image_id}]");
@@ -424,17 +704,10 @@ pub async fn send_message(
                     format!("{marker}\n{message_content}")
                 };
 
-                match normalize_inline_image_payload(image_uri) {
-                    Ok(raw) => {
-                        image_data.push(ImageData {
-                            data: raw,
-                            id: image_id,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(image_id, error = %e, "Skipping invalid stored image payload");
-                    }
-                }
+                image_data.push(ImageData {
+                    data: image_base64.clone(),
+                    id: image_id,
+                });
             }
 
             ChatMessage {
@@ -444,30 +717,8 @@ pub async fn send_message(
         })
         .collect();
 
-    let messages = apply_thinking_preference(messages, &profile, show_thinking);
-
-    if normalized_inline_image.is_some() {
-        let openai_messages = messages
-            .iter()
-            .zip(db_messages.iter())
-            .map(|(message, stored)| {
-                let image_payload = stored
-                    .image_base64
-                    .as_deref()
-                    .and_then(|image| normalize_inline_image_payload(image).ok());
-                json!({
-                    "role": if message.role == "assistant" { "assistant" } else { message.role.as_str() },
-                    "content": if image_payload.is_some() {
-                        build_openai_content_parts(
-                            &strip_legacy_image_markers(&message.content),
-                            image_payload.as_deref(),
-                        )
-                    } else {
-                        serde_json::Value::String(message.content.clone())
-                    },
-                })
-            })
-            .collect::<Vec<_>>();
+    if normalized_inline_image.is_some() && profile.family != ModelFamily::Qwen3_5 {
+        let openai_messages = build_openai_messages(&prepared_messages);
 
         {
             let mut s = state.write().await;
@@ -482,11 +733,18 @@ pub async fn send_message(
 
         let generation_started_at = now_rfc3339();
         let generation_started = std::time::Instant::now();
-        let _cancel = begin_generation(
+        let generation = begin_generation(
             state.inner(),
             "gui",
             Some(session_id.clone()),
             model_name.clone(),
+        )
+        .await;
+        append_live_stream_delta_for_request(
+            state.inner(),
+            &generation.request_id,
+            "input",
+            &live_input,
         )
         .await;
         let port = {
@@ -503,18 +761,30 @@ pub async fn send_message(
             "model": model_name,
             "messages": openai_messages,
             "stream": false,
-            "max_tokens": max_tokens.or(profile.default_max_output_tokens),
-            "temperature": temperature.or(profile.default_temperature),
-            "top_p": top_p.or(profile.default_top_p),
-            "top_k": top_k.or(profile.default_top_k),
+            "max_tokens": max_tokens.or(server_defaults.3).or(profile.default_max_output_tokens),
+            "temperature": temperature.or(launch_defaults.temperature).or(server_defaults.0).or(profile.default_temperature),
+            "top_p": top_p.or(launch_defaults.top_p).or(server_defaults.1).or(profile.default_top_p),
+            "top_k": top_k.or(launch_defaults.top_k).or(server_defaults.2).or(profile.default_top_k),
+            "min_p": min_p.or(launch_defaults.min_p).or(profile.default_min_p),
+            "presence_penalty": presence_penalty.or(launch_defaults.presence_penalty).or(profile.default_presence_penalty),
+            "repeat_penalty": repeat_penalty.or(launch_defaults.repeat_penalty),
         });
-        let response = client
-            .chat_completion(&request)
-            .await
-            .map_err(|e| format!("Vision completion failed: {e}"))?;
+        let response = match client.chat_completion(&request).await {
+            Ok(response) => response,
+            Err(error) => {
+                finish_generation_for_request(state.inner(), &generation.request_id, "error").await;
+                return Err(format!("Vision completion failed: {error}"));
+            }
+        };
         let raw_text = openai_response_text(&response);
         if !raw_text.is_empty() {
-            append_live_stream_delta(state.inner(), "raw", &raw_text).await;
+            append_live_stream_delta_for_request(
+                state.inner(),
+                &generation.request_id,
+                "raw",
+                &raw_text,
+            )
+            .await;
         }
         let stripped = if show_thinking == Some(true) {
             crate::normalize::think_strip::strip_control_channel_markers(&raw_text)
@@ -524,9 +794,39 @@ pub async fn send_message(
                 profile.think_tag_style,
             )
         };
-        if !stripped.is_empty() {
-            append_live_stream_delta(state.inner(), "content", &stripped).await;
-            let _ = app.emit("stream-token", &stripped);
+        let reasoning_content = crate::normalize::think_strip::extract_reasoning_content_with_style(
+            &raw_text,
+            profile.think_tag_style,
+        );
+        let presentation_source = crate::normalize::think_strip::strip_think_tags_with_style(
+            &raw_text,
+            profile.think_tag_style,
+        );
+        let (detected_tool_calls, extracted_display_content) =
+            crate::normalize::tool_extract::extract_tool_calls_for_profile(
+                &presentation_source,
+                &profile,
+            );
+        let capability_enforcement = crate::normalize::capability_truth::enforce_tool_calls(
+            detected_tool_calls,
+            extracted_display_content,
+            &crate::normalize::capability_truth::RuntimeCapabilities::desktop_chat(),
+        );
+        let display_content = capability_enforcement.display_text.clone();
+        let stored_content = if capability_enforcement.rejected.is_empty() {
+            stripped.clone()
+        } else {
+            display_content.clone()
+        };
+        if !display_content.is_empty() {
+            append_live_stream_delta_for_request(
+                state.inner(),
+                &generation.request_id,
+                "content",
+                &display_content,
+            )
+            .await;
+            let _ = app.emit("stream-token", &display_content);
         }
         let prompt_tokens = openai_usage_tokens(&response, "prompt_tokens");
         let completion_tokens = openai_usage_tokens(&response, "completion_tokens");
@@ -544,7 +844,7 @@ pub async fn send_message(
                     .loaded_model
                     .clone()
                     .unwrap_or_else(|| "Unknown".to_string()),
-                request_id: String::new(),
+                request_id: generation.request_id.clone(),
                 started_at: generation_started_at,
                 finished_at: now_rfc3339(),
                 elapsed_ms: generation_started.elapsed().as_millis() as u64,
@@ -568,17 +868,48 @@ pub async fn send_message(
                 },
             });
         }
+        let final_status = if generation.cancel.is_cancelled() {
+            "cancelled"
+        } else {
+            "completed"
+        };
+        finish_generation_for_request(state.inner(), &generation.request_id, final_status).await;
         let assistant_message_id = {
             let s = state.read().await;
             let db = s.session_db.lock().map_err(|e| e.to_string())?;
-            db.add_message(&session_id, "user", &content, 0, image_base64.as_deref())
-                .map_err(|e| e.to_string())?;
-            db.add_message(&session_id, "assistant", &stripped, 0, None)
+            db.add_message(&session_id, "assistant", &stored_content, 0, None)
                 .map_err(|e| e.to_string())?
         };
         {
             let s = state.read().await;
             let db = s.session_db.lock().map_err(|e| e.to_string())?;
+            db.update_message_presentation(
+                assistant_message_id,
+                Some(&display_content),
+                (!reasoning_content.trim().is_empty()).then_some(reasoning_content.as_str()),
+            )
+            .map_err(|e| e.to_string())?;
+            for call in &capability_enforcement.accepted {
+                db.add_tool_call(
+                    assistant_message_id,
+                    &call.id,
+                    &call.name,
+                    &call.arguments.to_string(),
+                    None,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            for rejected in &capability_enforcement.rejected {
+                let result = rejected.result_json();
+                db.add_tool_call(
+                    assistant_message_id,
+                    &rejected.call.id,
+                    &rejected.call.name,
+                    &rejected.call.arguments.to_string(),
+                    Some(&result),
+                )
+                .map_err(|e| e.to_string())?;
+            }
             db.update_message_generation_stats(
                 assistant_message_id,
                 completion_tokens.unwrap_or_else(|| {
@@ -590,45 +921,103 @@ pub async fn send_message(
             .map_err(|e| e.to_string())?;
         }
         let _ = app.emit("stream-done", 0.0f64);
-        finish_generation(state.inner(), "completed").await;
-        return Ok(stripped);
+        return Ok(display_content);
     }
 
-    let prompt = render_prompt(&messages, &profile);
-    {
-        let mut s = state.write().await;
-        s.last_prompt = Some(prompt.clone());
-    }
-
-    let request = CompletionRequest {
-        prompt,
-        n_predict: max_tokens
-            .or(profile.default_max_output_tokens)
-            .map(|value| value as i32),
-        temperature: temperature.or(profile.default_temperature),
-        top_p: top_p.or(profile.default_top_p),
-        top_k: top_k.or(profile.default_top_k),
-        min_p: profile.default_min_p,
-        presence_penalty: profile.default_presence_penalty,
-        frequency_penalty: None,
-        repeat_penalty: None,
-        seed,
-        stream: true,
-        stop: profile.stop_markers.clone(),
-        special: true,
-        image_data,
-        grammar: None,
-        json_schema: None,
+    let use_native_chat = profile.family == ModelFamily::Qwen3_5;
+    let (completion_request, native_chat_body) = if use_native_chat {
+        let native_messages = prepared_to_api_messages(&prepared_messages);
+        let (native_messages, _) = crate::api::completions::compact_native_messages_to_fit(
+            &native_messages,
+            context_limit,
+            max_tokens
+                .or(server_defaults.3)
+                .or(profile.default_max_output_tokens),
+            0,
+        )
+        .map_err(|error| error.1 .0.error.message)?;
+        let mut body = json!({
+            "model": model_name,
+            "messages": crate::api::completions::api_messages_to_native_value(&native_messages),
+            "stream": true,
+            "stream_options": { "include_usage": true },
+            "parallel_tool_calls": false,
+            "max_tokens": max_tokens.or(server_defaults.3).or(profile.default_max_output_tokens),
+            "temperature": temperature.or(launch_defaults.temperature).or(server_defaults.0).or(profile.default_temperature),
+            "top_p": top_p.or(launch_defaults.top_p).or(server_defaults.1).or(profile.default_top_p),
+            "top_k": top_k.or(launch_defaults.top_k).or(server_defaults.2).or(profile.default_top_k),
+            "min_p": min_p.or(launch_defaults.min_p).or(profile.default_min_p),
+            "presence_penalty": presence_penalty.or(launch_defaults.presence_penalty).or(profile.default_presence_penalty),
+            "repeat_penalty": repeat_penalty.or(launch_defaults.repeat_penalty).or(Some(1.0_f32)),
+            "seed": seed,
+        });
+        if let Some(object) = body.as_object_mut() {
+            object.retain(|_, value| !value.is_null());
+        }
+        {
+            let mut s = state.write().await;
+            s.last_prompt =
+                Some(serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string()));
+        }
+        (None, Some(body))
+    } else {
+        let prompt = render_prompt(&messages, &profile);
+        {
+            let mut s = state.write().await;
+            s.last_prompt = Some(prompt.clone());
+        }
+        (
+            Some(CompletionRequest {
+                prompt,
+                n_predict: max_tokens
+                    .or(server_defaults.3)
+                    .or(profile.default_max_output_tokens)
+                    .map(|value| value as i32),
+                temperature: temperature
+                    .or(launch_defaults.temperature)
+                    .or(server_defaults.0)
+                    .or(profile.default_temperature),
+                top_p: top_p
+                    .or(launch_defaults.top_p)
+                    .or(server_defaults.1)
+                    .or(profile.default_top_p),
+                top_k: top_k
+                    .or(launch_defaults.top_k)
+                    .or(server_defaults.2)
+                    .or(profile.default_top_k),
+                min_p: min_p.or(launch_defaults.min_p).or(profile.default_min_p),
+                presence_penalty: presence_penalty
+                    .or(launch_defaults.presence_penalty)
+                    .or(profile.default_presence_penalty),
+                frequency_penalty: None,
+                repeat_penalty: repeat_penalty.or(launch_defaults.repeat_penalty),
+                seed,
+                stream: true,
+                stop: profile.stop_markers.clone(),
+                special: true,
+                image_data,
+                grammar: None,
+                json_schema: None,
+            }),
+            None,
+        )
     };
 
     let generation_started_at = now_rfc3339();
     let generation_started = std::time::Instant::now();
 
-    let cancel = begin_generation(
+    let generation = begin_generation(
         state.inner(),
         "gui",
         Some(session_id.clone()),
         model_name.clone(),
+    )
+    .await;
+    append_live_stream_delta_for_request(
+        state.inner(),
+        &generation.request_id,
+        "input",
+        &live_input,
     )
     .await;
 
@@ -642,14 +1031,41 @@ pub async fn send_message(
     };
     let _permit = scheduler.acquire().await;
     let client = LlamaClient::new(port);
-    let response = client
-        .complete_stream(&request)
-        .await
-        .map_err(|e| format!("Completion failed: {e}"))?;
+    let response = match if let Some(body) = native_chat_body.as_ref() {
+        client.chat_completion_response(body).await
+    } else {
+        client
+            .complete_stream(
+                completion_request
+                    .as_ref()
+                    .expect("completion request should exist for compatibility route"),
+            )
+            .await
+    } {
+        Ok(response) => response,
+        Err(error) => {
+            finish_generation_for_request(state.inner(), &generation.request_id, "error").await;
+            return Err(format!("Completion failed: {error}"));
+        }
+    };
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        finish_generation_for_request(state.inner(), &generation.request_id, "error").await;
+        return Err(format!(
+            "llama-server native chat returned {status}: {body}"
+        ));
+    }
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let stream_cancel = generation.cancel.clone();
     tokio::spawn(async move {
-        let _ = streaming::consume_sse_stream(response, tx, cancel).await;
+        let result = if use_native_chat {
+            streaming::consume_chat_sse_stream(response, tx, stream_cancel).await
+        } else {
+            streaming::consume_sse_stream(response, tx, stream_cancel).await
+        };
+        let _ = result;
     });
 
     let mut full_text = String::new();
@@ -658,22 +1074,62 @@ pub async fn send_message(
     let mut tokens_evaluated = None;
     let mut decode_tokens_per_second = None;
     let mut prompt_tokens_per_second = None;
+    let mut output_gate = crate::normalize::capability_truth::ToolOutputStreamGate::default();
 
     while let Some(event) = rx.recv().await {
         match event {
             StreamEvent::RawDelta(raw) => {
-                append_live_stream_delta(state.inner(), "raw", &raw).await;
+                append_live_stream_delta_for_request(
+                    state.inner(),
+                    &generation.request_id,
+                    "raw",
+                    &raw,
+                )
+                .await;
             }
             StreamEvent::Token(token) => {
-                append_live_stream_delta(state.inner(), "content", &token).await;
-                let _ = app.emit("stream-token", &token);
+                if let Some(visible) = output_gate.push(&token) {
+                    append_live_stream_delta_for_request(
+                        state.inner(),
+                        &generation.request_id,
+                        "content",
+                        &visible,
+                    )
+                    .await;
+                    let _ = app.emit("stream-token", &visible);
+                } else {
+                    append_live_stream_delta_for_request(
+                        state.inner(),
+                        &generation.request_id,
+                        "content_buffered",
+                        &token,
+                    )
+                    .await;
+                }
                 tokio::task::yield_now().await;
             }
             StreamEvent::ReasoningDelta(reasoning) => {
                 reasoning_text.push_str(&reasoning);
-                append_live_stream_delta(state.inner(), "reasoning", &reasoning).await;
-                let _ = app.emit("stream-thinking", &reasoning);
+                append_live_stream_delta_for_request(
+                    state.inner(),
+                    &generation.request_id,
+                    "reasoning",
+                    &reasoning,
+                )
+                .await;
+                if show_thinking == Some(true) {
+                    let _ = app.emit("stream-thinking", &reasoning);
+                }
                 tokio::task::yield_now().await;
+            }
+            StreamEvent::ToolCallDelta(tool_call) => {
+                append_live_stream_delta_for_request(
+                    state.inner(),
+                    &generation.request_id,
+                    "tool_call",
+                    &tool_call,
+                )
+                .await;
             }
             StreamEvent::Done {
                 full_text: text,
@@ -686,21 +1142,44 @@ pub async fn send_message(
                 full_text = text;
                 tokens_predicted = Some(predicted);
                 tokens_evaluated = Some(evaluated);
-                decode_tokens_per_second = Some(decode_tps);
+                let elapsed_seconds = generation_started.elapsed().as_secs_f64();
+                let resolved_decode_tps = if decode_tps.is_finite() && decode_tps > 0.0 {
+                    decode_tps
+                } else if predicted > 0 && elapsed_seconds > 0.0 {
+                    // Native OpenAI streams may omit llama.cpp timing extensions.
+                    // Report measured request throughput instead of a false 0.0.
+                    predicted as f64 / elapsed_seconds
+                } else {
+                    0.0
+                };
+                decode_tokens_per_second =
+                    (resolved_decode_tps > 0.0).then_some(resolved_decode_tps);
                 prompt_tokens_per_second = prompt_tps;
-                let _ = app.emit("stream-done", decode_tps);
                 break;
             }
             StreamEvent::Error(error) => {
-                append_live_stream_delta(state.inner(), "error", &error).await;
+                append_live_stream_delta_for_request(
+                    state.inner(),
+                    &generation.request_id,
+                    "error",
+                    &error,
+                )
+                .await;
                 let _ = app.emit("stream-error", &error);
-                finish_generation(state.inner(), "error").await;
+                finish_generation_for_request(state.inner(), &generation.request_id, "error").await;
                 return Err(error);
             }
         }
     }
 
-    let stripped = if show_thinking == Some(true) {
+    let final_status = if generation.cancel.is_cancelled() {
+        "cancelled"
+    } else {
+        "completed"
+    };
+    finish_generation_for_request(state.inner(), &generation.request_id, final_status).await;
+
+    let stripped = if show_thinking == Some(true) && profile.family != ModelFamily::Qwen3_5 {
         crate::normalize::think_strip::strip_control_channel_markers(&full_text)
     } else {
         crate::normalize::think_strip::strip_think_tags_with_style(
@@ -708,6 +1187,37 @@ pub async fn send_message(
             profile.think_tag_style,
         )
     };
+    let presentation_source = crate::normalize::think_strip::strip_think_tags_with_style(
+        &full_text,
+        profile.think_tag_style,
+    );
+    let (detected_tool_calls, extracted_display_content) =
+        crate::normalize::tool_extract::extract_tool_calls_for_profile(
+            &presentation_source,
+            &profile,
+        );
+    let capability_enforcement = crate::normalize::capability_truth::enforce_tool_calls(
+        detected_tool_calls,
+        extracted_display_content,
+        &crate::normalize::capability_truth::RuntimeCapabilities::desktop_chat(),
+    );
+    let display_content = capability_enforcement.display_text.clone();
+    let stored_content = if capability_enforcement.rejected.is_empty() {
+        stripped.clone()
+    } else {
+        display_content.clone()
+    };
+    if output_gate.should_emit_final() && !display_content.is_empty() {
+        append_live_stream_delta_for_request(
+            state.inner(),
+            &generation.request_id,
+            "content",
+            &display_content,
+        )
+        .await;
+        let _ = app.emit("stream-token", &display_content);
+    }
+    let _ = app.emit("stream-done", decode_tokens_per_second.unwrap_or_default());
     let parse_trace = crate::normalize::parse_trace::build_parse_trace(
         &profile,
         &full_text,
@@ -722,15 +1232,40 @@ pub async fn send_message(
     let assistant_message_id = {
         let s = state.read().await;
         let db = s.session_db.lock().map_err(|e| e.to_string())?;
-        db.add_message(&session_id, "user", &content, 0, image_base64.as_deref())
-            .map_err(|e| e.to_string())?;
-        db.add_message(&session_id, "assistant", &stripped, 0, None)
+        db.add_message(&session_id, "assistant", &stored_content, 0, None)
             .map_err(|e| e.to_string())?
     };
 
     {
         let s = state.read().await;
         let db = s.session_db.lock().map_err(|e| e.to_string())?;
+        db.update_message_presentation(
+            assistant_message_id,
+            Some(&display_content),
+            (!reasoning_text.trim().is_empty()).then_some(reasoning_text.as_str()),
+        )
+        .map_err(|e| e.to_string())?;
+        for call in &capability_enforcement.accepted {
+            db.add_tool_call(
+                assistant_message_id,
+                &call.id,
+                &call.name,
+                &call.arguments.to_string(),
+                None,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        for rejected in &capability_enforcement.rejected {
+            let result = rejected.result_json();
+            db.add_tool_call(
+                assistant_message_id,
+                &rejected.call.id,
+                &rejected.call.name,
+                &rejected.call.arguments.to_string(),
+                Some(&result),
+            )
+            .map_err(|e| e.to_string())?;
+        }
         let predicted = tokens_predicted.unwrap_or_else(|| (stripped.len() as u32 / 4).max(1));
         db.update_message_generation_stats(
             assistant_message_id,
@@ -749,7 +1284,7 @@ pub async fn send_message(
                 .loaded_model
                 .clone()
                 .unwrap_or_else(|| "Unknown".to_string()),
-            request_id: String::new(),
+            request_id: generation.request_id.clone(),
             started_at: generation_started_at,
             finished_at: now_rfc3339(),
             elapsed_ms: generation_started.elapsed().as_millis() as u64,
@@ -774,19 +1309,17 @@ pub async fn send_message(
         });
     }
 
-    finish_generation(state.inner(), "completed").await;
     tokio::spawn(schedule_context_follow_up(
         state.inner().clone(),
         session_id,
     ));
 
-    Ok(stripped)
+    Ok(display_content)
 }
 
 #[tauri::command]
 pub async fn stop_generation(state: tauri::State<'_, SharedState>) -> Result<(), String> {
     let count = cancel_all_generations(state.inner()).await;
-    finish_generation(state.inner(), "cancelled").await;
     tracing::info!(count, "stop_generation: cancellation token fired");
     Ok(())
 }

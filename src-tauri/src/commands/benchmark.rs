@@ -1,6 +1,9 @@
 //! Tauri command for model benchmarking
 
-use crate::engine::benchmark::{test_model, ModelTestStats};
+use crate::engine::benchmark::{
+    test_agent_tool_loop, test_model, BenchmarkRuntimeStats, BenchmarkSamplingSettings,
+    ModelTestStats,
+};
 use crate::state::SharedState;
 use std::time::Duration;
 use tauri::State;
@@ -78,44 +81,71 @@ async fn mark_benchmark_crash_if_needed(shared_state: &SharedState) -> Option<St
     }
 }
 
-#[tauri::command]
-pub async fn run_model_test(
-    shared_state: State<'_, SharedState>,
-    model_name: String,
+async fn load_benchmark_model(
+    shared: SharedState,
+    model_name: &str,
     context_size: u32,
-    prompt: String,
-    max_tokens: u32,
-    temperature: Option<f32>,
-    top_p: Option<f32>,
-    top_k: Option<i32>,
-    seed: Option<i64>,
-) -> Result<ModelTestStats, String> {
+    spec_type: Option<String>,
+    spec_draft_n_max: Option<u32>,
+) -> Result<(u128, bool, BenchmarkRuntimeStats), String> {
     let load_start = std::time::Instant::now();
-    let shared = shared_state.inner().clone();
-    let possibly_reused = {
+    let (possibly_reused, benchmark_spec_type, benchmark_spec_draft_n_max) = {
         let s = shared.read().await;
+        let supports_self_mtp = s
+            .model_registry
+            .list()
+            .iter()
+            .find(|model| benchmark_model_names_match(&model.filename, model_name))
+            .map(|model| crate::models::gguf::has_mtp_tensors(&model.path))
+            .unwrap_or(false);
+        // A null spec candidate means benchmark-controlled auto detection, not
+        // "inherit whatever speculative settings happen to be active globally".
+        let (benchmark_spec_type, benchmark_spec_draft_n_max, expected_spec_type, expected_n) =
+            match spec_type {
+                Some(value) => {
+                    let n = spec_draft_n_max.unwrap_or(0);
+                    (Some(value.clone()), Some(n), value, n)
+                }
+                None if supports_self_mtp => {
+                    (Some(String::new()), Some(0), "draft-mtp".to_string(), 2)
+                }
+                None => (Some(String::new()), Some(0), String::new(), 0),
+            };
         let model_matches = s.loaded_model.as_deref().map_or(false, |loaded| {
-            benchmark_model_names_match(loaded, &model_name)
+            benchmark_model_names_match(loaded, model_name)
         });
         let context_ok = s
             .model_stats
             .as_ref()
-            .map_or(false, |stats| stats.context_size >= context_size);
-        model_matches
+            .map_or(false, |stats| stats.context_size == context_size);
+        let runtime_ok = s.last_launch_preview.as_ref().map_or(false, |preview| {
+            preview.spec_type == expected_spec_type && preview.spec_draft_n_max == expected_n
+        });
+        let possibly_reused = model_matches
             && context_ok
+            && runtime_ok
             && matches!(
                 s.process.state(),
                 crate::engine::process::ProcessState::Running
-            )
+            );
+        (
+            possibly_reused,
+            benchmark_spec_type,
+            benchmark_spec_draft_n_max,
+        )
     };
     let load_result = tokio::time::timeout(
         Duration::from_secs(BENCHMARK_LOAD_TIMEOUT_SECS),
         crate::commands::model::backend_load_model_with_overrides(
             shared.clone(),
-            model_name.clone(),
+            model_name.to_string(),
             Some(context_size),
             crate::commands::model::RuntimeLoadOverrides {
                 attach_mmproj: Some(false),
+                draft_model_path: Some(String::new()),
+                spec_type: benchmark_spec_type,
+                spec_draft_n_max: benchmark_spec_draft_n_max,
+                force_reload: !possibly_reused,
                 ..Default::default()
             },
         ),
@@ -128,7 +158,6 @@ pub async fn run_model_test(
     })?;
 
     load_result.map_err(|e| format!("Model load failed before benchmark: {e}"))?;
-
     if let Some(crash) = mark_benchmark_crash_if_needed(&shared).await {
         return Err(crash);
     }
@@ -136,6 +165,75 @@ pub async fn run_model_test(
     let elapsed_load_ms = load_start.elapsed().as_millis();
     let load_reused = possibly_reused && elapsed_load_ms < 1_000;
     let load_ms = if load_reused { 0 } else { elapsed_load_ms };
+    let runtime = {
+        let s = shared.read().await;
+        s.last_launch_preview
+            .as_ref()
+            .map(|preview| BenchmarkRuntimeStats {
+                spec_type: preview.spec_type.clone(),
+                spec_draft_n_max: preview.spec_draft_n_max,
+                launch_args: preview.args.clone(),
+            })
+            .unwrap_or_default()
+    };
+    Ok((load_ms, load_reused, runtime))
+}
+
+fn benchmark_sampling(
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<i32>,
+    min_p: Option<f32>,
+    presence_penalty: Option<f32>,
+    repeat_penalty: Option<f32>,
+    seed: Option<i64>,
+) -> BenchmarkSamplingSettings {
+    BenchmarkSamplingSettings {
+        temperature,
+        top_p,
+        top_k,
+        min_p,
+        presence_penalty,
+        repeat_penalty,
+        seed,
+    }
+}
+
+#[tauri::command]
+pub async fn run_model_test(
+    shared_state: State<'_, SharedState>,
+    model_name: String,
+    context_size: u32,
+    prompt: String,
+    max_tokens: u32,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<i32>,
+    min_p: Option<f32>,
+    presence_penalty: Option<f32>,
+    repeat_penalty: Option<f32>,
+    seed: Option<i64>,
+    spec_type: Option<String>,
+    spec_draft_n_max: Option<u32>,
+) -> Result<ModelTestStats, String> {
+    let shared = shared_state.inner().clone();
+    let (load_ms, load_reused, runtime) = load_benchmark_model(
+        shared.clone(),
+        &model_name,
+        context_size,
+        spec_type,
+        spec_draft_n_max,
+    )
+    .await?;
+    let sampling = benchmark_sampling(
+        temperature,
+        top_p,
+        top_k,
+        min_p,
+        presence_penalty,
+        repeat_penalty,
+        seed,
+    );
 
     let test_result = tokio::time::timeout(
         Duration::from_secs(BENCHMARK_TEST_TIMEOUT_SECS),
@@ -147,10 +245,8 @@ pub async fn run_model_test(
             load_reused,
             &prompt,
             max_tokens,
-            temperature,
-            top_p,
-            top_k,
-            seed,
+            sampling,
+            runtime,
         ),
     )
     .await;
@@ -169,6 +265,73 @@ pub async fn run_model_test(
             Err(crash.unwrap_or_else(|| {
                 format!(
                     "Model test timed out after {BENCHMARK_TEST_TIMEOUT_SECS}s. Try lower context, fewer output tokens, or a smaller quant."
+                )
+            }))
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn run_agent_tool_loop(
+    shared_state: State<'_, SharedState>,
+    model_name: String,
+    context_size: u32,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
+    top_k: Option<i32>,
+    min_p: Option<f32>,
+    presence_penalty: Option<f32>,
+    repeat_penalty: Option<f32>,
+    seed: Option<i64>,
+    spec_type: Option<String>,
+    spec_draft_n_max: Option<u32>,
+) -> Result<ModelTestStats, String> {
+    let shared = shared_state.inner().clone();
+    let (load_ms, load_reused, runtime) = load_benchmark_model(
+        shared.clone(),
+        &model_name,
+        context_size,
+        spec_type,
+        spec_draft_n_max,
+    )
+    .await?;
+    let sampling = benchmark_sampling(
+        temperature,
+        top_p,
+        top_k,
+        min_p,
+        presence_penalty,
+        repeat_penalty,
+        seed,
+    );
+    let result = tokio::time::timeout(
+        Duration::from_secs(BENCHMARK_TEST_TIMEOUT_SECS),
+        test_agent_tool_loop(
+            shared.clone(),
+            &model_name,
+            context_size,
+            Some(load_ms),
+            load_reused,
+            sampling,
+            runtime,
+        ),
+    )
+    .await;
+
+    match result {
+        Ok(Ok(stats)) => Ok(stats),
+        Ok(Err(error)) => {
+            if let Some(crash) = mark_benchmark_crash_if_needed(&shared).await {
+                Err(crash)
+            } else {
+                Err(format!("Agent tool loop failed: {error}"))
+            }
+        }
+        Err(_) => {
+            let crash = mark_benchmark_crash_if_needed(&shared).await;
+            Err(crash.unwrap_or_else(|| {
+                format!(
+                    "Agent tool loop timed out after {BENCHMARK_TEST_TIMEOUT_SECS}s. Try lower context or a faster sampling/runtime setting."
                 )
             }))
         }

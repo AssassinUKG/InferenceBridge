@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { emit } from "@tauri-apps/api/event";
+import { Cpu, FolderOpen, Network, Plug, Power, Search, SlidersHorizontal } from "lucide-react";
 import type { ApiAccessInfo, ApiServerAction, AppSettings, LlamaServerInfo, LoadProgress, ProcessStatusInfo, RuntimeDoctorReport, RuntimePackInfo, TemplateDryRunReport } from "../../lib/types";
 import * as api from "../../lib/tauri";
 import { formatCliArgs, parseCliArgs } from "../../lib/args";
+import { stripStaleThinkingKwargs } from "../../lib/modelLoadProfiles";
 
 interface Props {
   onSaved?: (settings: AppSettings) => void;
@@ -9,7 +12,19 @@ interface Props {
   loadProgress: LoadProgress | null;
   apiAction?: ApiServerAction;
   onSetApiServerRunning: (running: boolean) => void | Promise<void>;
+  runtimeFocusRequest?: number;
 }
+
+const SETTINGS_SECTIONS = [
+  { id: "api", label: "API", icon: Network, keywords: "server host port key network autostart" },
+  { id: "providers", label: "Providers", icon: Plug, keywords: "openai lm studio sglang hugging face provider" },
+  { id: "runtime", label: "Runtime", icon: Cpu, keywords: "llama cpp cuda cpu install update backend" },
+  { id: "inference", label: "Inference", icon: SlidersHorizontal, keywords: "batch context template jinja reasoning speculative gpu threads" },
+  { id: "storage", label: "Model folders", icon: FolderOpen, keywords: "directory folder scan gguf models" },
+  { id: "lifecycle", label: "Lifecycle", icon: Power, keywords: "close exit unload stop" },
+] as const;
+
+type SettingsSectionId = (typeof SETTINGS_SECTIONS)[number]["id"];
 
 // Shared primitives
 
@@ -19,7 +34,7 @@ function SectionPanel({ children }: { children: ReactNode }) {
       style={{
         background: "var(--surface-1)",
         border: "1px solid var(--border)",
-        borderRadius: "10px",
+        borderRadius: "8px",
         overflow: "hidden",
       }}
     >
@@ -34,11 +49,11 @@ function SectionHeader({ title, description }: { title: string; description?: st
       className="px-4 py-3"
       style={{ borderBottom: "1px solid var(--border)" }}
     >
-      <p className="text-xs font-semibold uppercase tracking-widest" style={{ color: "var(--text-2)" }}>
+      <p className="text-sm font-semibold" style={{ color: "var(--text-0)" }}>
         {title}
       </p>
       {description && (
-        <p className="mt-0.5 text-xs" style={{ color: "var(--text-1)" }}>
+        <p className="mt-1 text-xs leading-5" style={{ color: "var(--text-2)" }}>
           {description}
         </p>
       )}
@@ -99,14 +114,14 @@ function FlatInput({
       placeholder={placeholder}
       min={min}
       max={max}
-      className="w-full rounded py-1.5 px-3 text-sm outline-none transition"
+      className="w-full rounded-lg py-1.5 px-3 text-sm outline-none transition"
       style={{
         background: "var(--surface-2)",
         border: "1px solid var(--border)",
         color: "var(--text-0)",
       }}
       onFocus={(e) =>
-        ((e.currentTarget as HTMLInputElement).style.borderColor = "rgba(34,211,238,0.35)")
+        ((e.currentTarget as HTMLInputElement).style.borderColor = "rgba(255,255,255,0.28)")
       }
       onBlur={(e) =>
         ((e.currentTarget as HTMLInputElement).style.borderColor = "var(--border)")
@@ -128,7 +143,7 @@ function FlatSelect({
     <select
       value={value}
       onChange={(e) => onChange(e.target.value)}
-      className="w-full rounded py-1.5 px-3 text-sm outline-none transition"
+      className="w-full rounded-lg py-1.5 px-3 text-sm outline-none transition"
       style={{
         background: "var(--surface-2)",
         border: "1px solid var(--border)",
@@ -149,7 +164,7 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: () => void 
       style={{
         width: "40px",
         height: "22px",
-        background: checked ? "#22d3ee" : "var(--surface-3)",
+        background: checked ? "#f4f4f4" : "var(--surface-3)",
         border: "none",
         cursor: "pointer",
       }}
@@ -161,6 +176,7 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange: () => void 
           height: "16px",
           top: "3px",
           left: checked ? "21px" : "3px",
+          background: checked ? "#171717" : "#ffffff",
         }}
       />
     </button>
@@ -209,11 +225,11 @@ function applyQwenToolReliabilityPreset(settings: AppSettings): AppSettings {
   return {
     ...settings,
     use_jinja: true,
-    template_mode: "repo",
+    template_mode: "builtin",
     template_name: null,
     reasoning_mode: "off",
     reasoning_preserve: false,
-    chat_template_kwargs_json: JSON.stringify({ enable_thinking: false, preserve_thinking: false }),
+    chat_template_kwargs_json: null,
     parallel_slots: 1,
     cont_batching: true,
     flash_attn: true,
@@ -241,10 +257,10 @@ function FlatBtn({
     <button
       onClick={onClick}
       disabled={disabled}
-      className="rounded px-3 py-1.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-50"
+      className="rounded-lg px-3 py-1.5 text-xs font-medium transition disabled:cursor-not-allowed disabled:opacity-50"
       style={
         primary
-          ? { background: "#22d3ee", color: "#0a0a0a", border: "none", cursor: disabled ? "not-allowed" : "pointer" }
+          ? { background: "#f4f4f4", color: "#171717", border: "none", cursor: disabled ? "not-allowed" : "pointer" }
           : {
               background: "var(--surface-2)",
               border: "1px solid var(--border)",
@@ -455,7 +471,16 @@ function RuntimeManager({
             ) : (
               rows.map((pack, index) => {
                 const installing = downloadingBackend === pack.backend;
-                const isLatest = pack.available && !pack.update_available;
+                const isAheadOfStable =
+                  !!pack.installed_version &&
+                  !!pack.latest_version &&
+                  pack.installed_version !== pack.latest_version &&
+                  !pack.update_available;
+                const isLatest =
+                  !!pack.installed_version &&
+                  pack.available &&
+                  !pack.update_available &&
+                  !isAheadOfStable;
                 const installLabel = pack.installed_version ? "Update" : "Install";
                 return (
                   <div key={pack.id} className="px-3 py-3" style={{ borderTop: index === 0 ? "none" : "1px solid var(--border)" }}>
@@ -464,8 +489,12 @@ function RuntimeManager({
                         <div className="flex flex-wrap items-center gap-2">
                           <span className="text-sm font-semibold" style={{ color: "var(--text-0)" }}>{pack.name}</span>
                           {pack.installed_version && <VersionChip value={pack.installed_version} />}
-                          {pack.latest_version && pack.installed_version && pack.latest_version !== pack.installed_version && <span className="text-xs" style={{ color: "var(--text-2)" }}>→</span>}
-                          {pack.latest_version && <VersionChip value={pack.latest_version} />}
+                          {pack.latest_version && pack.installed_version && pack.latest_version !== pack.installed_version && (
+                            <span className="text-xs" style={{ color: "var(--text-2)" }}>
+                              {isAheadOfStable ? "stable" : "->"}
+                            </span>
+                          )}
+                          {pack.latest_version && pack.latest_version !== pack.installed_version && <VersionChip value={pack.latest_version} />}
                         </div>
                         <div className="mt-1 text-xs" style={{ color: "var(--text-1)" }}>{pack.description}</div>
                         {pack.error ? (
@@ -483,8 +512,10 @@ function RuntimeManager({
                         )}
                       </div>
                       <div className="flex shrink-0 items-center gap-3">
-                        {isLatest ? (
-                          <span className="text-xs font-semibold" style={{ color: "#34d399" }}>✓ Latest version</span>
+                        {isAheadOfStable ? (
+                          <span className="text-xs font-semibold" style={{ color: "#8ab4f8" }}>Ahead of stable</span>
+                        ) : isLatest ? (
+                          <span className="text-xs font-semibold" style={{ color: "#34d399" }}>Latest version</span>
                         ) : pack.available ? (
                           <button
                             onClick={() => onInstall(pack.backend)}
@@ -592,8 +623,8 @@ function ApiKeyRow({ value, onChange }: { value: string; onChange: (v: string) =
           </button>
           <button
             onClick={generate}
-            className="rounded px-2.5 py-1.5 text-xs font-medium transition"
-            style={{ background: "#22d3ee", color: "#0a0a0a", border: "none", cursor: "pointer" }}
+            className="rounded-lg px-2.5 py-1.5 text-xs font-medium transition"
+            style={{ background: "#f4f4f4", color: "#171717", border: "none", cursor: "pointer" }}
             onMouseEnter={(e) => ((e.currentTarget as HTMLButtonElement).style.filter = "brightness(1.08)")}
             onMouseLeave={(e) => ((e.currentTarget as HTMLButtonElement).style.filter = "")}
           >
@@ -612,7 +643,9 @@ function ApiKeyRow({ value, onChange }: { value: string; onChange: (v: string) =
 
 // Main component
 
-export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction = null, onSetApiServerRunning }: Props) {
+export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction = null, onSetApiServerRunning, runtimeFocusRequest = 0 }: Props) {
+  const [activeSettingsSection, setActiveSettingsSection] = useState<SettingsSectionId>("api");
+  const [settingsSearch, setSettingsSearch] = useState("");
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [persistedSettings, setPersistedSettings] = useState<AppSettings | null>(null);
   const [accessInfo, setAccessInfo] = useState<ApiAccessInfo | null>(null);
@@ -677,9 +710,13 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
     setRuntimeLoading(true);
     setRuntimeError(null);
     try {
-      setRuntimePacks(await api.listRuntimePacks());
+      const packs = await api.listRuntimePacks();
+      setRuntimePacks(packs);
+      void emit("runtime-packs-refreshed", packs).catch(() => {});
+      return packs;
     } catch (e) {
       setRuntimeError(String(e));
+      return [] as RuntimePackInfo[];
     } finally {
       setRuntimeLoading(false);
     }
@@ -693,9 +730,24 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
     loadRuntimePacks();
   }, [loadSettings, loadApiAccessInfo, loadConfigPath, loadLlamaInfo, loadRuntimePacks]);
 
+  useEffect(() => {
+    if (runtimeFocusRequest <= 0) return;
+    setActiveSettingsSection("runtime");
+    window.requestAnimationFrame(() => {
+      document
+        .getElementById("settings-runtime")
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }, [runtimeFocusRequest]);
+
   const saveSettings = useCallback(async (nextSettings?: AppSettings) => {
     const settingsToSave = nextSettings ?? settings;
     if (!settingsToSave) return false;
+    const staleThinkingKwargs = stripStaleThinkingKwargs(settingsToSave.chat_template_kwargs_json ?? "");
+    if (staleThinkingKwargs.removed) {
+      setError("Template kwargs contain a deprecated thinking override. Remove enable_thinking/reasoning and use Reasoning Mode instead.");
+      return false;
+    }
     setSaving(true);
     setSaved(false);
     try {
@@ -722,9 +774,22 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
       const result = await api.downloadLlamaBuild(backend);
       setDownloadStatus(result);
       await Promise.all([loadLlamaInfo(), loadRuntimePacks()]);
+      void emit("runtime-operation-notice", {
+        tone: "success",
+        title: "Runtime update installed",
+        message: result,
+        action: "settings",
+      }).catch(() => {});
       setTimeout(() => setDownloadStatus(null), 5000);
     } catch (e) {
-      setDownloadStatus(`Error: ${String(e)}`);
+      const message = `Error: ${String(e)}`;
+      setDownloadStatus(message);
+      void emit("runtime-operation-notice", {
+        tone: "error",
+        title: "Runtime update failed",
+        message,
+        action: "settings",
+      }).catch(() => {});
     } finally {
       setDownloadingBackend(null);
     }
@@ -732,8 +797,32 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
 
   const handleUpdate = async () => {
     setDownloadStatus("Checking runtime updates...");
-    await Promise.all([loadLlamaInfo(), loadRuntimePacks()]);
-    setDownloadStatus("Runtime update check complete.");
+    const [, packs] = await Promise.all([loadLlamaInfo(), loadRuntimePacks()]);
+    const update = packs.find(
+      (pack) => pack.update_available && pack.installed_version && pack.latest_version
+    );
+    const differingStable = packs.find(
+      (pack) =>
+        !pack.update_available &&
+        pack.installed_version &&
+        pack.latest_version &&
+        pack.installed_version !== pack.latest_version
+    );
+    const message = update
+      ? `Runtime update ${update.installed_version} -> ${update.latest_version} is available.`
+      : differingStable
+        ? `Installed runtime ${differingStable.installed_version} is ahead of stable ${differingStable.latest_version}; no downgrade is needed.`
+        : "Installed runtimes are up to date.";
+    setDownloadStatus(message);
+    if (!update && !differingStable) {
+      void emit("runtime-operation-notice", {
+        tone: "success",
+        title: "Runtime check complete",
+        message,
+        action: "settings",
+        dedupeKey: `runtime-current:${packs.map((pack) => pack.installed_version ?? "none").join(":")}`,
+      }).catch(() => {});
+    }
     setTimeout(() => setDownloadStatus(null), 3000);
   };
 
@@ -863,6 +952,18 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
   const configuredLmStudioProbe = providerCheck?.providers.find((provider) => provider.id === "lm-studio-configured");
   const configuredSglangProbe = providerCheck?.providers.find((provider) => provider.id === "sglang-configured");
   const configuredOpenAiProbe = providerCheck?.providers.find((provider) => provider.id === "openai-configured");
+  const visibleSettingsSections = SETTINGS_SECTIONS.filter((section) =>
+    `${section.label} ${section.keywords}`
+      .toLowerCase()
+      .includes(settingsSearch.trim().toLowerCase())
+  );
+
+  const openSettingsSection = (section: SettingsSectionId) => {
+    setActiveSettingsSection(section);
+    document
+      .getElementById(`settings-${section}`)
+      ?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
 
   const handleApiServerToggle = async () => {
     if (apiBusy) {
@@ -893,10 +994,47 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
   };
 
   return (
-    <div className="h-full overflow-y-auto">
-      <div className="p-3 flex flex-col gap-3">
+    <div className="flex h-full min-h-0 overflow-hidden bg-[var(--bg)]">
+      <aside className="hidden w-[220px] shrink-0 border-r border-[var(--border)] bg-[var(--surface-0)] p-3 md:block">
+        <div className="relative mb-4">
+          <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-3)]" />
+          <input
+            type="search"
+            value={settingsSearch}
+            onChange={(event) => setSettingsSearch(event.target.value)}
+            placeholder="Search settings"
+            className="ib-field w-full pl-9"
+          />
+        </div>
+        <div className="mb-2 px-2 text-[11px] font-medium text-[var(--text-3)]">InferenceBridge</div>
+        <nav className="space-y-0.5" aria-label="Settings sections">
+          {visibleSettingsSections.map((section) => {
+            const Icon = section.icon;
+            return (
+              <button
+                key={section.id}
+                type="button"
+                onClick={() => openSettingsSection(section.id)}
+                className={`ib-nav-item ${activeSettingsSection === section.id ? "is-active" : ""}`}
+              >
+                <Icon size={16} />
+                <span>{section.label}</span>
+              </button>
+            );
+          })}
+        </nav>
+      </aside>
+
+      <div className="min-h-0 flex-1 overflow-y-auto scroll-smooth">
+        <div className="mx-auto flex max-w-[980px] flex-col gap-4 px-5 py-8 lg:px-10">
+          <div className="mb-2">
+            <h1 className="text-2xl font-semibold text-[var(--text-0)]">
+              {SETTINGS_SECTIONS.find((section) => section.id === activeSettingsSection)?.label ?? "Settings"}
+            </h1>
+          </div>
 
         {/* API Surface */}
+        <div id="settings-api" className="scroll-mt-5">
         <SectionPanel>
           <SectionHeader title="API Surface" description="OpenAI-compatible endpoint for external clients. The desktop UI talks to InferenceBridge directly. Save API changes before starting or retrying the public endpoint." />
 
@@ -1078,8 +1216,10 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
             </>
           )}
         </SectionPanel>
+        </div>
 
         {/* Providers */}
+        <div id="settings-providers" className="scroll-mt-5">
         <SectionPanel>
           <SectionHeader
             title="Providers"
@@ -1264,7 +1404,9 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
             </>
           )}
         </SectionPanel>
+        </div>
 
+        <div id="settings-runtime" className="scroll-mt-5">
         <RuntimeManager
           settings={settings}
           setSettings={setSettings}
@@ -1283,7 +1425,9 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
           onRefresh={() => void handleUpdate()}
           onInstall={(backend) => void handleDownload(backend)}
         />
+        </div>
 
+        <div id="settings-inference" className="scroll-mt-5 flex flex-col gap-4">
         <div className="grid gap-3 xl:grid-cols-2">
           {/* Execution Defaults */}
           <SectionPanel>
@@ -1434,17 +1578,6 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
                 />
               </FieldRow>
               <Divider />
-              <FieldRow label="Defrag Threshold" hint="KV cache defrag (0=off, 0.1=default)">
-                <FlatInput
-                  type="number"
-                  value={settings.defrag_thold}
-                  onChange={(v) => setSettings({ ...settings, defrag_thold: parseFloat(v) || 0 })}
-                  min={0}
-                  max={1}
-                  placeholder="0.1"
-                />
-              </FieldRow>
-              <Divider />
               <FieldRow label="RoPE Scale" hint="--rope-freq-scale (0=auto)">
                 <FlatInput
                   type="number"
@@ -1518,7 +1651,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
                 },
                 {
                   label: "Use Jinja",
-                  hint: "--jinja: let llama.cpp render repo/custom templates",
+                  hint: "--jinja: render the embedded GGUF, repo, or custom chat template",
                   key: "use_jinja" as const,
                 },
               ].map((item, i) => (
@@ -1542,12 +1675,19 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
               ))}
 
               <Divider />
-              <FieldRow label="Reasoning Mode" hint="--reasoning: on, off, or auto (blank = unset)">
-                <FlatInput
+              <FieldRow label="Reasoning Mode" hint="On/off maps to llama-server --reasoning on/off. Auto follows the detected model profile; it does not use deprecated enable_thinking kwargs.">
+                <FlatSelect
                   value={settings.reasoning_mode}
-                  onChange={(v) => setSettings({ ...settings, reasoning_mode: v })}
-                  placeholder="on"
-                />
+                  onChange={(v) => {
+                    const kwargs = stripStaleThinkingKwargs(settings.chat_template_kwargs_json ?? "").value;
+                    setSettings({ ...settings, reasoning_mode: v, chat_template_kwargs_json: kwargs || null });
+                  }}
+                >
+                  <option value="auto">Auto · model profile</option>
+                  <option value="on">On · --reasoning on</option>
+                  <option value="off">Off · --reasoning off</option>
+                  <option value="">Unset</option>
+                </FlatSelect>
               </FieldRow>
               <Divider />
               <div className="flex items-center justify-between px-4 py-3">
@@ -1570,7 +1710,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
                 />
               </div>
               <Divider />
-              <FieldRow label="Template Mode" hint="repo, custom, or builtin">
+              <FieldRow label="Template Mode" hint="builtin uses embedded GGUF Jinja when present; repo/custom explicitly overrides it">
                 <FlatInput
                   value={settings.template_mode}
                   onChange={(v) => setSettings({ ...settings, template_mode: v })}
@@ -1604,7 +1744,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
                 />
               </FieldRow>
               <Divider />
-              <FieldRow label="Template Kwargs JSON" hint="Passed to --chat-template-kwargs">
+              <FieldRow label="Template Kwargs JSON" hint="Passed to --chat-template-kwargs. Do not put thinking/reasoning switches here; use Reasoning Mode.">
                 <FlatInput
                   value={settings.chat_template_kwargs_json ?? ""}
                   onChange={(v) =>
@@ -1613,7 +1753,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
                       chat_template_kwargs_json: v.trim() ? v : null,
                     })
                   }
-                  placeholder='{"preserve_thinking": true}'
+                  placeholder='{"custom_template_option": true}'
                 />
               </FieldRow>
               <Divider />
@@ -1777,8 +1917,10 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
             </div>
           </div>
         </SectionPanel>
+        </div>
 
         {/* Model Directories */}
+        <div id="settings-storage" className="scroll-mt-5">
         <SectionPanel>
           <SectionHeader
             title="Model Directories"
@@ -1837,8 +1979,10 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
             Save settings to apply directory changes and trigger a model re-scan.
           </div>
         </SectionPanel>
+        </div>
 
         {/* Lifecycle */}
+        <div id="settings-lifecycle" className="scroll-mt-5">
         <SectionPanel>
           <SectionHeader title="Lifecycle" />
           <div className="px-4 py-3">
@@ -1850,6 +1994,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
             </p>
           </div>
         </SectionPanel>
+        </div>
 
         {/* Save bar */}
         <div className="flex items-center gap-3 pb-2">
@@ -1869,6 +2014,7 @@ export function SettingsPanel({ onSaved, processStatus, loadProgress, apiAction 
           )}
         </div>
 
+        </div>
       </div>
     </div>
   );

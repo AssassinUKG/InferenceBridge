@@ -1,54 +1,35 @@
 import { MarkdownContent } from "./MarkdownContent";
+import { ReasoningPanel } from "./ReasoningPanel";
 
 interface Props {
   text: string;
   reasoning?: string;
+  onOpenHtml?: (html: string) => void;
 }
 
-export function StreamingText({ text, reasoning = "" }: Props) {
+export function StreamingText({ text, reasoning = "", onOpenHtml }: Props) {
   return (
-    <div className="flex gap-3 px-4 py-3">
-      <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-purple-600/30 text-xs text-purple-300">
-        AI
-      </div>
-
+    <article className="flex gap-3 py-4">
+      <div className="ib-brand-mark mt-0.5 h-7 w-7 text-[9px]">IB</div>
       <div className="min-w-0 flex-1">
-        {reasoning && (
-          <details
-            className="mb-2 rounded border px-3 py-2"
-            style={{
-              borderColor: "rgba(167,139,250,0.2)",
-              background: "rgba(167,139,250,0.05)",
-            }}
-          >
-            <summary className="cursor-pointer text-xs font-medium" style={{ color: "#a78bfa" }}>
-              Thinking
-            </summary>
-            <div className="mt-2 text-xs leading-6" style={{ color: "rgba(196,181,253,0.9)" }}>
-              <MarkdownContent content={reasoning} />
-            </div>
-          </details>
-        )}
-
+        <div className="mb-1 flex items-center gap-2 text-[13px] font-semibold text-[var(--text-0)]">
+          InferenceBridge
+          <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
+        </div>
+        {reasoning && <ReasoningPanel reasoning={reasoning} live />}
         {text ? (
           <div className="relative">
-            <MarkdownContent content={text} />
-            <span
-              className="ml-0.5 inline-block h-3.5 w-2 animate-pulse align-text-bottom"
-              style={{ background: "#60a5fa", borderRadius: "1px", verticalAlign: "text-bottom" }}
-            />
+            <MarkdownContent content={text} onOpenHtml={onOpenHtml} />
+            <span className="ml-1 inline-block h-4 w-1.5 animate-pulse rounded-sm bg-white/70 align-text-bottom" />
           </div>
-        ) : (
-          <div className="flex items-center gap-2 text-sm text-gray-500">
-            <span className="flex gap-1">
-              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-500" style={{ animationDelay: "0ms" }} />
-              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-500" style={{ animationDelay: "150ms" }} />
-              <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-gray-500" style={{ animationDelay: "300ms" }} />
-            </span>
-            <span>Generating...</span>
+        ) : !reasoning ? (
+          <div className="flex h-7 items-center gap-1.5" aria-label="Generating">
+            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[var(--text-2)]" />
+            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[var(--text-2)] [animation-delay:150ms]" />
+            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-[var(--text-2)] [animation-delay:300ms]" />
           </div>
-        )}
+        ) : null}
       </div>
-    </div>
+    </article>
   );
 }

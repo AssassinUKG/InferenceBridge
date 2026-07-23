@@ -9,6 +9,7 @@ pub struct AppConfig {
     pub server: ServerConfig,
     pub models: ModelsConfig,
     pub process: ProcessConfig,
+    pub image_generation: ImageGenerationConfig,
     pub providers: ProvidersConfig,
     pub hub: HubConfig,
     pub ui: UiConfig,
@@ -42,6 +43,59 @@ pub struct ServerConfig {
 pub struct ModelsConfig {
     /// Directories to scan for .gguf model files.
     pub scan_dirs: Vec<PathBuf>,
+}
+
+/// Native image-generation runtime configuration.
+///
+/// This is separate from `ProcessConfig` because image models have multiple
+/// components and a different lifecycle from llama-server chat models.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImageGenerationConfig {
+    /// Capability truth stays false unless this is enabled and validation passes.
+    pub enabled: bool,
+    /// Absolute path to the pinned stable-diffusion.cpp `sd-cli` executable.
+    pub runner_path: String,
+    /// Absolute output directory. Empty uses the app support `images` directory.
+    pub output_dir: String,
+    pub default_bundle: String,
+    pub default_profile: String,
+    /// Warn the UI when a sampled GPU temperature reaches this value.
+    pub warn_temperature_c: f32,
+    /// Do not begin another unattended queued job until temperature is below this.
+    pub cooldown_temperature_c: f32,
+    pub bundles: Vec<ImageModelBundleConfig>,
+    pub profiles: Vec<ImageGenerationProfileConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImageModelBundleConfig {
+    pub id: String,
+    pub name: String,
+    pub architecture: String,
+    pub quantization: String,
+    pub transformer_path: String,
+    pub text_encoder_path: String,
+    pub vae_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImageGenerationProfileConfig {
+    pub id: String,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub steps: u32,
+    pub cfg_scale: f32,
+    pub flow_shift: f32,
+    pub sampling_method: String,
+    /// Negative values reserve that many GiB from currently free VRAM.
+    pub max_vram_gib: f32,
+    pub auto_fit: bool,
+    pub diffusion_flash_attention: bool,
+    pub timeout_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +246,7 @@ impl Default for AppConfig {
             server: ServerConfig::default(),
             models: ModelsConfig::default(),
             process: ProcessConfig::default(),
+            image_generation: ImageGenerationConfig::default(),
             providers: ProvidersConfig::default(),
             hub: HubConfig::default(),
             ui: UiConfig::default(),
@@ -209,7 +264,7 @@ impl Default for ServerConfig {
             default_top_p: None,
             default_top_k: None,
             default_max_tokens: None,
-            default_ctx_size: Some(40960),
+            default_ctx_size: Some(16384),
             tool_argument_repair_enabled: true,
             api_key: None,
         }
@@ -219,6 +274,99 @@ impl Default for ServerConfig {
 impl Default for ModelsConfig {
     fn default() -> Self {
         Self { scan_dirs: vec![] }
+    }
+}
+
+impl Default for ImageGenerationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            runner_path: String::new(),
+            output_dir: String::new(),
+            default_bundle: "qwen-image-2512-q6".to_string(),
+            default_profile: "quality".to_string(),
+            warn_temperature_c: 85.0,
+            cooldown_temperature_c: 70.0,
+            bundles: Vec::new(),
+            profiles: vec![
+                ImageGenerationProfileConfig::preview(),
+                ImageGenerationProfileConfig::quality(),
+                ImageGenerationProfileConfig::max_quality(),
+            ],
+        }
+    }
+}
+
+impl Default for ImageModelBundleConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            architecture: "qwen_image".to_string(),
+            quantization: String::new(),
+            transformer_path: String::new(),
+            text_encoder_path: String::new(),
+            vae_path: String::new(),
+        }
+    }
+}
+
+impl ImageGenerationProfileConfig {
+    fn preview() -> Self {
+        Self {
+            id: "preview".to_string(),
+            name: "Preview".to_string(),
+            width: 512,
+            height: 512,
+            steps: 4,
+            cfg_scale: 2.5,
+            flow_shift: 3.0,
+            sampling_method: "euler".to_string(),
+            max_vram_gib: -1.0,
+            auto_fit: true,
+            diffusion_flash_attention: true,
+            timeout_seconds: 1_800,
+        }
+    }
+
+    fn quality() -> Self {
+        Self {
+            id: "quality".to_string(),
+            name: "Quality".to_string(),
+            width: 1024,
+            height: 1024,
+            steps: 50,
+            cfg_scale: 2.5,
+            flow_shift: 3.0,
+            sampling_method: "euler".to_string(),
+            max_vram_gib: -1.0,
+            auto_fit: true,
+            diffusion_flash_attention: true,
+            timeout_seconds: 5_400,
+        }
+    }
+
+    fn max_quality() -> Self {
+        Self {
+            id: "max_quality".to_string(),
+            name: "Max Quality".to_string(),
+            width: 1328,
+            height: 1328,
+            steps: 50,
+            cfg_scale: 2.5,
+            flow_shift: 3.0,
+            sampling_method: "euler".to_string(),
+            max_vram_gib: -1.0,
+            auto_fit: true,
+            diffusion_flash_attention: true,
+            timeout_seconds: 7_200,
+        }
+    }
+}
+
+impl Default for ImageGenerationProfileConfig {
+    fn default() -> Self {
+        Self::quality()
     }
 }
 
@@ -295,7 +443,9 @@ impl Default for ProcessConfig {
             cont_batching: true,
             parallel_slots: 1,
             main_gpu: 0,
-            defrag_thold: 0.1,
+            // Retained for settings-file compatibility only; current
+            // llama.cpp builds deprecate the corresponding launch flag.
+            defrag_thold: 0.0,
             rope_freq_scale: 0.0,
             fit_mode: String::new(),
             cache_ram_mb: None,

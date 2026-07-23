@@ -4,9 +4,12 @@ use axum::response::{IntoResponse, Json, Response};
 use serde::{Deserialize, Serialize};
 
 use crate::api::completions::{
-    api_tool_call_value, build_chat_request, completion_failure_diagnostics,
-    ensure_runtime_vision_ready, extract_runtime_load_overrides, ApiContentPart, ApiImageUrl,
-    ApiMessage, ApiMessageContent, ChatCompletionRequest, StopParam,
+    api_messages_have_images, api_tool_call_value, build_chat_request, build_native_chat_body,
+    compact_native_messages_to_fit, complete_native_chat_with_live_capture,
+    complete_with_live_capture, completion_failure_diagnostics, ensure_runtime_vision_ready,
+    extract_runtime_load_overrides, native_fixed_prompt_tokens, native_replay_request,
+    uses_native_chat_api, ApiContentPart, ApiImageUrl, ApiMessage, ApiMessageContent,
+    ChatCompletionRequest, StopParam,
 };
 use crate::api::errors::ApiErrorResponse;
 use crate::engine::client::{CompletionResponse, LlamaClient, Timings};
@@ -105,6 +108,14 @@ fn anthropic_to_chat_request(
         messages.extend(anthropic_message_to_api_messages(message)?);
     }
 
+    let mut extra = std::collections::HashMap::new();
+    if let Some(tool_choice) = request.tool_choice.as_ref() {
+        extra.insert(
+            "tool_choice".to_string(),
+            anthropic_tool_choice_to_openai(tool_choice),
+        );
+    }
+
     Ok(ChatCompletionRequest {
         model: request.model,
         messages,
@@ -128,8 +139,27 @@ fn anthropic_to_chat_request(
         reasoning_tokens: None,
         stream_options: None,
         options: None,
-        extra: std::collections::HashMap::new(),
+        extra,
     })
+}
+
+fn anthropic_tool_choice_to_openai(value: &serde_json::Value) -> serde_json::Value {
+    match value.get("type").and_then(serde_json::Value::as_str) {
+        Some("auto") => serde_json::json!("auto"),
+        Some("any") => serde_json::json!("required"),
+        Some("none") => serde_json::json!("none"),
+        Some("tool") => value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(|name| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": { "name": name },
+                })
+            })
+            .unwrap_or_else(|| serde_json::json!("auto")),
+        _ => value.clone(),
+    }
 }
 
 fn anthropic_system_to_text(value: &serde_json::Value) -> Option<String> {
@@ -384,9 +414,19 @@ async fn run_anthropic_chat(
         requested_overrides,
     )
     .await?;
-    let profile = crate::models::overrides::detect_effective_profile(&model_name);
+    let profile = {
+        let s = state.read().await;
+        s.effective_profile_for_model(&model_name)
+    };
 
-    let (server_defaults, scheduler, llama_port, context_limit, tool_argument_repair_enabled) = {
+    let (
+        server_defaults,
+        launch_defaults,
+        scheduler,
+        llama_port,
+        context_limit,
+        tool_argument_repair_enabled,
+    ) = {
         let s = state.read().await;
         (
             (
@@ -395,6 +435,7 @@ async fn run_anthropic_chat(
                 s.config.server.default_top_k,
                 s.config.server.default_max_tokens,
             ),
+            s.active_sampling_defaults(),
             s.request_scheduler.clone(),
             s.process.port(),
             s.model_stats
@@ -412,30 +453,70 @@ async fn run_anthropic_chat(
     let client = LlamaClient::new(llama_port);
     let permit = scheduler.acquire().await;
 
-    let (request, _compaction) = build_chat_request(
-        &profile,
-        req,
-        (
-            &server_defaults.0,
-            &server_defaults.1,
-            &server_defaults.2,
-            &server_defaults.3,
-        ),
-        context_limit,
-        Some(&client),
-    )
-    .await?;
+    let use_native_chat = uses_native_chat_api(&profile);
+    let has_images = api_messages_have_images(&req.messages);
+    let native_compaction = if use_native_chat {
+        Some(compact_native_messages_to_fit(
+            &req.messages,
+            context_limit,
+            req.max_tokens
+                .or(server_defaults.3)
+                .or(profile.default_max_output_tokens),
+            native_fixed_prompt_tokens(&req),
+        )?)
+    } else {
+        None
+    };
+    let native_chat_body = use_native_chat.then(|| {
+        let mut body = build_native_chat_body(
+            &original_request_body,
+            &req,
+            &model_name,
+            &profile,
+            server_defaults,
+            &launch_defaults,
+        );
+        if let Some((messages, _)) = native_compaction.as_ref() {
+            body["messages"] = crate::api::completions::api_messages_to_native_value(messages);
+        }
+        if original_stream {
+            body["stream_options"] = serde_json::json!({ "include_usage": true });
+        }
+        body
+    });
+
+    let (request, _compaction) = if let Some(body) = native_chat_body.as_ref() {
+        (native_replay_request(body), None)
+    } else {
+        build_chat_request(
+            &profile,
+            req,
+            (
+                &server_defaults.0,
+                &server_defaults.1,
+                &server_defaults.2,
+                &server_defaults.3,
+            ),
+            &launch_defaults,
+            context_limit,
+            Some(&client),
+        )
+        .await?
+    };
 
     ensure_runtime_vision_ready(
         &state,
         &model_name,
         &profile,
-        !request.image_data.is_empty(),
+        has_images || !request.image_data.is_empty(),
     )
     .await?;
     {
         let mut s = state.write().await;
-        s.last_prompt = Some(request.prompt.clone());
+        s.last_prompt = Some(match native_chat_body.as_ref() {
+            Some(body) => serde_json::to_string_pretty(body).unwrap_or_else(|_| body.to_string()),
+            None => request.prompt.clone(),
+        });
     }
 
     let generation_started_at = chrono::Utc::now().to_rfc3339();
@@ -448,6 +529,8 @@ async fn run_anthropic_chat(
             state,
             client,
             request,
+            native_chat_body,
+            use_native_chat,
             model_name,
             profile,
             generation_started_at,
@@ -461,7 +544,40 @@ async fn run_anthropic_chat(
         .await;
     }
 
-    let response = match client.complete(&request).await {
+    let buffer_tool_content = requested_tools
+        .as_ref()
+        .map(|tools| !tools.is_empty())
+        .unwrap_or(false);
+    let response_result = if let Some(body) = native_chat_body.as_ref() {
+        complete_native_chat_with_live_capture(
+            &state,
+            &client,
+            body,
+            &model_name,
+            &request_id,
+            "anthropic-api-native-chat",
+            &generation_started_at,
+            generation_started,
+            gen.cancel,
+            buffer_tool_content,
+        )
+        .await
+    } else {
+        complete_with_live_capture(
+            &state,
+            &client,
+            &request,
+            &model_name,
+            &request_id,
+            "api",
+            &generation_started_at,
+            generation_started,
+            gen.cancel,
+            buffer_tool_content,
+        )
+        .await
+    };
+    let response = match response_result {
         Ok(response) => response,
         Err(error) => {
             let diagnostics = completion_failure_diagnostics(&state, &model_name, &error).await;
@@ -479,11 +595,39 @@ async fn run_anthropic_chat(
         tool_argument_repair_enabled,
     )
     .await;
-    append_live_stream_delta_for_request(&state, &request_id, "raw", &response.content).await;
+    let elapsed_ms = generation_started.elapsed().as_millis() as u64;
+    {
+        let mut s = state.write().await;
+        s.last_generation_metrics = Some(crate::state::RuntimePerformanceMetrics {
+            source: "api".to_string(),
+            model: model_name.clone(),
+            request_id: request_id.clone(),
+            started_at: generation_started_at,
+            finished_at: chrono::Utc::now().to_rfc3339(),
+            elapsed_ms,
+            time_to_first_token_ms: None,
+            prompt_tokens: response.tokens_evaluated,
+            completion_tokens: response.tokens_predicted,
+            total_tokens: match (response.tokens_evaluated, response.tokens_predicted) {
+                (Some(prompt), Some(completion)) => Some(prompt + completion),
+                _ => None,
+            },
+            prompt_tokens_per_second: response
+                .timings
+                .as_ref()
+                .and_then(|timings| timings.prompt_per_second),
+            decode_tokens_per_second: response
+                .timings
+                .as_ref()
+                .and_then(|timings| timings.predicted_per_second),
+            end_to_end_tokens_per_second: crate::api::completions::end_to_end_tokens_per_second(
+                response.tokens_predicted,
+                elapsed_ms,
+            ),
+        });
+    }
     finish_api_generation_for_request(&state, &request_id, "completed").await;
     let _ = original_request_body;
-    let _ = generation_started_at;
-    let _ = generation_started;
     let _permit = permit;
     Ok(Json(anthropic).into_response())
 }
@@ -504,8 +648,17 @@ async fn anthropic_response_from_completion(
         &response.content,
         profile.think_tag_style,
     );
-    let (tool_calls, text) =
+    let (detected_tool_calls, extracted_text) =
         crate::normalize::tool_extract::extract_tool_calls_for_profile(&stripped, profile);
+    let capability_enforcement = crate::normalize::capability_truth::enforce_tool_calls(
+        detected_tool_calls,
+        extracted_text,
+        &crate::normalize::capability_truth::RuntimeCapabilities::from_requested_tools(
+            requested_tools.map(Vec::as_slice),
+        ),
+    );
+    let tool_calls = capability_enforcement.accepted;
+    let text = capability_enforcement.display_text;
     let mut content = Vec::new();
     if !reasoning_text.trim().is_empty() {
         content.push(serde_json::json!({
@@ -602,6 +755,8 @@ async fn stream_anthropic_message(
     state: SharedState,
     client: LlamaClient,
     request: crate::engine::client::CompletionRequest,
+    native_chat_body: Option<serde_json::Value>,
+    use_native_chat: bool,
     model_name: String,
     profile: crate::models::profiles::ModelProfile,
     generation_started_at: String,
@@ -612,7 +767,11 @@ async fn stream_anthropic_message(
     permit: RequestPermit,
     tool_argument_repair_enabled: bool,
 ) -> Result<Response, ApiErrorResponse> {
-    let response = match client.complete_stream(&request).await {
+    let response = match if let Some(body) = native_chat_body.as_ref() {
+        client.chat_completion_response(body).await
+    } else {
+        client.complete_stream(&request).await
+    } {
         Ok(response) => response,
         Err(error) => {
             let diagnostics = completion_failure_diagnostics(&state, &model_name, &error).await;
@@ -620,11 +779,24 @@ async fn stream_anthropic_message(
             return Err(ApiErrorResponse::inference_failed(&diagnostics));
         }
     };
+    if !response.status().is_success() {
+        let status = response.status();
+        let response_body = response.text().await.unwrap_or_default();
+        finish_api_generation_for_request(&state, &request_id, "error").await;
+        return Err(ApiErrorResponse::inference_failed(&format!(
+            "llama-server returned {status}: {response_body}"
+        )));
+    }
 
     let stream_cancel = cancel.clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel(64);
     tokio::spawn(async move {
-        let _ = streaming::consume_sse_stream(response, tx, cancel).await;
+        let result = if use_native_chat {
+            streaming::consume_chat_sse_stream(response, tx, cancel).await
+        } else {
+            streaming::consume_sse_stream(response, tx, cancel).await
+        };
+        let _ = result;
     });
 
     let buffer_tool_content = requested_tools
@@ -645,6 +817,8 @@ async fn stream_anthropic_message(
         let mut block_open = false;
         let mut first_token_at: Option<std::time::Instant> = None;
         let mut visible_tokens: u32 = 0;
+        let mut output_gate =
+            crate::normalize::capability_truth::ToolOutputStreamGate::new(buffer_tool_content);
 
         let message_start = serde_json::json!({
             "type": "message_start",
@@ -682,24 +856,34 @@ async fn stream_anthropic_message(
                         first_token_at = Some(std::time::Instant::now());
                     }
                     visible_tokens = visible_tokens.saturating_add(1);
-                    append_live_stream_delta_for_request(
-                        &state_for_stream,
-                        &request_id,
-                        if buffer_tool_content { "content_buffered" } else { "content" },
-                        &token,
-                    ).await;
-                    if !buffer_tool_content {
+                    if let Some(visible) = output_gate.push(&token) {
+                        append_live_stream_delta_for_request(
+                            &state_for_stream,
+                            &request_id,
+                            "content",
+                            &visible,
+                        ).await;
                         let delta = serde_json::json!({
                             "type": "content_block_delta",
                             "index": 0,
-                            "delta": { "type": "text_delta", "text": token }
+                            "delta": { "type": "text_delta", "text": visible }
                         });
                         yield Ok(anthropic_sse("content_block_delta", delta));
+                    } else {
+                        append_live_stream_delta_for_request(
+                            &state_for_stream,
+                            &request_id,
+                            "content_buffered",
+                            &token,
+                        ).await;
                     }
                 }
                 StreamEvent::ReasoningDelta(reasoning) => {
                     raw_full_text.push_str(&reasoning);
                     append_live_stream_delta_for_request(&state_for_stream, &request_id, "reasoning", &reasoning).await;
+                }
+                StreamEvent::ToolCallDelta(tool_call) => {
+                    append_live_stream_delta_for_request(&state_for_stream, &request_id, "tool_call", &tool_call).await;
                 }
                 StreamEvent::Done {
                     full_text,
@@ -710,12 +894,6 @@ async fn stream_anthropic_message(
                     stopped_limit,
                     stop_type,
                 } => {
-                    if block_open {
-                        yield Ok(anthropic_sse("content_block_stop", serde_json::json!({
-                            "type": "content_block_stop",
-                            "index": 0
-                        })));
-                    }
                     let response = CompletionResponse {
                         content: full_text.clone(),
                         stop: true,
@@ -736,22 +914,6 @@ async fn stream_anthropic_message(
                         requested_tools.as_ref(),
                         tool_argument_repair_enabled,
                     ).await;
-
-                    if buffer_tool_content {
-                        for (index, block) in anthropic.content.iter().enumerate() {
-                            yield Ok(anthropic_sse(
-                                "content_block_start",
-                                anthropic_content_block_start_event(index, block),
-                            ));
-                            if let Some(delta) = anthropic_content_block_delta_event(index, block) {
-                                yield Ok(anthropic_sse("content_block_delta", delta));
-                            }
-                            yield Ok(anthropic_sse("content_block_stop", serde_json::json!({
-                                "type": "content_block_stop",
-                                "index": index
-                            })));
-                        }
-                    }
 
                     let elapsed_ms = generation_started.elapsed().as_millis() as u64;
                     {
@@ -776,6 +938,62 @@ async fn stream_anthropic_message(
                         });
                     }
 
+                    // The upstream generation is terminal before the final SSE frames are
+                    // yielded. Record that fact first so dropping the response stream while
+                    // those frames are being drained cannot relabel it as disconnected.
+                    finish_anthropic_stream_generation(
+                        &state_for_stream,
+                        &request_id,
+                        &guard,
+                        "completed",
+                    ).await;
+
+                    if !buffer_tool_content && output_gate.should_emit_final() {
+                        let final_text = anthropic.content.iter()
+                            .filter(|block| {
+                                block.get("type").and_then(serde_json::Value::as_str)
+                                    == Some("text")
+                            })
+                            .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("\n\n");
+                        if !final_text.is_empty() {
+                            append_live_stream_delta_for_request(
+                                &state_for_stream,
+                                &request_id,
+                                "content",
+                                &final_text,
+                            ).await;
+                            yield Ok(anthropic_sse("content_block_delta", serde_json::json!({
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": { "type": "text_delta", "text": final_text }
+                            })));
+                        }
+                    }
+                    if block_open {
+                        yield Ok(anthropic_sse("content_block_stop", serde_json::json!({
+                            "type": "content_block_stop",
+                            "index": 0
+                        })));
+                    }
+
+                    if buffer_tool_content {
+                        for (index, block) in anthropic.content.iter().enumerate() {
+                            yield Ok(anthropic_sse(
+                                "content_block_start",
+                                anthropic_content_block_start_event(index, block),
+                            ));
+                            if let Some(delta) = anthropic_content_block_delta_event(index, block) {
+                                yield Ok(anthropic_sse("content_block_delta", delta));
+                            }
+                            yield Ok(anthropic_sse("content_block_stop", serde_json::json!({
+                                "type": "content_block_stop",
+                                "index": index
+                            })));
+                        }
+                    }
+
                     yield Ok(anthropic_sse("message_delta", serde_json::json!({
                         "type": "message_delta",
                         "delta": {
@@ -787,15 +1005,20 @@ async fn stream_anthropic_message(
                     yield Ok(anthropic_sse("message_stop", serde_json::json!({
                         "type": "message_stop"
                     })));
-                    finish_api_generation_for_request(&state_for_stream, &request_id, "completed").await;
-                    let _ = &guard;
+                    return;
                 }
                 StreamEvent::Error(error) => {
+                    finish_anthropic_stream_generation(
+                        &state_for_stream,
+                        &request_id,
+                        &guard,
+                        "error",
+                    ).await;
                     yield Ok(anthropic_sse("error", serde_json::json!({
                         "type": "error",
                         "error": { "type": "api_error", "message": error }
                     })));
-                    finish_api_generation_for_request(&state_for_stream, &request_id, "error").await;
+                    return;
                 }
             }
         }
@@ -804,6 +1027,16 @@ async fn stream_anthropic_message(
     Ok(Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response())
+}
+
+async fn finish_anthropic_stream_generation(
+    state: &SharedState,
+    request_id: &str,
+    guard: &GenerationDropGuard,
+    status: &str,
+) {
+    guard.mark_completed();
+    finish_api_generation_for_request(state, request_id, status).await;
 }
 
 fn anthropic_sse(event: &str, data: serde_json::Value) -> Event {
@@ -889,8 +1122,16 @@ fn anthropic_content_block_delta_event(
 mod tests {
     use super::{
         anthropic_content_block_delta_event, anthropic_content_block_start_event,
-        anthropic_image_block_to_data_url, anthropic_to_chat_request, AnthropicMessagesRequest,
+        anthropic_image_block_to_data_url, anthropic_to_chat_request,
+        finish_anthropic_stream_generation, AnthropicMessagesRequest,
     };
+    use crate::api::completions::build_native_chat_body;
+    use crate::config::AppConfig;
+    use crate::engine::process::SamplingDefaults;
+    use crate::models::profiles::ModelProfile;
+    use crate::state::{begin_api_generation, AppState, GenerationDropGuard};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
 
     #[test]
     fn translates_anthropic_tools_to_openai_tools() {
@@ -920,6 +1161,36 @@ mod tests {
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["function"]["name"], "get_weather");
         assert_eq!(tools[0]["function"]["parameters"]["required"][0], "city");
+    }
+
+    #[test]
+    fn anthropic_conversion_builds_nonempty_native_messages() {
+        let request: AnthropicMessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "Tess-4-27B-Q4_K_M.gguf",
+            "max_tokens": 64,
+            "messages": [
+                {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "tess"}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "found"}]}
+            ]
+        }))
+        .expect("Anthropic request should deserialize");
+        let chat = match anthropic_to_chat_request(request) {
+            Ok(chat) => chat,
+            Err(_) => panic!("translation should succeed"),
+        };
+        let profile = ModelProfile::detect("Tess-4-27B-Q4_K_M.gguf");
+        let body = build_native_chat_body(
+            &serde_json::json!({}),
+            &chat,
+            "Tess-4-27B-Q4_K_M.gguf",
+            &profile,
+            (None, None, None, None),
+            &SamplingDefaults::default(),
+        );
+
+        assert!(!body["messages"].as_array().unwrap().is_empty());
+        assert_eq!(body["messages"][0]["tool_calls"][0]["id"], "toolu_1");
+        assert_eq!(body["messages"][1]["tool_call_id"], "toolu_1");
     }
 
     #[test]
@@ -954,5 +1225,35 @@ mod tests {
             anthropic_image_block_to_data_url(&block).as_deref(),
             Some("https://example.test/image.png")
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_stream_guard_preserves_anthropic_completion_and_error_statuses() {
+        for terminal_status in ["completed", "error"] {
+            let state = Arc::new(RwLock::new(
+                AppState::new(AppConfig::default()).expect("state should initialize"),
+            ));
+            let generation = begin_api_generation(&state, "test-model".to_string()).await;
+            let request_id = generation.request_id.clone();
+            let cancellation = generation.cancel.clone();
+            let guard =
+                GenerationDropGuard::new(state.clone(), request_id.clone(), generation.cancel);
+
+            finish_anthropic_stream_generation(&state, &request_id, &guard, terminal_status).await;
+            drop(guard);
+            tokio::task::yield_now().await;
+
+            assert!(
+                !cancellation.is_cancelled(),
+                "terminal guard drop must not cancel a finished request"
+            );
+            let state = state.read().await;
+            let stream = state
+                .live_streams
+                .iter()
+                .find(|stream| stream.request_id == request_id)
+                .expect("request stream should remain in history");
+            assert_eq!(stream.status, terminal_status);
+        }
     }
 }

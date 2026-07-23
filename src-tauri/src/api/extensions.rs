@@ -9,16 +9,16 @@ use crate::engine::client::LlamaClient;
 use crate::state::{EffectiveProfileInfo, SharedState};
 
 pub async fn context_status(State(state): State<SharedState>) -> Json<tracker::ContextStatus> {
-    let (loaded, port, stored) = {
+    let (can_poll, port, stored) = {
         let s = state.read().await;
         (
-            s.loaded_model.is_some(),
+            tracker::can_poll_context(s.loaded_model.is_some(), s.process.state()),
             s.process.port(),
             s.last_context_status.clone(),
         )
     };
 
-    if !loaded {
+    if !can_poll {
         return Json(stored.unwrap_or_else(tracker::ContextStatus::empty));
     }
 

@@ -144,11 +144,16 @@ fn normalize_requested_context_size(context_size: Option<u32>) -> Option<u32> {
 
 /// Resolve the context size to pass to llama-server.
 ///
-/// Returns only what was explicitly requested. No defaults, no fallbacks.
-/// If nothing was requested, returns `None` and llama-server uses whatever
-/// the GGUF model metadata specifies.
-fn resolve_launch_context_size(requested_context_size: Option<u32>) -> Option<u32> {
+/// An explicit load/request value wins, followed by the model-specific
+/// practical default, then the generic server fallback.
+fn resolve_launch_context_size(
+    requested_context_size: Option<u32>,
+    profile_default: Option<u32>,
+    server_default: Option<u32>,
+) -> Option<u32> {
     normalize_requested_context_size(requested_context_size)
+        .or_else(|| normalize_requested_context_size(profile_default))
+        .or_else(|| normalize_requested_context_size(server_default))
 }
 
 fn sanitize_hf_cache_segment(value: &str) -> String {
@@ -162,119 +167,6 @@ fn sanitize_hf_cache_segment(value: &str) -> String {
             }
         })
         .collect()
-}
-
-const HF_SIDECAR_MAX_BYTES: usize = 2 * 1024 * 1024;
-const HF_SIDECAR_DEFAULT_FILES: &[&str] = &[
-    "tokenizer_config.json",
-    "config.json",
-    "generation_config.json",
-    "special_tokens_map.json",
-];
-
-fn is_allowed_hf_sidecar_path(path: &str) -> bool {
-    let trimmed = path.trim().trim_start_matches('/');
-    if trimmed.is_empty()
-        || trimmed.contains('\\')
-        || trimmed
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-    {
-        return false;
-    }
-    let filename = std::path::Path::new(trimmed)
-        .file_name()
-        .map(|value| value.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    matches!(
-        filename.as_str(),
-        "chat_template.jinja"
-            | "tokenizer_config.json"
-            | "config.json"
-            | "generation_config.json"
-            | "special_tokens_map.json"
-    )
-}
-
-fn hf_sidecar_cache_path(repo_id: &str, relative_path: &str) -> std::path::PathBuf {
-    crate::config::app_support_dir()
-        .join("hf-sidecars")
-        .join(sanitize_hf_cache_segment(repo_id))
-        .join(relative_path.trim().trim_start_matches('/'))
-}
-
-async fn fetch_hf_small_sidecar(
-    client: &reqwest::Client,
-    repo_id: &str,
-    relative_path: &str,
-    hf_api_key: Option<&str>,
-) -> Result<Option<std::path::PathBuf>, String> {
-    let relative_path = relative_path.trim().trim_start_matches('/');
-    if !is_allowed_hf_sidecar_path(relative_path) {
-        return Err(format!("Blocked non-sidecar HF path: {relative_path}"));
-    }
-
-    let cached_path = hf_sidecar_cache_path(repo_id, relative_path);
-    if cached_path.exists() {
-        return Ok(Some(cached_path));
-    }
-
-    let url = format!(
-        "https://huggingface.co/{}/resolve/main/{}",
-        repo_id.trim(),
-        relative_path
-    );
-    let mut request = client.get(&url);
-    if let Some(key) = hf_api_key.map(str::trim).filter(|value| !value.is_empty()) {
-        request = request.bearer_auth(key);
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|error| format!("Failed to fetch {relative_path} from {repo_id}: {error}"))?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED
-        || response.status() == reqwest::StatusCode::FORBIDDEN
-    {
-        return Err(format!(
-            "{relative_path} requires a Hugging Face token for {repo_id}: HTTP {}",
-            response.status()
-        ));
-    }
-    if !response.status().is_success() {
-        return Err(format!(
-            "Failed to fetch {relative_path} from {repo_id}: HTTP {}",
-            response.status()
-        ));
-    }
-    if let Some(length) = response.content_length() {
-        if length > HF_SIDECAR_MAX_BYTES as u64 {
-            return Err(format!(
-                "Blocked {relative_path} from {repo_id}: {length} bytes exceeds sidecar limit"
-            ));
-        }
-    }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| format!("Failed to read {relative_path} from {repo_id}: {error}"))?;
-    if bytes.len() > HF_SIDECAR_MAX_BYTES {
-        return Err(format!(
-            "Blocked {relative_path} from {repo_id}: {} bytes exceeds sidecar limit",
-            bytes.len()
-        ));
-    }
-    if let Some(parent) = cached_path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|error| format!("Failed to create {}: {error}", parent.display()))?;
-    }
-    tokio::fs::write(&cached_path, bytes)
-        .await
-        .map_err(|error| format!("Failed to write {}: {error}", cached_path.display()))?;
-    Ok(Some(cached_path))
 }
 
 async fn ensure_cached_hf_template(
@@ -329,12 +221,26 @@ async fn ensure_cached_hf_template(
             response.status()
         ));
     }
-
+    if response
+        .content_length()
+        .is_some_and(|length| length > crate::models::sidecars::HF_SIDECAR_MAX_BYTES as u64)
+    {
+        return Err(format!(
+            "Blocked repo chat template from {url}: file exceeds the 2 MiB sidecar limit"
+        ));
+    }
     let body = response
-        .text()
+        .bytes()
         .await
         .map_err(|error| format!("Failed to read template response from {url}: {error}"))?;
-    tokio::fs::write(&cached_path, body)
+    if body.len() > crate::models::sidecars::HF_SIDECAR_MAX_BYTES {
+        return Err(format!(
+            "Blocked repo chat template from {url}: {} bytes exceeds the 2 MiB sidecar limit",
+            body.len()
+        ));
+    }
+    crate::models::sidecars::validate_template(template_relative, &body)?;
+    tokio::fs::write(&cached_path, &body)
         .await
         .map_err(|error| format!("Failed to write {}: {error}", cached_path.display()))?;
     Ok(cached_path)
@@ -392,6 +298,20 @@ async fn resolve_template_selection(
                 .as_deref()
                 .filter(|value| !value.trim().is_empty())
             {
+                if let Some((cached, source_repo, source)) =
+                    crate::models::sidecars::effective_template_cache(
+                        repo_id,
+                        metadata.template_path.as_deref(),
+                    )
+                {
+                    return Ok((
+                        "repo".to_string(),
+                        Some(format!("hf:{source_repo}/{source}")),
+                        Some(cached),
+                        None,
+                        true,
+                    ));
+                }
                 if metadata.has_repo_template {
                     match ensure_cached_hf_template(repo_id, repo_template_path, hf_api_key).await {
                         Ok(cached) => {
@@ -590,32 +510,62 @@ fn classify_api_port_owner(pid: u32, current_pid: u32, name: Option<&str>) -> (S
     } else if lower.contains("inference-bridge") {
         ("inference-bridge".to_string(), true)
     } else if lower.is_empty() {
-        ("ghost".to_string(), true)
+        ("ghost".to_string(), false)
     } else {
         ("other".to_string(), false)
     }
 }
 
+fn api_port_owner_info(pid: u32, current_pid: u32, name: Option<String>) -> ApiPortOwnerInfo {
+    let (kind, killable) = classify_api_port_owner(pid, current_pid, name.as_deref());
+    ApiPortOwnerInfo {
+        pid,
+        name: Some(name.unwrap_or_else(|| "Unknown or stale Windows port owner".to_string())),
+        kind,
+        killable,
+    }
+}
+
+fn recovery_target_matches(
+    requested_pid: u32,
+    expected_kind: &str,
+    owner: &ApiPortOwnerInfo,
+) -> bool {
+    owner.pid == requested_pid && owner.kind == expected_kind
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_api_port_owner, disable_fit_for_explicit_context, effective_api_endpoint,
-        loaded_context_satisfies_request, resolve_launch_context_size,
+        api_port_owner_info, classify_api_port_owner, disable_fit_for_explicit_context,
+        effective_api_endpoint, loaded_context_satisfies_request, recovery_target_matches,
+        resolve_launch_context_size,
     };
 
     #[test]
     fn passes_through_requested_context() {
-        assert_eq!(resolve_launch_context_size(Some(32768)), Some(32768));
+        assert_eq!(
+            resolve_launch_context_size(Some(32768), Some(16384), Some(8192)),
+            Some(32768)
+        );
     }
 
     #[test]
     fn none_when_nothing_requested() {
-        assert_eq!(resolve_launch_context_size(None), None);
+        assert_eq!(resolve_launch_context_size(None, None, None), None);
     }
 
     #[test]
     fn ignores_zero() {
-        assert_eq!(resolve_launch_context_size(Some(0)), None);
+        assert_eq!(resolve_launch_context_size(Some(0), None, None), None);
+    }
+
+    #[test]
+    fn model_default_precedes_generic_server_context() {
+        assert_eq!(
+            resolve_launch_context_size(None, Some(32768), Some(16384)),
+            Some(32768)
+        );
     }
 
     #[test]
@@ -679,11 +629,24 @@ mod tests {
     }
 
     #[test]
-    fn unknown_port_owner_is_reported_as_killable_ghost() {
+    fn unknown_port_owner_is_reported_as_non_killable_ghost() {
         assert_eq!(
             classify_api_port_owner(24_752, 13_080, None),
-            ("ghost".to_string(), true)
+            ("ghost".to_string(), false)
         );
+    }
+
+    #[test]
+    fn unresolved_port_owner_gets_accurate_safe_display_info() {
+        let owner = api_port_owner_info(24_752, 13_080, None);
+
+        assert_eq!(owner.pid, 24_752);
+        assert_eq!(
+            owner.name.as_deref(),
+            Some("Unknown or stale Windows port owner")
+        );
+        assert_eq!(owner.kind, "ghost");
+        assert!(!owner.killable);
     }
 
     #[test]
@@ -692,6 +655,15 @@ mod tests {
             classify_api_port_owner(13_080, 13_080, Some("inference-bridge.exe")),
             ("self".to_string(), false)
         );
+    }
+
+    #[test]
+    fn recovery_refuses_owner_that_changed_from_ghost_to_recognized_process() {
+        let current_owner =
+            api_port_owner_info(24_752, 13_080, Some("inference-bridge.exe".to_string()));
+
+        assert_eq!(current_owner.kind, "inference-bridge");
+        assert!(!recovery_target_matches(24_752, "ghost", &current_owner));
     }
 }
 
@@ -820,13 +792,19 @@ fn effective_profile_info_from_state(
         })
         .ok_or_else(|| "No model is available to resolve an effective profile".to_string())?;
 
+    let canonical_model = state
+        .model_registry
+        .find_by_name(&resolved_model)
+        .map(|model| model.filename.clone())
+        .unwrap_or_else(|| resolved_model.clone());
+
     Ok(EffectiveProfileInfo {
         requested_model: requested_model
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
-        override_entry: effective_override(&resolved_model),
-        profile: detect_effective_profile(&resolved_model),
-        resolved_model: Some(resolved_model),
+        override_entry: effective_override(&canonical_model),
+        profile: state.effective_profile_for_model(&resolved_model),
+        resolved_model: Some(canonical_model),
     })
 }
 
@@ -839,6 +817,24 @@ pub fn get_effective_profile_for_shared(
 
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeLoadOverrides {
+    pub gpu_layers: Option<i32>,
+    pub threads: Option<u32>,
+    pub threads_batch: Option<u32>,
+    pub batch_size: Option<u32>,
+    pub ubatch_size: Option<u32>,
+    pub flash_attn: Option<bool>,
+    pub use_mmap: Option<bool>,
+    pub use_mlock: Option<bool>,
+    pub cont_batching: Option<bool>,
+    pub parallel_slots: Option<u32>,
+    pub main_gpu: Option<i32>,
+    pub defrag_thold: Option<f32>,
+    pub rope_freq_scale: Option<f32>,
+    pub cache_type_k: Option<String>,
+    pub cache_type_v: Option<String>,
+    pub kv_unified: Option<bool>,
+    pub no_warmup: Option<bool>,
+    pub ctx_shift: Option<bool>,
     pub hf_repo: Option<String>,
     pub hf_file: Option<String>,
     pub fit_mode: Option<String>,
@@ -867,6 +863,42 @@ pub struct RuntimeLoadOverrides {
 pub struct RuntimeLoadRequest {
     #[serde(default)]
     pub context_size: Option<u32>,
+    #[serde(default)]
+    pub gpu_layers: Option<i32>,
+    #[serde(default)]
+    pub threads: Option<u32>,
+    #[serde(default)]
+    pub threads_batch: Option<u32>,
+    #[serde(default)]
+    pub batch_size: Option<u32>,
+    #[serde(default)]
+    pub ubatch_size: Option<u32>,
+    #[serde(default)]
+    pub flash_attn: Option<bool>,
+    #[serde(default)]
+    pub use_mmap: Option<bool>,
+    #[serde(default)]
+    pub use_mlock: Option<bool>,
+    #[serde(default)]
+    pub cont_batching: Option<bool>,
+    #[serde(default)]
+    pub parallel_slots: Option<u32>,
+    #[serde(default)]
+    pub main_gpu: Option<i32>,
+    #[serde(default)]
+    pub defrag_thold: Option<f32>,
+    #[serde(default)]
+    pub rope_freq_scale: Option<f32>,
+    #[serde(default)]
+    pub cache_type_k: Option<String>,
+    #[serde(default)]
+    pub cache_type_v: Option<String>,
+    #[serde(default)]
+    pub kv_unified: Option<bool>,
+    #[serde(default)]
+    pub no_warmup: Option<bool>,
+    #[serde(default)]
+    pub ctx_shift: Option<bool>,
     #[serde(default)]
     pub hf_repo: Option<String>,
     #[serde(default)]
@@ -918,6 +950,24 @@ impl RuntimeLoadRequest {
 
     pub fn into_overrides(self) -> RuntimeLoadOverrides {
         RuntimeLoadOverrides {
+            gpu_layers: self.gpu_layers,
+            threads: self.threads,
+            threads_batch: self.threads_batch,
+            batch_size: self.batch_size,
+            ubatch_size: self.ubatch_size,
+            flash_attn: self.flash_attn,
+            use_mmap: self.use_mmap,
+            use_mlock: self.use_mlock,
+            cont_batching: self.cont_batching,
+            parallel_slots: self.parallel_slots,
+            main_gpu: self.main_gpu,
+            defrag_thold: self.defrag_thold,
+            rope_freq_scale: self.rope_freq_scale,
+            cache_type_k: self.cache_type_k,
+            cache_type_v: self.cache_type_v,
+            kv_unified: self.kv_unified,
+            no_warmup: self.no_warmup,
+            ctx_shift: self.ctx_shift,
             hf_repo: self.hf_repo,
             hf_file: self.hf_file,
             fit_mode: self.fit_mode,
@@ -1046,8 +1096,74 @@ pub async fn backend_load_model_with_overrides(
         let mut s = state.write().await;
         let hf_metadata = model.hf_metadata.clone();
         let hf_api_key = s.config.hub.hf_api_key.clone();
-        let ctx = resolve_launch_context_size(context_size.or(s.config.server.default_ctx_size));
+        let architecture = model
+            .gguf_meta
+            .as_ref()
+            .and_then(|meta| meta.architecture.as_deref());
+        let effective_profile = crate::models::overrides::detect_effective_profile_with_arch(
+            &model.filename,
+            architecture,
+        );
+        let ctx = resolve_launch_context_size(
+            context_size,
+            effective_profile.default_context_window,
+            s.config.server.default_ctx_size,
+        );
         let mut process_config = s.config.process.clone();
+        if let Some(gpu_layers) = overrides.gpu_layers {
+            process_config.gpu_layers = gpu_layers;
+        }
+        if let Some(threads) = overrides.threads {
+            process_config.threads = threads;
+        }
+        if let Some(threads_batch) = overrides.threads_batch {
+            process_config.threads_batch = threads_batch;
+        }
+        if let Some(batch_size) = overrides.batch_size {
+            process_config.batch_size = batch_size;
+        }
+        if let Some(ubatch_size) = overrides.ubatch_size {
+            process_config.ubatch_size = ubatch_size;
+        }
+        if let Some(flash_attn) = overrides.flash_attn {
+            process_config.flash_attn = flash_attn;
+        }
+        if let Some(use_mmap) = overrides.use_mmap {
+            process_config.use_mmap = use_mmap;
+        }
+        if let Some(use_mlock) = overrides.use_mlock {
+            process_config.use_mlock = use_mlock;
+        }
+        if let Some(cont_batching) = overrides.cont_batching {
+            process_config.cont_batching = cont_batching;
+        }
+        if let Some(parallel_slots) = overrides.parallel_slots {
+            process_config.parallel_slots = parallel_slots.max(1);
+        }
+        if let Some(main_gpu) = overrides.main_gpu {
+            process_config.main_gpu = main_gpu.max(0);
+        }
+        if let Some(defrag_thold) = overrides.defrag_thold {
+            process_config.defrag_thold = defrag_thold.max(0.0);
+        }
+        if let Some(rope_freq_scale) = overrides.rope_freq_scale {
+            process_config.rope_freq_scale = rope_freq_scale.max(0.0);
+        }
+        if let Some(cache_type_k) = overrides.cache_type_k.as_ref() {
+            process_config.cache_type_k = cache_type_k.trim().to_string();
+        }
+        if let Some(cache_type_v) = overrides.cache_type_v.as_ref() {
+            process_config.cache_type_v = cache_type_v.trim().to_string();
+        }
+        if let Some(kv_unified) = overrides.kv_unified {
+            process_config.kv_unified = kv_unified;
+        }
+        if let Some(no_warmup) = overrides.no_warmup {
+            process_config.no_warmup = no_warmup;
+        }
+        if let Some(ctx_shift) = overrides.ctx_shift {
+            process_config.ctx_shift = ctx_shift;
+        }
         if let Some(fit_mode) = overrides.fit_mode.as_ref() {
             process_config.fit_mode = fit_mode.clone();
         }
@@ -1106,14 +1222,6 @@ pub async fn backend_load_model_with_overrides(
             process_config.extra_args = extra_args.clone();
         }
 
-        let architecture = model
-            .gguf_meta
-            .as_ref()
-            .and_then(|meta| meta.architecture.as_deref());
-        let effective_profile = crate::models::overrides::detect_effective_profile_with_arch(
-            &model.filename,
-            architecture,
-        );
         let mut forced_jinja_for_tool_profile = false;
         if profile_needs_jinja(&effective_profile) && !process_config.use_jinja {
             process_config.use_jinja = true;
@@ -1183,21 +1291,21 @@ pub async fn backend_load_model_with_overrides(
             hf_repo: overrides.hf_repo.clone(),
             hf_file: overrides.hf_file.clone(),
             context_size: ctx,
-            gpu_layers: s.config.process.gpu_layers,
-            threads: s.config.process.threads,
-            threads_batch: s.config.process.threads_batch,
+            gpu_layers: process_config.gpu_layers,
+            threads: process_config.threads,
+            threads_batch: process_config.threads_batch,
             port: 0, // auto-assign ephemeral port at launch
             backend_preference: s.config.process.backend_preference.clone(),
-            batch_size: s.config.process.batch_size,
-            ubatch_size: s.config.process.ubatch_size,
-            flash_attn: s.config.process.flash_attn,
-            use_mmap: s.config.process.use_mmap,
-            use_mlock: s.config.process.use_mlock,
-            cont_batching: s.config.process.cont_batching,
-            parallel_slots: s.config.process.parallel_slots,
-            main_gpu: s.config.process.main_gpu,
-            defrag_thold: s.config.process.defrag_thold,
-            rope_freq_scale: s.config.process.rope_freq_scale,
+            batch_size: process_config.batch_size,
+            ubatch_size: process_config.ubatch_size,
+            flash_attn: process_config.flash_attn,
+            use_mmap: process_config.use_mmap,
+            use_mlock: process_config.use_mlock,
+            cont_batching: process_config.cont_batching,
+            parallel_slots: process_config.parallel_slots,
+            main_gpu: process_config.main_gpu,
+            defrag_thold: process_config.defrag_thold,
+            rope_freq_scale: process_config.rope_freq_scale,
             fit_mode: Some(process_config.fit_mode.clone())
                 .filter(|value| !value.trim().is_empty()),
             cache_ram_mb: process_config.cache_ram_mb,
@@ -1215,12 +1323,12 @@ pub async fn backend_load_model_with_overrides(
                 .clone()
                 .filter(|value| !value.trim().is_empty()),
             extra_args: process_config.extra_args.clone(),
-            cache_type_k: s.config.process.cache_type_k.clone(),
-            cache_type_v: s.config.process.cache_type_v.clone(),
-            kv_unified: s.config.process.kv_unified,
-            no_warmup: s.config.process.no_warmup,
-            ctx_shift: s.config.process.ctx_shift,
-            tensor_split: s.config.process.tensor_split.clone(),
+            cache_type_k: process_config.cache_type_k.clone(),
+            cache_type_v: process_config.cache_type_v.clone(),
+            kv_unified: process_config.kv_unified,
+            no_warmup: process_config.no_warmup,
+            ctx_shift: process_config.ctx_shift,
+            tensor_split: process_config.tensor_split.clone(),
             draft_model_path: process_config.draft_model_path.clone(),
             spec_type: process_config.spec_type.clone(),
             spec_draft_n_max: process_config.spec_draft_n_max,
@@ -1640,6 +1748,9 @@ pub async fn backend_load_model_with_overrides(
         }
         s.loaded_model = Some(model_filename.clone());
         s.process.set_state_running();
+        s.request_scheduler = std::sync::Arc::new(crate::engine::scheduler::RequestScheduler::new(
+            launch_preview.parallel_slots,
+        ));
         s.last_known_good_config = Some(launch_preview);
         s.last_startup_duration_ms = Some(start.elapsed().as_millis() as u64);
     }
@@ -1698,134 +1809,36 @@ pub async fn backend_load_model_with_overrides(
     Ok(result)
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct HfSidecarSyncFile {
-    pub repo_id: String,
-    pub path: String,
-    pub cached_path: Option<String>,
-    pub status: String,
-    pub message: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct HfSidecarSyncSummary {
-    pub models_checked: usize,
-    pub repos_checked: usize,
-    pub files_cached: usize,
-    pub files_skipped: usize,
-    pub files_failed: usize,
-    pub hf_token_configured: bool,
-    pub cache_root: String,
-    pub results: Vec<HfSidecarSyncFile>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct HfSidecarCacheStatus {
-    pub filename: String,
-    pub repo_id: Option<String>,
-    pub template_path: Option<String>,
-    pub template_cached: bool,
-    pub template_cache_path: Option<String>,
-    pub sidecar_cached_count: usize,
-    pub sidecar_expected_count: usize,
-    pub sidecar_cache_dir: Option<String>,
-}
-
-fn hf_template_cache_path(repo_id: &str, template_path: &str) -> std::path::PathBuf {
-    crate::config::app_support_dir()
-        .join("hf-templates")
-        .join(sanitize_hf_cache_segment(repo_id))
-        .join(template_path.trim().trim_start_matches('/'))
-}
-
 #[tauri::command]
 pub async fn get_hf_sidecar_cache_status(
     state: tauri::State<'_, SharedState>,
-) -> Result<Vec<HfSidecarCacheStatus>, String> {
-    let models = {
+) -> Result<Vec<crate::models::sidecars::HfSidecarCacheStatus>, String> {
+    let targets = {
         let s = state.read().await;
         s.model_registry
             .list()
             .iter()
-            .map(|model| (model.filename.clone(), model.hf_metadata.clone()))
+            .map(|model| crate::models::sidecars::SidecarTarget {
+                filename: model.filename.clone(),
+                repo_id: model
+                    .hf_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.repo_id.clone()),
+                preferred_template_path: model
+                    .hf_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.template_path.clone()),
+            })
             .collect::<Vec<_>>()
     };
-
-    let mut statuses = Vec::with_capacity(models.len());
-    for (filename, metadata) in models {
-        let Some(metadata) = metadata else {
-            statuses.push(HfSidecarCacheStatus {
-                filename,
-                repo_id: None,
-                template_path: None,
-                template_cached: false,
-                template_cache_path: None,
-                sidecar_cached_count: 0,
-                sidecar_expected_count: HF_SIDECAR_DEFAULT_FILES.len(),
-                sidecar_cache_dir: None,
-            });
-            continue;
-        };
-        let repo_id = metadata
-            .repo_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        let Some(repo_id_value) = repo_id.as_deref() else {
-            statuses.push(HfSidecarCacheStatus {
-                filename,
-                repo_id: None,
-                template_path: None,
-                template_cached: false,
-                template_cache_path: None,
-                sidecar_cached_count: 0,
-                sidecar_expected_count: HF_SIDECAR_DEFAULT_FILES.len(),
-                sidecar_cache_dir: None,
-            });
-            continue;
-        };
-
-        let template_path = metadata.has_repo_template.then(|| {
-            metadata
-                .template_path
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or("chat_template.jinja")
-                .to_string()
-        });
-        let template_cache = template_path
-            .as_deref()
-            .map(|path| hf_template_cache_path(repo_id_value, path));
-        let sidecar_dir = crate::config::app_support_dir()
-            .join("hf-sidecars")
-            .join(sanitize_hf_cache_segment(repo_id_value));
-        let sidecar_cached_count = HF_SIDECAR_DEFAULT_FILES
-            .iter()
-            .filter(|path| hf_sidecar_cache_path(repo_id_value, path).exists())
-            .count();
-
-        statuses.push(HfSidecarCacheStatus {
-            filename,
-            repo_id,
-            template_path,
-            template_cached: template_cache.as_ref().is_some_and(|path| path.exists()),
-            template_cache_path: template_cache.map(|path| path.display().to_string()),
-            sidecar_cached_count,
-            sidecar_expected_count: HF_SIDECAR_DEFAULT_FILES.len(),
-            sidecar_cache_dir: Some(sidecar_dir.display().to_string()),
-        });
-    }
-
-    Ok(statuses)
+    crate::models::sidecars::get_cache_status(targets)
 }
 
-#[tauri::command]
-pub async fn sync_hf_sidecar_cache(
+async fn selected_sidecar_targets(
     state: tauri::State<'_, SharedState>,
     model_names: Option<Vec<String>>,
-) -> Result<HfSidecarSyncSummary, String> {
-    let (models, hf_api_key) = {
+) -> (Vec<crate::models::sidecars::SidecarTarget>, Option<String>) {
+    {
         let s = state.read().await;
         let requested = model_names.unwrap_or_default();
         let requested_lower = requested
@@ -1840,156 +1853,66 @@ pub async fn sync_hf_sidecar_cache(
                 requested_lower.is_empty()
                     || requested_lower.contains(&model.filename.to_ascii_lowercase())
             })
-            .map(|model| (model.filename.clone(), model.hf_metadata.clone()))
+            .map(|model| crate::models::sidecars::SidecarTarget {
+                filename: model.filename.clone(),
+                repo_id: model
+                    .hf_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.repo_id.clone()),
+                preferred_template_path: model
+                    .hf_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.template_path.clone()),
+            })
             .collect::<Vec<_>>();
         (models, s.config.hub.hf_api_key.clone())
-    };
-    let hf_token_configured = hf_api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_some();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent("InferenceBridge/1.0")
-        .build()
-        .map_err(|error| format!("Failed to create Hugging Face client: {error}"))?;
-
-    let mut results = Vec::new();
-    let mut seen_repos = std::collections::HashSet::new();
-    for (_filename, metadata) in models.iter() {
-        let Some(metadata) = metadata else {
-            continue;
-        };
-        let Some(repo_id) = metadata
-            .repo_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
-            continue;
-        };
-        if !seen_repos.insert(repo_id.to_string()) {
-            continue;
-        }
-
-        let mut paths = Vec::new();
-        if metadata.has_repo_template {
-            paths.push(
-                metadata
-                    .template_path
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or("chat_template.jinja")
-                    .to_string(),
-            );
-        }
-        paths.extend(
-            HF_SIDECAR_DEFAULT_FILES
-                .iter()
-                .map(|value| value.to_string()),
-        );
-        paths.sort();
-        paths.dedup();
-
-        for path in paths {
-            if !is_allowed_hf_sidecar_path(&path) {
-                results.push(HfSidecarSyncFile {
-                    repo_id: repo_id.to_string(),
-                    path,
-                    cached_path: None,
-                    status: "blocked".to_string(),
-                    message: Some(
-                        "Blocked because the path is not an allowed small sidecar file."
-                            .to_string(),
-                    ),
-                });
-                continue;
-            }
-
-            if path.ends_with("chat_template.jinja") {
-                match ensure_cached_hf_template(repo_id, &path, hf_api_key.as_deref()).await {
-                    Ok(cached) => {
-                        results.push(HfSidecarSyncFile {
-                            repo_id: repo_id.to_string(),
-                            path,
-                            cached_path: Some(cached.display().to_string()),
-                            status: "cached".to_string(),
-                            message: None,
-                        });
-                        continue;
-                    }
-                    Err(error) if error.contains("HTTP 404") => {
-                        results.push(HfSidecarSyncFile {
-                            repo_id: repo_id.to_string(),
-                            path,
-                            cached_path: None,
-                            status: "missing".to_string(),
-                            message: Some(error),
-                        });
-                        continue;
-                    }
-                    Err(error) => {
-                        results.push(HfSidecarSyncFile {
-                            repo_id: repo_id.to_string(),
-                            path,
-                            cached_path: None,
-                            status: "failed".to_string(),
-                            message: Some(error),
-                        });
-                        continue;
-                    }
-                }
-            }
-
-            match fetch_hf_small_sidecar(&client, repo_id, &path, hf_api_key.as_deref()).await {
-                Ok(Some(cached)) => results.push(HfSidecarSyncFile {
-                    repo_id: repo_id.to_string(),
-                    path,
-                    cached_path: Some(cached.display().to_string()),
-                    status: "cached".to_string(),
-                    message: None,
-                }),
-                Ok(None) => results.push(HfSidecarSyncFile {
-                    repo_id: repo_id.to_string(),
-                    path,
-                    cached_path: None,
-                    status: "missing".to_string(),
-                    message: None,
-                }),
-                Err(error) => results.push(HfSidecarSyncFile {
-                    repo_id: repo_id.to_string(),
-                    path,
-                    cached_path: None,
-                    status: "failed".to_string(),
-                    message: Some(error),
-                }),
-            }
-        }
     }
+}
 
-    let files_cached = results
-        .iter()
-        .filter(|result| result.status == "cached")
-        .count();
-    let files_skipped = results
-        .iter()
-        .filter(|result| matches!(result.status.as_str(), "missing" | "blocked"))
-        .count();
-    let files_failed = results
-        .iter()
-        .filter(|result| result.status == "failed")
-        .count();
-    Ok(HfSidecarSyncSummary {
-        models_checked: models.len(),
-        repos_checked: seen_repos.len(),
-        files_cached,
-        files_skipped,
-        files_failed,
-        hf_token_configured,
-        cache_root: crate::config::app_support_dir().display().to_string(),
-        results,
-    })
+#[tauri::command]
+pub async fn check_hf_sidecar_updates(
+    state: tauri::State<'_, SharedState>,
+    model_names: Option<Vec<String>>,
+) -> Result<crate::models::sidecars::HfSidecarSyncSummary, String> {
+    let (targets, hf_api_key) = selected_sidecar_targets(state, model_names).await;
+    crate::models::sidecars::update_targets(targets, hf_api_key, false).await
+}
+
+#[tauri::command]
+pub async fn sync_hf_sidecar_cache(
+    state: tauri::State<'_, SharedState>,
+    model_names: Option<Vec<String>>,
+) -> Result<crate::models::sidecars::HfSidecarSyncSummary, String> {
+    let (targets, hf_api_key) = selected_sidecar_targets(state, model_names).await;
+    crate::models::sidecars::update_targets(targets, hf_api_key, true).await
+}
+
+#[tauri::command]
+pub async fn rollback_hf_sidecar_cache(
+    state: tauri::State<'_, SharedState>,
+    model_name: String,
+) -> Result<crate::models::sidecars::HfSidecarRollbackSummary, String> {
+    let target = {
+        let s = state.read().await;
+        let model = s
+            .model_registry
+            .list()
+            .iter()
+            .find(|model| model.filename.eq_ignore_ascii_case(model_name.trim()))
+            .ok_or_else(|| format!("Model not found: {model_name}"))?;
+        crate::models::sidecars::SidecarTarget {
+            filename: model.filename.clone(),
+            repo_id: model
+                .hf_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.repo_id.clone()),
+            preferred_template_path: model
+                .hf_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.template_path.clone()),
+        }
+    };
+    crate::models::sidecars::rollback_target(target)
 }
 
 pub async fn backend_load_model(
@@ -2010,7 +1933,7 @@ pub async fn backend_load_model(
 use crate::config::ProcessConfig;
 use crate::engine::download;
 use crate::engine::process::{LaunchConfig, LaunchPreview, LlamaProcess};
-use crate::models::overrides::{detect_effective_profile, effective_override, HfModelMetadata};
+use crate::models::overrides::{effective_override, HfModelMetadata};
 use crate::models::scanner;
 use crate::state::{
     EffectiveProfileInfo, GenerationRequest, LoadProgress, RuntimePerformanceMetrics, SharedState,
@@ -2047,11 +1970,30 @@ pub async fn list_models(state: tauri::State<'_, SharedState>) -> Result<Vec<Mod
                 .as_deref()
                 .map(|loaded| names_match(loaded, &m.filename))
                 .unwrap_or(false);
+            let active_mmproj_path = is_loaded
+                .then(|| {
+                    last_launch_preview
+                        .as_ref()
+                        .and_then(|preview| preview.mmproj_path.clone())
+                })
+                .flatten();
+            let mmproj_candidate_path = active_mmproj_path.or_else(|| {
+                crate::engine::process::find_mmproj_for_model(&m.path)
+                    .map(|path| path.to_string_lossy().to_string())
+            });
+            let mmproj_available = mmproj_candidate_path.is_some();
             let vision_runtime_ready = is_loaded
                 && last_launch_preview
                     .as_ref()
                     .and_then(|preview| preview.mmproj_path.as_ref())
                     .is_some();
+            let managed_template = m.hf_metadata.as_ref().and_then(|metadata| {
+                let repo_id = metadata.repo_id.as_deref()?;
+                crate::models::sidecars::effective_template_cache(
+                    repo_id,
+                    metadata.template_path.as_deref(),
+                )
+            });
             ModelInfo {
                 filename: m.filename.clone(),
                 path: m.path.to_string_lossy().to_string(),
@@ -2060,6 +2002,7 @@ pub async fn list_models(state: tauri::State<'_, SharedState>) -> Result<Vec<Mod
                 supports_tools,
                 supports_reasoning,
                 supports_vision: m.profile.supports_vision,
+                supports_parallel_tools: m.profile.supports_parallel_tools,
                 context_window: if is_loaded {
                     loaded_context
                 } else {
@@ -2093,6 +2036,15 @@ pub async fn list_models(state: tauri::State<'_, SharedState>) -> Result<Vec<Mod
                     last_launch_preview
                         .as_ref()
                         .map(|preview| preview.template_mode.clone())
+                } else if managed_template.is_some() {
+                    Some("repo".to_string())
+                } else if m
+                    .gguf_meta
+                    .as_ref()
+                    .map(|metadata| metadata.has_chat_template)
+                    .unwrap_or(false)
+                {
+                    Some("builtin".to_string())
                 } else {
                     None
                 },
@@ -2100,18 +2052,31 @@ pub async fn list_models(state: tauri::State<'_, SharedState>) -> Result<Vec<Mod
                     last_launch_preview
                         .as_ref()
                         .and_then(|preview| preview.template_source.clone())
+                } else if let Some((_, source_repo, source)) = managed_template.as_ref() {
+                    Some(format!("hf:{source_repo}/{source}"))
+                } else if m
+                    .gguf_meta
+                    .as_ref()
+                    .map(|metadata| metadata.has_chat_template)
+                    .unwrap_or(false)
+                {
+                    Some("gguf:embedded-jinja".to_string())
                 } else {
                     None
                 },
                 vision_runtime_ready,
+                mmproj_available,
+                mmproj_candidate_path,
                 vision_status: if !m.profile.supports_vision {
                     "Not capable".to_string()
                 } else if vision_runtime_ready {
                     "Vision Ready".to_string()
                 } else if is_loaded {
                     "mmproj Missing".to_string()
+                } else if mmproj_available {
+                    "Vision Ready to load".to_string()
                 } else {
-                    "Vision Capable".to_string()
+                    "mmproj Missing".to_string()
                 },
                 provider_type: "managed_llamacpp".to_string(),
                 provider_name: "Managed llama.cpp".to_string(),
@@ -2189,6 +2154,7 @@ async fn list_active_external_provider_models(state: SharedState) -> Option<Vec<
                     supports_tools: false,
                     supports_reasoning: false,
                     supports_vision: false,
+                    supports_parallel_tools: false,
                     context_window: context,
                     max_context_window: context,
                     max_output_tokens: model.max_output_tokens,
@@ -2205,6 +2171,8 @@ async fn list_active_external_provider_models(state: SharedState) -> Option<Vec<
                     template_mode: None,
                     template_source: Some(provider.name.clone()),
                     vision_runtime_ready: false,
+                    mmproj_available: false,
+                    mmproj_candidate_path: None,
                     vision_status: "Provider managed".to_string(),
                     provider_type: provider.provider_type.clone(),
                     provider_name: provider.name.clone(),
@@ -2755,15 +2723,11 @@ fn detect_api_port_owner_windows(port: u16) -> Option<ApiPortOwnerInfo> {
             continue;
         }
 
-        let name = process_name_for_pid(pid);
-        let (kind, killable) = classify_api_port_owner(pid, current_pid, name.as_deref());
-
-        return Some(ApiPortOwnerInfo {
+        return Some(api_port_owner_info(
             pid,
-            name: name.or_else(|| Some("System / Windows networking".to_string())),
-            kind,
-            killable,
-        });
+            current_pid,
+            process_name_for_pid(pid),
+        ));
     }
 
     None
@@ -2920,7 +2884,11 @@ pub async fn kill_process(pid: u32) -> Result<String, String> {
 }
 
 #[tauri::command]
-pub async fn recover_api_port(pid: u32, port: u16) -> Result<String, String> {
+pub async fn recover_api_port(
+    pid: u32,
+    port: u16,
+    expected_kind: String,
+) -> Result<String, String> {
     let before = detect_api_port_owner(port)
         .ok_or_else(|| format!("No LISTENING owner found on port {port}."))?;
     if before.pid != pid {
@@ -2930,9 +2898,17 @@ pub async fn recover_api_port(pid: u32, port: u16) -> Result<String, String> {
         ));
     }
 
+    if !recovery_target_matches(pid, expected_kind.trim(), &before) {
+        return Err(format!(
+            "Port {port} owner classification changed from {} to {} before recovery. Nothing was terminated; refresh the status and try again.",
+            expected_kind.trim(),
+            before.kind
+        ));
+    }
+
     if before.kind == "ghost" {
         return Err(format!(
-            "Windows reports port {port} is owned by PID {pid}, but that PID does not exist in the process table. This is usually a stale System/HNS/WinNAT/WSL networking listener, not a killable process. Run an elevated PowerShell and execute: `wsl --shutdown; Restart-Service hns -Force; Restart-Service WinNAT -Force`. Then retry InferenceBridge. If Windows still reports the listener after that, restart Windows."
+            "Windows reports port {port} is owned by PID {pid}, but its process name could not be resolved. It may be a stale Windows networking listener or an inaccessible/protected process. InferenceBridge will not terminate it automatically. Run an elevated PowerShell and execute: `wsl --shutdown; Restart-Service hns -Force; Restart-Service WinNAT -Force`. Then retry InferenceBridge. If Windows still reports the listener after that, restart Windows."
         ));
     }
 
@@ -3062,6 +3038,7 @@ pub struct ModelInfo {
     pub supports_tools: bool,
     pub supports_reasoning: bool,
     pub supports_vision: bool,
+    pub supports_parallel_tools: bool,
     pub context_window: Option<u32>,
     pub max_context_window: Option<u32>,
     pub max_output_tokens: Option<u32>,
@@ -3078,6 +3055,8 @@ pub struct ModelInfo {
     pub template_mode: Option<String>,
     pub template_source: Option<String>,
     pub vision_runtime_ready: bool,
+    pub mmproj_available: bool,
+    pub mmproj_candidate_path: Option<String>,
     pub vision_status: String,
     pub provider_type: String,
     pub provider_name: String,

@@ -7,14 +7,14 @@ use serde_json::Value;
 /// Image attached to a completion request (for vision models).
 /// llama-server expects base64-encoded image data (no data-URI prefix) plus an
 /// integer id that is referenced in the prompt as `[img-{id}]`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ImageData {
     pub data: String, // raw base64, no "data:image/...;base64," prefix
     pub id: u32,
 }
 
 /// Request to llama-server's /completion endpoint.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CompletionRequest {
     pub prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -79,6 +79,9 @@ pub struct Timings {
 pub struct SlotInfo {
     pub id: u32,
     pub n_ctx: u32,
+    /// Total tokens currently occupying the slot in newer llama-server builds.
+    #[serde(default)]
+    pub n_prompt_tokens: u32,
     /// May be absent in newer llama-server versions.
     #[serde(default)]
     pub n_past: u32,
@@ -91,6 +94,14 @@ pub struct SlotInfo {
     pub next_token: Option<NextTokenInfo>,
     #[serde(default)]
     pub is_processing: bool,
+}
+
+impl SlotInfo {
+    /// Return current slot occupancy across old, current, and partial schemas.
+    pub fn used_tokens(&self) -> u32 {
+        let decoded = self.next_token.as_ref().map_or(0, |token| token.n_decoded);
+        self.n_prompt_tokens.max(self.n_past).max(decoded)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -243,8 +254,7 @@ impl LlamaClient {
         tokio::time::timeout(
             std::time::Duration::from_secs(NON_STREAM_HTTP_TIMEOUT_SECS),
             async {
-                let url = format!("{}/v1/chat/completions", self.base_url);
-                let resp = self.client.post(&url).json(request).send().await?;
+                let resp = self.chat_completion_response(request).await?;
                 if !resp.status().is_success() {
                     let status = resp.status();
                     let body = resp.text().await.unwrap_or_default();
@@ -260,6 +270,17 @@ impl LlamaClient {
                 NON_STREAM_HTTP_TIMEOUT_SECS
             )
         })?
+    }
+
+    /// Send an OpenAI-compatible chat request without buffering its response.
+    /// This keeps llama.cpp's native multimodal SSE/JSON shape intact for the
+    /// public API proxy while still sharing the configured HTTP connection pool.
+    pub async fn chat_completion_response(
+        &self,
+        request: &serde_json::Value,
+    ) -> Result<reqwest::Response> {
+        let url = format!("{}/v1/chat/completions", self.base_url);
+        Ok(self.client.post(&url).json(request).send().await?)
     }
 
     /// Query slot information for context/KV monitoring.
@@ -307,16 +328,28 @@ mod tests {
             slots[0].next_token.as_ref().map(|token| token.n_decoded),
             Some(669)
         );
+        assert_eq!(slots[0].used_tokens(), 669);
     }
 
     #[test]
     fn deserializes_slot_info_when_next_token_is_object() {
-        let payload = r#"[{"id":0,"n_ctx":4096,"n_past":128,"state":0,"is_processing":true,"next_token":{"n_remain":12,"n_decoded":128}}]"#;
+        let payload = r#"[{"id":0,"n_ctx":4096,"n_past":128,"state":0,"is_processing":true,"next_token":{"n_remain":12,"n_decoded":12}}]"#;
         let slots: Vec<SlotInfo> =
             serde_json::from_str(payload).expect("slot payload should deserialize");
         assert_eq!(
             slots[0].next_token.as_ref().map(|token| token.n_decoded),
-            Some(128)
+            Some(12)
         );
+        assert_eq!(slots[0].used_tokens(), 128);
+    }
+
+    #[test]
+    fn current_slot_schema_uses_total_prompt_tokens_for_context_occupancy() {
+        let payload = r#"[{"id":0,"n_ctx":32768,"n_prompt_tokens":5773,"n_prompt_tokens_processed":5762,"n_prompt_tokens_cache":0,"is_processing":false,"next_token":{"n_remain":4085,"n_decoded":11}}]"#;
+        let slots: Vec<SlotInfo> =
+            serde_json::from_str(payload).expect("current slot payload should deserialize");
+
+        assert_eq!(slots[0].n_prompt_tokens, 5773);
+        assert_eq!(slots[0].used_tokens(), 5773);
     }
 }

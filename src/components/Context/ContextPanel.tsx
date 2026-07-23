@@ -293,10 +293,10 @@ export function ContextPanel({ status, processStatus, gpuStats }: Props) {
               style={{
                 background:
                   processStatus?.api_state === "Running"
-                    ? "rgba(34,211,238,0.1)"
+                    ? "rgba(52,211,153,0.08)"
                     : "rgba(107,114,128,0.12)",
                 border: "1px solid var(--border)",
-                color: processStatus?.api_state === "Running" ? "#22d3ee" : "var(--text-1)",
+                color: processStatus?.api_state === "Running" ? "#34d399" : "var(--text-1)",
               }}
             >
               API {processStatus?.api_state ?? "Unknown"}

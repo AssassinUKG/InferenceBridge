@@ -1,9 +1,41 @@
-import { useState, useRef, useEffect } from "react";
-import type { MessageInfo, ProcessStatusInfo } from "../../lib/types";
-import type { SamplingParams } from "../../lib/tauri";
-import { PRESETS, PRESET_ORDER, modelSupportsThinking, type PresetKey } from "../../lib/presets";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
+import {
+  ArrowUp,
+  Box,
+  ChevronDown,
+  Image as ImageIcon,
+  Paperclip,
+  Plus,
+  RotateCcw,
+  SlidersHorizontal,
+  Square,
+  X,
+} from "lucide-react";
+import type {
+  ImageGenerationProgress,
+  MessageInfo,
+  ModelInfo,
+  ProcessStatusInfo,
+} from "../../lib/types";
+import {
+  cancelImageGeneration,
+  getImageGenerationStatus,
+  type SamplingParams,
+} from "../../lib/tauri";
+import { readSamplingSettings, recommendedLoadPresets } from "../../lib/modelLoadProfiles";
+import { latestAssistantOutputTokens } from "../../lib/chatPresentation";
+import { isNearScrollBottom } from "../../lib/conversationUi";
+import {
+  PRESETS,
+  PRESET_ORDER,
+  modelSupportsThinking,
+} from "../../lib/presets";
+import { Button, IconButton } from "../ui/Controls";
+import { ModelArtwork, modelDisplayName } from "../Model/modelPresentation";
 import { MessageBubble } from "./MessageBubble";
 import { StreamingText } from "./StreamingText";
+import { CanvasPanel, type CanvasVersion } from "./CanvasPanel";
 
 interface Props {
   messages: MessageInfo[];
@@ -15,8 +47,11 @@ interface Props {
   error: string | null;
   hasModel: boolean;
   hasSession: boolean;
-  /** Name of the currently loaded model used to detect thinking support. */
+  sessionId?: string | null;
   loadedModel?: string | null;
+  loadedModelInfo?: ModelInfo | null;
+  modelPickerOpen?: boolean;
+  loadedModelVisionConfigured?: boolean;
   loadedModelSupportsVision?: boolean;
   loadedModelVisionStatusText?: string | null;
   onSend: (
@@ -26,7 +61,17 @@ interface Props {
     showThinking?: boolean | null
   ) => void;
   onStop: () => void;
+  canCreateSession: boolean;
+  creatingSession: boolean;
+  onCreateSession: () => void;
+  onOpenModelPicker: (trigger: HTMLElement | null) => void;
 }
+
+const suggestionPrompts = [
+  "Explain this error and suggest a fix",
+  "Draft a robust tool-call schema",
+  "Help me compare two implementation options",
+];
 
 export function ChatPanel({
   messages,
@@ -38,90 +83,283 @@ export function ChatPanel({
   error,
   hasModel,
   hasSession,
+  sessionId = null,
   loadedModel,
+  loadedModelInfo = null,
+  modelPickerOpen = false,
+  loadedModelVisionConfigured = false,
   loadedModelSupportsVision = false,
   loadedModelVisionStatusText = null,
   onSend,
   onStop,
+  canCreateSession,
+  creatingSession,
+  onCreateSession,
+  onOpenModelPicker,
 }: Props) {
   const [input, setInput] = useState("");
   const [image, setImage] = useState<File | null>(null);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
-  const [showSampling, setShowSampling] = useState(false);
+  const [controlsOpen, setControlsOpen] = useState(false);
   const [sampling, setSampling] = useState<SamplingParams>({});
   const [showThinking, setShowThinking] = useState(false);
-  const [activePreset, setActivePreset] = useState<PresetKey | null>(null);
+  const [activePreset, setActivePreset] = useState<string | null>(null);
   const [composerError, setComposerError] = useState<string | null>(null);
+  const [dragActive, setDragActive] = useState(false);
+  const [canvasVersions, setCanvasVersions] = useState<CanvasVersion[]>([]);
+  const [canvasIndex, setCanvasIndex] = useState(0);
+  const [canvasOpen, setCanvasOpen] = useState(false);
+  const [followingOutput, setFollowingOutput] = useState(true);
+  const [imageProgress, setImageProgress] = useState<ImageGenerationProgress | null>(null);
+  const [imageProgressReceivedAt, setImageProgressReceivedAt] = useState(Date.now());
+  const [, setImageClock] = useState(Date.now());
   const bottomRef = useRef<HTMLDivElement>(null);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+  const followingOutputRef = useRef(true);
+  const lastScrollTopRef = useRef(0);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const controlsRef = useRef<HTMLDivElement>(null);
 
-  const canThink = modelSupportsThinking(loadedModel);
+  const canThink = loadedModelInfo?.supports_reasoning ?? modelSupportsThinking(loadedModel);
+  const tessQwenPresets = loadedModelInfo ? recommendedLoadPresets(loadedModelInfo) : [];
+  const generationPresets = tessQwenPresets.length > 0
+    ? tessQwenPresets.map((preset) => ({
+        key: preset.id,
+        label: preset.id === "general-thinking" ? "General sampler" : preset.name,
+        description: `${preset.description} Sampler only; the loaded --reasoning mode is unchanged.`,
+        sampling: {
+          temperature: preset.sampling.temperature,
+          top_p: preset.sampling.topP,
+          top_k: preset.sampling.topK,
+          min_p: preset.sampling.minP,
+          presence_penalty: preset.sampling.presencePenalty,
+          repeat_penalty: preset.sampling.repeatPenalty,
+        } satisfies SamplingParams,
+        suggestThinking: null,
+      }))
+    : PRESET_ORDER.map((key) => ({ key, ...PRESETS[key] }));
+  const activePresetConfig = generationPresets.find((preset) => preset.key === activePreset) ?? null;
   const lastMetrics = processStatus?.last_generation_metrics ?? null;
   const activeGeneration = processStatus?.active_generation ?? null;
-  const liveGeneratedApprox = Math.max(0, Math.round((streamingText.length + streamingReasoning.length) / 4));
+  const liveGeneratedApprox = Math.max(
+    0,
+    Math.round((streamingText.length + streamingReasoning.length) / 4)
+  );
+  const latestStoredOutputTokens = latestAssistantOutputTokens(messages);
   const generatedTokens = isStreaming
     ? liveGeneratedApprox
-    : lastMetrics?.completion_tokens ?? null;
-  const promptTokens = lastMetrics?.prompt_tokens ?? null;
-  const totalTokens = lastMetrics?.total_tokens ?? null;
-  const displayTokSec =
-    isStreaming
-      ? tokensPerSecond ?? lastMetrics?.decode_tokens_per_second ?? null
-      : tokensPerSecond ?? lastMetrics?.decode_tokens_per_second ?? null;
+    : latestStoredOutputTokens ?? lastMetrics?.completion_tokens ?? null;
+  const lastDecodeRate = lastMetrics?.decode_tokens_per_second;
+  const displayTokSec = isStreaming
+    ? tokensPerSecond
+    : tokensPerSecond ?? (lastDecodeRate != null && lastDecodeRate > 0 ? lastDecodeRate : null);
+  const hasCustomSampling = Object.values(sampling).some(
+    (value) => value !== undefined
+  );
+  const canSend =
+    (!!input.trim() || !!image) && hasModel && hasSession && !isStreaming;
+  const sendDisabledReason = isStreaming
+    ? "Generation is already running"
+    : !hasModel
+      ? "Load a model before sending"
+      : !hasSession
+        ? "Select a conversation before sending"
+        : !input.trim() && !image
+          ? "Enter a message or attach an image"
+          : undefined;
 
-  const applyPreset = (key: PresetKey) => {
-    const preset = PRESETS[key];
+  const openCanvas = useCallback((html: string) => {
+    setCanvasVersions((current) => {
+      const existing = current.findIndex((version) => version.html === html);
+      if (existing >= 0) {
+        setCanvasIndex(existing);
+        return current;
+      }
+      const next = [...current, { html, label: `Version ${current.length + 1}` }].slice(-12);
+      setCanvasIndex(next.length - 1);
+      return next;
+    });
+    setCanvasOpen(true);
+  }, []);
+
+  const updateFollowingOutput = useCallback((next: boolean) => {
+    followingOutputRef.current = next;
+    setFollowingOutput(next);
+  }, []);
+
+  const scrollToLatest = useCallback((resumeFollowing = true) => {
+    if (resumeFollowing) updateFollowingOutput(true);
+    const node = chatScrollRef.current;
+    if (!node) return;
+    node.scrollTop = node.scrollHeight;
+    lastScrollTopRef.current = node.scrollTop;
+  }, [updateFollowingOutput]);
+
+  useEffect(() => {
+    if (!followingOutputRef.current) return undefined;
+    const frame = window.requestAnimationFrame(() => scrollToLatest(false));
+    return () => window.cancelAnimationFrame(frame);
+  }, [messages.length, scrollToLatest, streamingReasoning.length, streamingText.length]);
+
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "0px";
+    textarea.style.height = `${Math.min(200, Math.max(28, textarea.scrollHeight))}px`;
+  }, [input]);
+
+  useEffect(() => {
+    setInput("");
+    setImage(null);
+    setImagePreview(null);
+    setComposerError(null);
+    setControlsOpen(false);
+    updateFollowingOutput(true);
+    lastScrollTopRef.current = 0;
+    const frame = window.requestAnimationFrame(() => scrollToLatest(false));
+    return () => window.cancelAnimationFrame(frame);
+  }, [scrollToLatest, sessionId, updateFollowingOutput]);
+
+  useEffect(() => {
+    const focusComposer = () => textareaRef.current?.focus();
+    window.addEventListener("ib-focus-composer", focusComposer);
+    return () => window.removeEventListener("ib-focus-composer", focusComposer);
+  }, []);
+
+  useEffect(() => {
+    if (!controlsOpen) return undefined;
+    const closeOnOutsideClick = (event: MouseEvent) => {
+      if (!controlsRef.current?.contains(event.target as Node)) {
+        setControlsOpen(false);
+      }
+    };
+    window.addEventListener("mousedown", closeOnOutsideClick);
+    return () => window.removeEventListener("mousedown", closeOnOutsideClick);
+  }, [controlsOpen]);
+
+  useEffect(() => {
+    let mounted = true;
+    let stopListening: (() => void) | undefined;
+    const receiveProgress = (progress: ImageGenerationProgress | null) => {
+      if (!mounted || !progress) return;
+      setImageProgress(progress);
+      setImageProgressReceivedAt(Date.now());
+    };
+
+    void getImageGenerationStatus()
+      .then((status) => receiveProgress(status.active_job))
+      .catch(() => {
+        // The browser-only Vite preview has no native image runtime.
+      });
+    void listen<ImageGenerationProgress>("image-generation-progress", (event) => {
+      receiveProgress(event.payload);
+    }).then((unlisten) => {
+      if (mounted) stopListening = unlisten;
+      else unlisten();
+    });
+
+    return () => {
+      mounted = false;
+      stopListening?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!imageProgress || imageProgress.done) return undefined;
+    const timer = window.setInterval(() => setImageClock(Date.now()), 1_000);
+    return () => window.clearInterval(timer);
+  }, [imageProgress?.done, imageProgress?.job_id]);
+
+  useEffect(() => {
+    const preview = processStatus?.last_launch_preview;
+    if (!loadedModel || !preview) return;
+    const fromArgs = readSamplingSettings(preview.args ?? []);
+    const defaults = preview.sampling_defaults;
+    const nextSampling: SamplingParams = {
+      temperature: defaults?.temperature ?? fromArgs.temperature ?? undefined,
+      top_p: defaults?.top_p ?? fromArgs.topP ?? undefined,
+      top_k: defaults?.top_k ?? fromArgs.topK ?? undefined,
+      min_p: defaults?.min_p ?? fromArgs.minP ?? undefined,
+      presence_penalty: defaults?.presence_penalty ?? fromArgs.presencePenalty ?? undefined,
+      repeat_penalty: defaults?.repeat_penalty ?? fromArgs.repeatPenalty ?? undefined,
+    };
+    setSampling(nextSampling);
+    setActivePreset(null);
+    if (canThink && preview.reasoning_mode && preview.reasoning_mode !== "auto") {
+      setShowThinking(preview.reasoning_mode === "on");
+    }
+  }, [canThink, loadedModel, processStatus?.last_launch_preview?.model_path]);
+
+  const applyPreset = (key: string) => {
+    const preset = generationPresets.find((candidate) => candidate.key === key);
     if (!preset) return;
     setActivePreset(key);
     setSampling(preset.sampling);
-    if (preset.suggestThinking !== null && canThink) {
-      setShowThinking(preset.suggestThinking);
-    }
   };
 
-  const clearPreset = () => {
+  const resetControls = () => {
     setActivePreset(null);
     setSampling({});
+    setShowThinking(false);
   };
 
-  const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0] || null;
+  const attachImage = (file: File) => {
+    if (!file.type.startsWith("image/")) {
+      setComposerError("Only image attachments are supported in chat.");
+      return;
+    }
+    if (file.size > 16 * 1024 * 1024) {
+      setComposerError("Images must be 16 MB or smaller.");
+      return;
+    }
+
     setImage(file);
     setComposerError(null);
-    if (file) {
-      const reader = new FileReader();
-      reader.onload = (ev) => {
-        setImagePreview(ev.target?.result as string);
-      };
-      reader.readAsDataURL(file);
-    } else {
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const result = event.target?.result;
+      if (typeof result === "string") setImagePreview(result);
+    };
+    reader.onerror = () => {
+      setImage(null);
       setImagePreview(null);
-    }
+      setComposerError("InferenceBridge could not read that image.");
+    };
+    reader.readAsDataURL(file);
   };
 
-  const handleRemoveImage = () => {
+  const handleImageChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) attachImage(file);
+    event.target.value = "";
+  };
+
+  const removeImage = () => {
     setImage(null);
     setImagePreview(null);
     setComposerError(null);
   };
 
-  // Allow pasting images directly from the clipboard into the chat input.
-  const handlePaste = (e: React.ClipboardEvent) => {
-    const items = Array.from(e.clipboardData?.items ?? []);
-    const imageItem = items.find((item) => item.type.startsWith("image/"));
+  const handlePaste = (event: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const imageItem = Array.from(event.clipboardData.items).find((item) =>
+      item.type.startsWith("image/")
+    );
     if (!imageItem) return;
-    e.preventDefault();
     const file = imageItem.getAsFile();
     if (!file) return;
-    setImage(file);
-    setComposerError(null);
-    const reader = new FileReader();
-    reader.onload = (ev) => setImagePreview(ev.target?.result as string);
-    reader.readAsDataURL(file);
+    event.preventDefault();
+    attachImage(file);
   };
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages.length, streamingText]);
+  const handleDrop = (event: React.DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setDragActive(false);
+    const file = Array.from(event.dataTransfer.files).find((item) =>
+      item.type.startsWith("image/")
+    );
+    if (file) attachImage(file);
+  };
 
   const handleSubmit = () => {
     const trimmed = input.trim();
@@ -133,391 +371,658 @@ export function ChatPanel({
       );
       return;
     }
-    const params = Object.keys(sampling).length > 0 ? sampling : undefined;
+
+    const params = hasCustomSampling ? sampling : undefined;
     setComposerError(null);
+    scrollToLatest();
     onSend(trimmed, params, imagePreview, showThinking);
     setInput("");
     setImage(null);
     setImagePreview(null);
   };
 
-  if (!hasModel) {
-    return (
-      <div className="flex items-center justify-center h-full text-gray-500">
-        <div className="text-center">
-          <p className="text-2xl mb-2">Chat</p>
-          <p>Load a model in the Models tab to start chatting</p>
-        </div>
-      </div>
-    );
-  }
-
-  if (!hasSession) {
-    return (
-      <div className="flex items-center justify-center h-full text-gray-500">
-        <div className="text-center">
-          <p className="text-2xl mb-2">Chat</p>
-          <p>Create or select a session from the sidebar</p>
-        </div>
-      </div>
-    );
-  }
+  const chooseSuggestion = (prompt: string) => {
+    setInput(prompt);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  };
 
   return (
-    <div className="flex h-full flex-col">
-      <div
-        className="flex shrink-0 flex-wrap items-center gap-2 px-3 py-2"
-        style={{ borderBottom: "1px solid var(--border)", background: "var(--surface-1)" }}
-      >
-        <span
-          className={`h-2 w-2 rounded-full ${isStreaming ? "animate-pulse" : ""}`}
-          style={{ background: isStreaming ? "#34d399" : "#64748b" }}
-        />
-        <div className="min-w-0 flex-1">
-          <div className="truncate text-xs font-semibold uppercase tracking-[0.14em]" style={{ color: "var(--text-2)" }}>
-            Chat
-          </div>
-          <div className="truncate text-xs" style={{ color: "var(--text-1)" }}>
-            {loadedModel ?? "model"} {activeGeneration ? `- ${activeGeneration.status}` : ""}
-          </div>
-        </div>
-        <ChatMetric label="Generated" value={generatedTokens == null ? "n/a" : generatedTokens.toLocaleString()} />
-        <ChatMetric label="Tok/sec" value={displayTokSec == null ? "n/a" : displayTokSec.toFixed(displayTokSec >= 100 ? 0 : 1)} tone="good" />
-        <ChatMetric label="Prompt" value={promptTokens == null ? "n/a" : promptTokens.toLocaleString()} />
-        <ChatMetric label="Total" value={totalTokens == null ? "n/a" : totalTokens.toLocaleString()} />
-        {lastMetrics?.elapsed_ms != null && <ChatMetric label="Elapsed" value={formatChatDuration(lastMetrics.elapsed_ms)} />}
-      </div>
-      <div className="flex-1 overflow-y-auto">
-        {messages.length === 0 && !isStreaming && (
-          <div className="flex items-center justify-center h-full text-gray-600 text-sm">
-            Start the conversation by sending a message
-          </div>
-        )}
-        {messages.map((msg) => (
-          <MessageBubble key={msg.id} message={msg} />
-        ))}
-        {isStreaming && <StreamingText text={streamingText} reasoning={streamingReasoning} />}
-        <div ref={bottomRef} />
-      </div>
-
-      {(displayTokSec != null || error || composerError) && (
-        <div className="px-4 py-1 text-xs border-t border-gray-700/50">
-          {error || composerError ? (
-            <span className="text-red-400">{composerError ?? error}</span>
+    <div className="flex h-full min-h-0 flex-col bg-[var(--bg)]">
+      <div className="flex h-12 shrink-0 items-center gap-3 border-b border-[var(--border)] px-4">
+        <button
+          type="button"
+          data-context-copy={loadedModelInfo?.filename ?? loadedModel ?? undefined}
+          data-context-label="model name"
+          onClick={(event) => onOpenModelPicker(event.currentTarget)}
+          aria-label={loadedModelInfo ? `Change model. Current model ${modelDisplayName(loadedModelInfo)}` : loadedModel ? `Change model. Current model ${loadedModel}` : "Choose a model"}
+          aria-haspopup="dialog"
+          aria-expanded={modelPickerOpen}
+          aria-controls="rich-model-picker"
+          className="flex min-w-0 items-center gap-2 rounded-lg px-2 py-1.5 text-left hover:bg-white/5"
+          title="Choose a model"
+        >
+          {loadedModelInfo ? (
+            <ModelArtwork model={loadedModelInfo} size="xs" />
           ) : (
-            <span className="text-gray-500">
-              {displayTokSec?.toFixed(displayTokSec >= 100 ? 0 : 1)} tok/s
+            <Box size={15} className={loadedModel ? "text-emerald-400" : "text-[var(--text-3)]"} />
+          )}
+          <span className="max-w-[460px] truncate text-sm font-medium text-[var(--text-0)]">
+            {loadedModelInfo ? modelDisplayName(loadedModelInfo) : loadedModel ?? "Choose a model"}
+          </span>
+          <ChevronDown size={14} className={`text-[var(--text-3)] transition ${modelPickerOpen ? "rotate-180" : ""}`} />
+        </button>
+
+        <div className="ml-auto flex items-center gap-3 text-[11px] tabular-nums text-[var(--text-2)]">
+          {isStreaming && activeGeneration && (
+            <span className="hidden items-center gap-1.5 sm:flex">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
+              {activeGeneration.status}
             </span>
           )}
+          {generatedTokens != null && <span>{generatedTokens.toLocaleString()} tokens</span>}
+          {displayTokSec != null && (
+            <span className="text-emerald-300">
+              {displayTokSec.toFixed(displayTokSec >= 100 ? 0 : 1)} tok/s
+            </span>
+          )}
+          {isStreaming && displayTokSec == null && (
+            <span className="text-[var(--text-3)]">measuring speed…</span>
+          )}
+        </div>
+      </div>
+
+      <div className="relative min-h-0 flex-1">
+        <div
+          ref={chatScrollRef}
+          className="h-full overflow-y-auto"
+          aria-live="polite"
+          onScroll={(event) => {
+            const node = event.currentTarget;
+            const scrollingUp = node.scrollTop < lastScrollTopRef.current - 1;
+            const nearBottom = isNearScrollBottom(node.scrollHeight, node.scrollTop, node.clientHeight);
+            lastScrollTopRef.current = node.scrollTop;
+
+            if (scrollingUp) {
+              updateFollowingOutput(false);
+            } else if (nearBottom) {
+              updateFollowingOutput(true);
+            } else if (followingOutputRef.current) {
+              updateFollowingOutput(false);
+            }
+          }}
+        >
+          {!hasModel ? (
+          <ChatEmptyState
+            icon={<Box size={22} />}
+            title="Load a model to begin"
+            action={<Button onClick={(event) => onOpenModelPicker(event.currentTarget)}>Choose a model</Button>}
+          />
+        ) : !hasSession ? (
+          <ChatEmptyState
+            title="Select a chat to continue"
+            description="Or start a fresh conversation with the selected model."
+            action={(
+              <Button
+                variant="primary"
+                icon={<Plus size={16} />}
+                disabled={!canCreateSession || creatingSession}
+                onClick={onCreateSession}
+              >
+                {creatingSession ? "Creating chat..." : "New chat"}
+              </Button>
+            )}
+          />
+        ) : messages.length === 0 && !isStreaming && !imageProgress ? (
+          <div className="mx-auto flex h-full w-full max-w-[760px] flex-col items-center justify-center px-6 pb-20 text-center">
+            <div className="ib-brand-mark mb-5 h-10 w-10 text-xs">IB</div>
+            <h1 className="text-2xl font-semibold text-[var(--text-0)]">What are we working on?</h1>
+            <div className="mt-7 grid w-full grid-cols-1 gap-2 sm:grid-cols-3">
+              {suggestionPrompts.map((prompt) => (
+                <button
+                  key={prompt}
+                  type="button"
+                  onClick={() => chooseSuggestion(prompt)}
+                  className="min-h-[72px] rounded-xl border border-[var(--border)] bg-[var(--surface-1)] px-4 py-3 text-left text-sm leading-5 text-[var(--text-1)] transition hover:bg-[var(--surface-2)] hover:text-[var(--text-0)]"
+                >
+                  {prompt}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="mx-auto w-full max-w-[var(--content-max)] px-4 pb-8 pt-5 sm:px-8">
+            {messages.map((message) => (
+              <MessageBubble key={message.id} message={message} onOpenHtml={openCanvas} />
+            ))}
+            {imageProgress && (
+              <ImageGenerationProgressCard
+                progress={imageProgress}
+                receivedAt={imageProgressReceivedAt}
+                onCancel={() => {
+                  void cancelImageGeneration();
+                }}
+              />
+            )}
+            {isStreaming && (
+              <StreamingText text={streamingText} reasoning={streamingReasoning} onOpenHtml={openCanvas} />
+            )}
+            <div ref={bottomRef} className="h-2" />
+          </div>
+          )}
+        </div>
+        {hasSession && !followingOutput && (messages.length > 0 || isStreaming || !!imageProgress) && (
+          <button
+            type="button"
+            className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-1.5 rounded-full border border-white/10 bg-[var(--surface-3)] px-3 py-1.5 text-xs font-medium text-[var(--text-1)] shadow-lg transition hover:bg-[var(--surface-hover)] hover:text-[var(--text-0)]"
+            onClick={() => scrollToLatest()}
+            aria-label="Jump to latest message and resume following output"
+          >
+            <ChevronDown size={14} />
+            Jump to latest
+          </button>
+        )}
+      </div>
+
+      {hasModel && hasSession && (
+        <div className="shrink-0 px-3 pb-3 pt-2 sm:px-6 sm:pb-4">
+          <div className="mx-auto w-full max-w-[var(--content-max)]">
+            {(error || composerError) && (
+              <div className="mb-2 rounded-lg border border-rose-400/20 bg-rose-950/25 px-3 py-2 text-xs leading-5 text-rose-200">
+                {composerError ?? error}
+              </div>
+            )}
+
+            <div
+              className={`relative rounded-[22px] border bg-[var(--surface-3)] shadow-[0_8px_32px_rgba(0,0,0,0.18)] transition-colors ${
+                dragActive
+                  ? "border-white/40 bg-[var(--surface-hover)]"
+                  : "border-white/10"
+              }`}
+              onDragEnter={(event) => {
+                event.preventDefault();
+                setDragActive(true);
+              }}
+              onDragOver={(event) => {
+                event.preventDefault();
+                setDragActive(true);
+              }}
+              onDragLeave={(event) => {
+                if (!event.currentTarget.contains(event.relatedTarget as Node)) {
+                  setDragActive(false);
+                }
+              }}
+              onDrop={handleDrop}
+            >
+              {dragActive && (
+                <div className="pointer-events-none absolute inset-0 z-20 flex items-center justify-center rounded-[22px] bg-[#303030]/95 text-sm font-medium text-white">
+                  <ImageIcon size={18} className="mr-2" />
+                  Drop image
+                </div>
+              )}
+
+              {imagePreview && (
+                <div className="flex items-center gap-3 px-3 pt-3">
+                  <div className="relative h-16 w-16 shrink-0 overflow-hidden rounded-xl border border-white/10 bg-black/20">
+                    <img src={imagePreview} alt="Chat attachment" className="h-full w-full object-cover" />
+                    <button
+                      type="button"
+                      aria-label="Remove image"
+                      title="Remove image"
+                      className="absolute right-1 top-1 flex h-5 w-5 items-center justify-center rounded-full bg-black/70 text-white hover:bg-black"
+                      onClick={removeImage}
+                    >
+                      <X size={12} />
+                    </button>
+                  </div>
+                  <div className="min-w-0">
+                    <div className="truncate text-xs font-medium text-[var(--text-0)]">
+                      {image?.name || "Pasted image"}
+                    </div>
+                    <div className={`mt-1 text-[11px] ${loadedModelSupportsVision ? "text-emerald-300" : "text-amber-300"}`}>
+                      {loadedModelSupportsVision
+                        ? "Vision ready"
+                        : loadedModelVisionConfigured
+                          ? "Projector not attached"
+                          : "Vision model required"}
+                    </div>
+                    {image && <div className="mt-1 text-[10px] text-[var(--text-3)]">{(image.size / 1024).toFixed(image.size >= 1024 * 1024 ? 0 : 1)} KB · {image.type || "image"}</div>}
+                  </div>
+                </div>
+              )}
+
+              <textarea
+                ref={textareaRef}
+                value={input}
+                onChange={(event) => setInput(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" && !event.shiftKey) {
+                    event.preventDefault();
+                    handleSubmit();
+                  }
+                  if (event.key === "Escape" && isStreaming) {
+                    event.preventDefault();
+                    onStop();
+                  }
+                }}
+                onPaste={handlePaste}
+                placeholder="Message InferenceBridge"
+                rows={1}
+                className="ib-chat-input block max-h-[200px] min-h-[46px] w-full resize-none overflow-y-auto bg-transparent px-4 pb-2 pt-3.5 text-[15px] leading-6 text-[var(--text-0)] outline-none placeholder:text-[var(--text-3)]"
+              />
+
+              <div className="flex h-12 items-center justify-between gap-2 px-2 pb-1.5">
+                <div className="flex items-center gap-0.5">
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*"
+                    className="hidden"
+                    onChange={handleImageChange}
+                    disabled={isStreaming}
+                  />
+                  <IconButton
+                    label="Attach image"
+                    size="md"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={isStreaming}
+                  >
+                    <Paperclip size={18} />
+                  </IconButton>
+
+                  <div className="relative" ref={controlsRef}>
+                    <IconButton
+                      label="Generation controls"
+                      size="md"
+                      selected={controlsOpen || hasCustomSampling || showThinking}
+                      onClick={() => setControlsOpen((value) => !value)}
+                    >
+                      <SlidersHorizontal size={17} />
+                    </IconButton>
+
+                    {controlsOpen && (
+                      <GenerationControls
+                        sampling={sampling}
+                        presets={generationPresets}
+                        activePreset={activePreset}
+                        showThinking={showThinking}
+                        canThink={canThink}
+                        onSamplingChange={(next) => {
+                          setSampling(next);
+                          setActivePreset(null);
+                        }}
+                        onPresetChange={applyPreset}
+                        onThinkingChange={setShowThinking}
+                        onReset={resetControls}
+                      />
+                    )}
+                  </div>
+
+                  {(activePreset || hasCustomSampling || showThinking) && (
+                    <span className="ml-1 hidden max-w-[240px] truncate text-[11px] text-[var(--text-2)] sm:inline">
+                      {activePresetConfig?.label ?? "Custom"}
+                      {showThinking ? " / Thinking" : ""}
+                    </span>
+                  )}
+                </div>
+
+                {isStreaming ? (
+                  <button
+                    type="button"
+                    onClick={onStop}
+                    aria-label="Stop generating"
+                    title="Stop generating"
+                    className="flex h-8 w-8 items-center justify-center rounded-full bg-white text-black transition hover:bg-neutral-200"
+                  >
+                    <Square size={13} fill="currentColor" />
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={handleSubmit}
+                    disabled={!canSend}
+                    aria-label="Send message"
+                    title={sendDisabledReason ?? "Send message"}
+                    className="flex h-8 w-8 items-center justify-center rounded-full bg-white text-black transition hover:bg-neutral-200 disabled:bg-[#676767] disabled:text-[#303030]"
+                  >
+                    <ArrowUp size={17} strokeWidth={2.5} />
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
         </div>
       )}
+      {canvasOpen && (
+        <CanvasPanel
+          versions={canvasVersions}
+          index={canvasIndex}
+          onSelect={setCanvasIndex}
+          onClose={() => setCanvasOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
 
-      <div className="border-t border-gray-700 p-3">
-        {/* Preset row */}
-        <div className="flex items-center gap-1.5 mb-2 flex-wrap">
-          <span className="text-[10px] uppercase tracking-widest text-gray-600 mr-0.5">Preset</span>
-          {PRESET_ORDER.map((key) => {
-            const p = PRESETS[key];
-            const isActive = activePreset === key;
-            return (
-              <button
-                key={key}
-                onClick={() => (isActive ? clearPreset() : applyPreset(key))}
-                title={p.description}
-                className="flex items-center gap-1 rounded px-2 py-0.5 text-xs transition"
-                style={{
-                  background: isActive ? "rgba(34,211,238,0.14)" : "rgba(255,255,255,0.04)",
-                  border: isActive
-                    ? "1px solid rgba(34,211,238,0.35)"
-                    : "1px solid rgba(255,255,255,0.08)",
-                  color: isActive ? "#22d3ee" : "#6b7280",
-                  cursor: "pointer",
-                  fontWeight: isActive ? 500 : 400,
-                }}
-              >
-                <span>{p.icon}</span>
-                {p.label}
-              </button>
-            );
-          })}
-
-          <div style={{ width: "1px", height: "14px", background: "rgba(255,255,255,0.08)", margin: "0 2px" }} />
-
-          {/* Thinking toggle only shown for models that support it */}
-          {canThink && (
-            <button
-              onClick={() => setShowThinking(!showThinking)}
-              title={
-                showThinking
-                  ? "Thinking ON - model reasons step-by-step before answering"
-                  : "Thinking OFF - direct response (faster)"
-              }
-              className="flex items-center gap-1.5 rounded px-2 py-0.5 text-xs transition"
-              style={{
-                background: showThinking ? "rgba(167,139,250,0.12)" : "transparent",
-                border: showThinking ? "1px solid rgba(167,139,250,0.35)" : "1px solid rgba(255,255,255,0.08)",
-                color: showThinking ? "#a78bfa" : "#52525a",
-                cursor: "pointer",
-              }}
-            >
-              Think
-              <span
-                className="relative shrink-0 rounded-full transition"
-                style={{
-                  display: "inline-block",
-                  width: "24px",
-                  height: "13px",
-                  background: showThinking ? "#a78bfa" : "rgba(255,255,255,0.1)",
-                  verticalAlign: "middle",
-                }}
-              >
-                <span
-                  className="absolute rounded-full bg-white transition-all"
-                  style={{
-                    width: "9px", height: "9px",
-                    top: "2px",
-                    left: showThinking ? "13px" : "2px",
-                  }}
-                />
-              </span>
-            </button>
-          )}
-
-          {/* Show thinking for non-thinking models too (manual override) */}
-          {!canThink && (
-            <button
-              onClick={() => setShowThinking(!showThinking)}
-              title="Thinking toggle (model may not support this)"
-              className="flex items-center gap-1 rounded px-2 py-0.5 text-xs transition"
-              style={{
-                border: "1px solid rgba(255,255,255,0.08)",
-                color: "#3f3f46",
-                cursor: "pointer",
-                background: "transparent",
-              }}
-            >
-              Think
-            </button>
-          )}
-
-          {/* Sampling custom button shows or hides the fine-tune panel */}
-          <button
-            onClick={() => setShowSampling(!showSampling)}
-            className="flex items-center gap-1 rounded px-2 py-0.5 text-xs transition"
-            style={{
-              border: "1px solid rgba(255,255,255,0.08)",
-              color: Object.values(sampling).some((v) => v !== undefined) ? "#22d3ee" : "#4b5563",
-              background: Object.values(sampling).some((v) => v !== undefined) ? "rgba(34,211,238,0.06)" : "transparent",
-              cursor: "pointer",
-            }}
-            title="Fine-tune individual sampling parameters"
-          >
-            {showSampling ? "Hide Params" : "Params"}
-            {Object.values(sampling).some((v) => v !== undefined) && !activePreset && (
-              <span className="w-1.5 h-1.5 rounded-full" style={{ background: "#22d3ee" }} />
-            )}
-          </button>
-
-          {(activePreset || Object.values(sampling).some((v) => v !== undefined)) && (
-            <button
-              onClick={clearPreset}
-              className="rounded px-2 py-0.5 text-xs transition"
-              style={{ color: "#6b7280", border: "none", background: "transparent", cursor: "pointer" }}
-              title="Reset to model defaults"
-            >
-              Reset
-            </button>
-          )}
-        </div>
-
-        {showSampling && (
-          <div className="flex flex-wrap gap-3 mb-2 text-xs">
-            <label className="flex items-center gap-1.5">
-              <span className="text-gray-500">Temp</span>
-              <input
-                type="number"
-                step="0.1"
-                min="0"
-                max="2"
-                value={sampling.temperature ?? ""}
-                onChange={(e) =>
-                  setSampling({
-                    ...sampling,
-                    temperature: e.target.value
-                      ? parseFloat(e.target.value)
-                      : undefined,
-                  })
-                }
-                placeholder="0.7"
-                className="w-16 px-1.5 py-0.5 bg-gray-800 border border-gray-600 rounded text-gray-300 focus:outline-none focus:border-blue-500"
-              />
-            </label>
-            <label className="flex items-center gap-1.5">
-              <span className="text-gray-500">Top P</span>
-              <input
-                type="number"
-                step="0.05"
-                min="0"
-                max="1"
-                value={sampling.top_p ?? ""}
-                onChange={(e) =>
-                  setSampling({
-                    ...sampling,
-                    top_p: e.target.value ? parseFloat(e.target.value) : undefined,
-                  })
-                }
-                placeholder="0.9"
-                className="w-16 px-1.5 py-0.5 bg-gray-800 border border-gray-600 rounded text-gray-300 focus:outline-none focus:border-blue-500"
-              />
-            </label>
-            <label className="flex items-center gap-1.5">
-              <span className="text-gray-500">Top K</span>
-              <input
-                type="number"
-                step="1"
-                min="0"
-                value={sampling.top_k ?? ""}
-                onChange={(e) =>
-                  setSampling({
-                    ...sampling,
-                    top_k: e.target.value ? parseInt(e.target.value) : undefined,
-                  })
-                }
-                placeholder="40"
-                className="w-16 px-1.5 py-0.5 bg-gray-800 border border-gray-600 rounded text-gray-300 focus:outline-none focus:border-blue-500"
-              />
-            </label>
-            <label className="flex items-center gap-1.5">
-              <span className="text-gray-500">Max</span>
-              <input
-                type="number"
-                step="64"
-                min="1"
-                value={sampling.max_tokens ?? ""}
-                onChange={(e) =>
-                  setSampling({
-                    ...sampling,
-                    max_tokens: e.target.value
-                      ? parseInt(e.target.value)
-                      : undefined,
-                  })
-                }
-                placeholder="2048"
-                className="w-20 px-1.5 py-0.5 bg-gray-800 border border-gray-600 rounded text-gray-300 focus:outline-none focus:border-blue-500"
-              />
-            </label>
-            <label className="flex items-center gap-1.5">
-              <span className="text-gray-500">Seed</span>
-              <input
-                type="number"
-                step="1"
-                value={sampling.seed ?? ""}
-                onChange={(e) =>
-                  setSampling({
-                    ...sampling,
-                    seed: e.target.value ? parseInt(e.target.value) : undefined,
-                  })
-                }
-                placeholder="-1"
-                className="w-20 px-1.5 py-0.5 bg-gray-800 border border-gray-600 rounded text-gray-300 focus:outline-none focus:border-blue-500"
-              />
-            </label>
+function ChatEmptyState({
+  icon,
+  title,
+  description,
+  action,
+}: {
+  icon?: React.ReactNode;
+  title: string;
+  description?: string;
+  action?: React.ReactNode;
+}) {
+  return (
+    <div className="flex h-full items-center justify-center px-6 pb-16">
+      <div className="text-center">
+        {icon && (
+          <div className="mx-auto mb-4 flex h-11 w-11 items-center justify-center rounded-xl bg-[var(--surface-2)] text-[var(--text-1)]">
+            {icon}
           </div>
         )}
-
-        <div className="flex gap-2 items-end">
-          <textarea
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                handleSubmit();
-              }
-              if (e.key === "Escape" && isStreaming) {
-                e.preventDefault();
-                onStop();
-              }
-            }}
-            onPaste={handlePaste}
-            placeholder="Type a message... (Enter to send, Shift+Enter for newline, paste image)"
-            rows={1}
-            className="flex-1 bg-gray-800 border border-gray-600 rounded-lg px-3 py-2 text-sm text-gray-200 placeholder-gray-500 resize-none focus:outline-none focus:border-blue-500"
-          />
-          <label className="cursor-pointer flex items-center">
-            <input
-              type="file"
-              accept="image/*"
-              className="hidden"
-              onChange={handleImageChange}
-              disabled={isStreaming}
-            />
-            <span className="px-2 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm text-gray-200 ml-1">
-              Img
-            </span>
-          </label>
-          {isStreaming ? (
-            <button
-              onClick={onStop}
-              className="px-4 py-2 bg-red-600 hover:bg-red-500 rounded-lg text-sm shrink-0"
-            >
-              Stop
-            </button>
-          ) : (
-            <button
-              onClick={handleSubmit}
-              disabled={!input.trim() && !image}
-              className="px-4 py-2 bg-blue-600 hover:bg-blue-500 rounded-lg text-sm disabled:opacity-40 shrink-0"
-            >
-              Send
-            </button>
-          )}
-        </div>
-        {imagePreview && (
-          <div className="mt-2 flex items-center gap-2">
-            <img
-              src={imagePreview}
-              alt="preview"
-              className="max-h-24 rounded border border-gray-600"
-            />
-            <span className="text-xs text-gray-500">
-              {loadedModelSupportsVision
-                ? "Will be sent to the current vision model."
-                : loadedModelVisionStatusText ??
-                  "Current model is text-only. Load a vision model before sending."}
-            </span>
-            <button
-              onClick={handleRemoveImage}
-              className="text-xs text-red-400 hover:underline"
-            >
-              Remove
-            </button>
-          </div>
-        )}
+        <h2 className="text-xl font-semibold text-[var(--text-0)]">{title}</h2>
+        {description && <p className="mt-2 text-sm text-[var(--text-2)]">{description}</p>}
+        {action && <div className="mt-5">{action}</div>}
       </div>
     </div>
   );
 }
 
-function ChatMetric({ label, value, tone = "neutral" }: { label: string; value: string; tone?: "neutral" | "good" }) {
+function ImageGenerationProgressCard({
+  progress,
+  receivedAt,
+  onCancel,
+}: {
+  progress: ImageGenerationProgress;
+  receivedAt: number;
+  onCancel: () => void;
+}) {
+  const liveDelta = progress.done ? 0 : Math.max(0, (Date.now() - receivedAt) / 1_000);
+  const elapsed = progress.elapsed_seconds + liveDelta;
+  const eta = progress.eta_seconds == null
+    ? null
+    : Math.max(0, progress.eta_seconds - liveDelta);
+  const percentage = Math.round(Math.max(0, Math.min(1, progress.progress)) * 100);
+  const failed = progress.status === "failed";
+  const cancelled = progress.status === "cancelled";
+  const statusText = failed
+    ? progress.error ?? progress.message
+    : cancelled
+      ? "Generation cancelled"
+      : progress.message;
+
   return (
     <div
-      className="min-w-[72px] rounded px-2 py-1 text-right"
-      style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}
+      className={`my-5 rounded-2xl border px-4 py-4 ${
+        failed
+          ? "border-rose-400/20 bg-rose-950/20"
+          : "border-white/10 bg-[var(--surface-2)]"
+      }`}
+      aria-live="polite"
     >
-      <div className="text-[9px] uppercase tracking-[0.12em]" style={{ color: "var(--text-2)" }}>
-        {label}
-      </div>
-      <div className="text-xs font-semibold tabular-nums" style={{ color: tone === "good" ? "#34d399" : "var(--text-0)" }}>
-        {value}
+      <div className="flex items-start gap-3">
+        <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-violet-400/10 text-violet-300">
+          <ImageIcon size={16} />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div className="text-sm font-semibold text-[var(--text-0)]">
+                {progress.done && !failed && !cancelled ? "Image ready" : "Generating image"}
+              </div>
+              <div className={`mt-0.5 text-xs ${failed ? "text-rose-200" : "text-[var(--text-2)]"}`}>
+                {statusText}
+              </div>
+            </div>
+            {!progress.done && (
+              <Button variant="ghost" size="sm" icon={<Square size={11} />} onClick={onCancel}>
+                Cancel
+              </Button>
+            )}
+          </div>
+
+          <div
+            className="mt-3 h-1.5 overflow-hidden rounded-full bg-black/25"
+            role="progressbar"
+            aria-label="Image generation progress"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={percentage}
+          >
+            <div
+              className="h-full rounded-full bg-violet-400 transition-[width] duration-300"
+              style={{ width: `${percentage}%` }}
+            />
+          </div>
+
+          <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-[var(--text-2)]">
+            <span>{percentage}% complete</span>
+            {progress.total_steps > 0 && progress.stage === "generating" && (
+              <span>Step {progress.current_step} of {progress.total_steps}</span>
+            )}
+            <span>Elapsed {formatImageDuration(elapsed)}</span>
+            {!progress.done && (
+              <span>
+                {eta == null ? "Estimating time remaining..." : `About ${formatImageDuration(eta)} left`}
+              </span>
+            )}
+          </div>
+          {progress.output_path && (
+            <div className="mt-2 truncate text-[11px] text-[var(--text-3)]" title={progress.output_path}>
+              Saved to {progress.output_path}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
 }
 
-function formatChatDuration(ms: number) {
-  if (ms < 1000) return `${Math.round(ms)} ms`;
-  const seconds = Math.floor(ms / 1000);
-  const minutes = Math.floor(seconds / 60);
-  return minutes > 0 ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
+function formatImageDuration(seconds: number) {
+  const rounded = Math.max(0, Math.round(seconds));
+  const minutes = Math.floor(rounded / 60);
+  const remainingSeconds = rounded % 60;
+  if (minutes === 0) return `${remainingSeconds}s`;
+  return `${minutes}m ${remainingSeconds.toString().padStart(2, "0")}s`;
+}
+
+function GenerationControls({
+  sampling,
+  presets,
+  activePreset,
+  showThinking,
+  canThink,
+  onSamplingChange,
+  onPresetChange,
+  onThinkingChange,
+  onReset,
+}: {
+  sampling: SamplingParams;
+  presets: Array<{
+    key: string;
+    label: string;
+    description: string;
+    sampling: SamplingParams;
+    suggestThinking: boolean | null;
+  }>;
+  activePreset: string | null;
+  showThinking: boolean;
+  canThink: boolean;
+  onSamplingChange: (sampling: SamplingParams) => void;
+  onPresetChange: (preset: string) => void;
+  onThinkingChange: (value: boolean) => void;
+  onReset: () => void;
+}) {
+  const setNumber = (key: keyof SamplingParams, value: string, integer = false) => {
+    onSamplingChange({
+      ...sampling,
+      [key]: value ? (integer ? Number.parseInt(value, 10) : Number.parseFloat(value)) : undefined,
+    });
+  };
+
+  return (
+    <div className="absolute bottom-full left-0 z-50 mb-3 w-[430px] max-w-[calc(100vw-32px)] rounded-2xl border border-white/10 bg-[#292929] p-3 shadow-[0_18px_56px_rgba(0,0,0,0.5)]">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-sm font-semibold text-[var(--text-0)]">Generation controls</div>
+          <div className="mt-0.5 text-[11px] text-[var(--text-2)]">Applied to the next message</div>
+        </div>
+        <Button variant="ghost" size="sm" icon={<RotateCcw size={13} />} onClick={onReset}>
+          Reset
+        </Button>
+      </div>
+
+      <div className="mt-3 grid grid-cols-3 gap-1 rounded-xl bg-black/15 p-1">
+        {presets.map((preset) => (
+          <button
+            key={preset.key}
+            type="button"
+            title={preset.description}
+            onClick={() => onPresetChange(preset.key)}
+            className={`h-8 rounded-lg text-xs font-medium transition ${
+              activePreset === preset.key
+                ? "bg-white text-black"
+                : "text-[var(--text-1)] hover:bg-white/5 hover:text-white"
+            }`}
+          >
+            {preset.label}
+          </button>
+        ))}
+      </div>
+
+      <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
+        <SamplingField
+          label="Temperature"
+          value={sampling.temperature}
+          placeholder="0.7"
+          min="0"
+          max="2"
+          step="0.1"
+          onChange={(value) => setNumber("temperature", value)}
+        />
+        <SamplingField
+          label="Top P"
+          value={sampling.top_p}
+          placeholder="0.9"
+          min="0"
+          max="1"
+          step="0.05"
+          onChange={(value) => setNumber("top_p", value)}
+        />
+        <SamplingField
+          label="Top K"
+          value={sampling.top_k}
+          placeholder="40"
+          min="0"
+          step="1"
+          onChange={(value) => setNumber("top_k", value, true)}
+        />
+        <SamplingField
+          label="Min P"
+          value={sampling.min_p}
+          placeholder="0"
+          min="0"
+          max="1"
+          step="0.01"
+          onChange={(value) => setNumber("min_p", value)}
+        />
+        <SamplingField
+          label="Presence"
+          value={sampling.presence_penalty}
+          placeholder="0"
+          min="-2"
+          max="2"
+          step="0.1"
+          onChange={(value) => setNumber("presence_penalty", value)}
+        />
+        <SamplingField
+          label="Repeat"
+          value={sampling.repeat_penalty}
+          placeholder="1"
+          min="0"
+          max="2"
+          step="0.05"
+          onChange={(value) => setNumber("repeat_penalty", value)}
+        />
+        <SamplingField
+          label="Max tokens"
+          value={sampling.max_tokens}
+          placeholder="2048"
+          min="1"
+          step="64"
+          onChange={(value) => setNumber("max_tokens", value, true)}
+        />
+        <SamplingField
+          label="Seed"
+          value={sampling.seed}
+          placeholder="-1"
+          step="1"
+          onChange={(value) => setNumber("seed", value, true)}
+        />
+      </div>
+
+      <div className="mt-3 flex items-center justify-between rounded-xl border border-white/8 bg-black/10 px-3 py-2.5">
+        <div>
+          <div className="text-xs font-medium text-[var(--text-0)]">Show reasoning</div>
+          <div className="mt-0.5 text-[11px] text-[var(--text-2)]">
+            {canThink ? "Display reasoning emitted by the loaded mode; changing this does not change --reasoning" : "The loaded model does not expose reasoning output"}
+          </div>
+        </div>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={showThinking}
+          aria-label="Show reasoning output"
+          disabled={!canThink}
+          onClick={() => canThink && onThinkingChange(!showThinking)}
+          className={`relative h-6 w-11 rounded-full transition disabled:cursor-not-allowed disabled:opacity-40 ${showThinking ? "bg-white" : "bg-[#555]"}`}
+        >
+          <span
+            className={`absolute top-1 h-4 w-4 rounded-full transition-all ${
+              showThinking ? "left-6 bg-black" : "left-1 bg-white"
+            }`}
+          />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SamplingField({
+  label,
+  value,
+  placeholder,
+  min,
+  max,
+  step,
+  onChange,
+}: {
+  label: string;
+  value?: number;
+  placeholder: string;
+  min?: string;
+  max?: string;
+  step: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="min-w-0">
+      <span className="mb-1 block truncate text-[10px] text-[var(--text-2)]" title={label}>
+        {label}
+      </span>
+      <input
+        type="number"
+        value={value ?? ""}
+        placeholder={placeholder}
+        min={min}
+        max={max}
+        step={step}
+        onChange={(event) => onChange(event.target.value)}
+        className="h-8 w-full rounded-lg border border-white/10 bg-black/15 px-2 text-xs text-white outline-none placeholder:text-[var(--text-3)] focus:border-white/25"
+      />
+    </label>
+  );
 }

@@ -143,6 +143,33 @@ pub fn current_version() -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+fn llama_build_number(version: &str) -> Option<u64> {
+    let trimmed = version.trim();
+    let digits = trimmed
+        .strip_prefix('b')
+        .or_else(|| trimmed.strip_prefix('B'))?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Returns true only when `candidate` is newer than the installed release.
+/// llama.cpp stable tags are monotonic `bNNNN` build numbers. Unknown formats
+/// retain the old unequal-version behavior so custom channels can still update.
+pub fn release_is_newer(current: Option<&str>, candidate: &str) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+    if current.trim().eq_ignore_ascii_case(candidate.trim()) {
+        return false;
+    }
+    match (llama_build_number(current), llama_build_number(candidate)) {
+        (Some(current_build), Some(candidate_build)) => candidate_build > current_build,
+        _ => true,
+    }
+}
+
 /// Represent a release asset from GitHub.
 #[derive(Debug, serde::Deserialize)]
 struct GithubAsset {
@@ -173,11 +200,13 @@ pub async fn check_for_update() -> anyhow::Result<Option<(String, String, u64)>>
 
     // Scan releases for the first one with a matching Windows server binary
     for release in &releases {
-        // Skip if we already have this version
-        if current.as_deref() == Some(&release.tag_name) {
+        // Releases are newest-first. If the installed build is equal to or
+        // ahead of this release, every remaining stable release is older too.
+        if !release_is_newer(current.as_deref(), &release.tag_name) {
             tracing::info!(
-                version = %release.tag_name,
-                "llama-server is up-to-date"
+                installed = ?current,
+                available = %release.tag_name,
+                "llama-server is up-to-date or ahead of the stable channel"
             );
             return Ok(None);
         }
@@ -561,7 +590,27 @@ fn file_is_locked(error: &std::io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::file_is_locked;
+    use super::{file_is_locked, release_is_newer};
+
+    #[test]
+    fn newer_llama_build_is_an_update() {
+        assert!(release_is_newer(Some("b9968"), "b9983"));
+    }
+
+    #[test]
+    fn older_llama_build_is_not_an_update() {
+        assert!(!release_is_newer(Some("b9983"), "b9968"));
+    }
+
+    #[test]
+    fn equal_llama_build_is_not_an_update() {
+        assert!(!release_is_newer(Some("B9983"), "b9983"));
+    }
+
+    #[test]
+    fn missing_runtime_can_install_latest_build() {
+        assert!(release_is_newer(None, "b9983"));
+    }
 
     #[test]
     fn windows_sharing_violation_is_treated_as_locked_file() {

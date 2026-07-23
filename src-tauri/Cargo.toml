@@ -8,6 +8,10 @@ description = "Local LLM desktop app with a shared OpenAI-compatible API"
 name = "inference_bridge_lib"
 crate-type = ["lib", "cdylib", "staticlib"]
 
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2.5", features = [] }
 

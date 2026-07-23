@@ -75,7 +75,7 @@ export function ProcessManager() {
   };
 
   return (
-    <section className="rounded-[28px] border border-white/10 bg-[linear-gradient(180deg,rgba(15,23,42,0.82),rgba(8,15,29,0.94))] p-5 shadow-[0_12px_40px_rgba(2,6,23,0.28)]">
+    <section className="rounded-lg border border-white/10 bg-[var(--surface-1)] p-5 shadow-[0_12px_40px_rgba(0,0,0,0.20)]">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h3 className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">

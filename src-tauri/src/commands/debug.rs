@@ -285,7 +285,10 @@ pub async fn template_dry_run(
         }
     };
 
-    let profile = crate::models::profiles::ModelProfile::detect(&model_name);
+    let profile = {
+        let s = state.read().await;
+        s.effective_profile_for_model(&model_name)
+    };
     let messages = vec![
         crate::templates::engine::ChatMessage {
             role: "system".to_string(),
@@ -303,13 +306,26 @@ pub async fn template_dry_run(
 
     let mut checks = Vec::new();
     let mut warnings = Vec::new();
-    let lower = model_name.to_ascii_lowercase();
-    let is_qwen = lower.contains("qwen");
-    let is_gemma = lower.contains("gemma");
+    let is_qwen = matches!(
+        profile.family,
+        crate::models::profiles::ModelFamily::Qwen3_5
+            | crate::models::profiles::ModelFamily::Qwen3
+            | crate::models::profiles::ModelFamily::Qwen2_5
+    );
+    let is_gemma = matches!(
+        profile.family,
+        crate::models::profiles::ModelFamily::Gemma
+            | crate::models::profiles::ModelFamily::Gemma4
+            | crate::models::profiles::ModelFamily::DiffusionGemma
+    );
     let template_mode = request.template_mode.trim().to_ascii_lowercase();
 
     if request.use_jinja {
         checks.push("Jinja rendering is enabled for llama.cpp launch.".to_string());
+        checks.push(
+            "This dry-run prompt shows InferenceBridge's compatibility renderer used by the llama.cpp /completion path; embedded Jinja is applied only by native llama-server chat endpoints."
+                .to_string(),
+        );
     } else if is_qwen || is_gemma {
         warnings.push(format!(
             "{model_name} looks template-sensitive but Use Jinja is disabled."
@@ -375,8 +391,8 @@ pub async fn template_dry_run(
             .map(str::trim)
             .unwrap_or("");
         if kwargs.is_empty() {
-            warnings.push(
-                "Qwen launch has no chat_template_kwargs_json; thinking/tool behavior may depend on template defaults."
+            checks.push(
+                "No deprecated thinking template kwargs are configured; --reasoning is authoritative."
                     .to_string(),
             );
         } else if serde_json::from_str::<serde_json::Value>(kwargs).is_ok() {

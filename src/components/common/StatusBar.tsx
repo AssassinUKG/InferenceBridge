@@ -4,6 +4,7 @@ import type {
   LoadProgress,
   ProcessStatusInfo,
 } from "../../lib/types";
+import { Box, Braces, Database, TriangleAlert } from "lucide-react";
 
 interface Props {
   processStatus: ProcessStatusInfo | null;
@@ -20,22 +21,9 @@ function buildApiUrl(settings: AppSettings | null) {
   return `http://${host}:${settings.server_port}/v1`;
 }
 
-function apiStateTone(state: string) {
-  if (state === "Running") {
-    return "border-emerald-400/18 bg-emerald-400/10 text-emerald-200";
-  }
-  if (state === "Starting") {
-    return "border-amber-400/18 bg-amber-400/10 text-amber-200";
-  }
-  if (state === "Error") {
-    return "border-rose-400/18 bg-rose-400/10 text-rose-200";
-  }
-  return "border-white/8 bg-white/5 text-slate-400";
-}
-
 export function StatusBar({ processStatus, contextStatus, settings }: Props) {
   const model = processStatus?.model ?? "No model loaded";
-  const state = processStatus?.state ?? "Idle";
+  const hasModel = !!processStatus?.model;
   const crashes = processStatus?.crash_count ?? 0;
   const pct = Math.round(contextStatus.fill_ratio * 100);
   const apiUrl = processStatus?.api_url ?? buildApiUrl(settings);
@@ -51,73 +39,48 @@ export function StatusBar({ processStatus, contextStatus, settings }: Props) {
           : "text-slate-500";
 
   return (
-    <footer className="border-t border-white/8 bg-slate-950/82 px-4 py-2 backdrop-blur-xl">
-      <div className="mx-auto flex max-w-7xl flex-col gap-2 text-xs text-slate-400 lg:flex-row lg:items-center lg:justify-between">
-        <div className="flex flex-wrap items-center gap-3">
-          <span className="inline-flex items-center gap-2 rounded-full border border-white/8 bg-white/5 px-3 py-1">
-            <span
-              className={`h-2.5 w-2.5 rounded-full ${
-                state === "Running"
-                  ? "bg-emerald-400 shadow-[0_0_14px_rgba(74,222,128,0.9)]"
-                  : state === "Starting"
-                    ? "animate-pulse bg-amber-400"
-                    : state === "Stopping"
-                      ? "bg-orange-400"
-                      : "bg-slate-600"
-              }`}
-            />
-            <span className="font-medium text-slate-200">{model}</span>
-          </span>
+    <footer className="flex h-8 shrink-0 items-center gap-4 border-t border-[var(--border)] bg-[var(--surface-0)] px-4 text-[11px] text-[var(--text-2)]">
+      <span className={`flex min-w-0 items-center gap-1.5 ${hasModel ? "text-emerald-300" : ""}`} title={model}>
+        <Box size={12} />
+        <span className="max-w-[280px] truncate">{model}</span>
+        {processStatus?.backend && <span className="text-[var(--text-3)]">/{processStatus.backend}</span>}
+      </span>
 
-          {processStatus?.backend && (
-            <span className="rounded-full border border-cyan-400/18 bg-cyan-400/10 px-3 py-1 text-cyan-200">
-              {processStatus.backend}
-            </span>
-          )}
+      <span className="hidden items-center gap-1.5 md:flex" title={apiUrl}>
+        <Braces size={12} />
+        <span className={apiState === "Running" ? "text-emerald-300" : apiState === "Error" ? "text-rose-300" : ""}>
+          API {apiState}
+        </span>
+        <span className="max-w-[240px] truncate text-[var(--text-3)]">{apiUrl}</span>
+      </span>
 
-          {processStatus?.previous_model &&
-            processStatus.previous_model !== processStatus.model && (
-              <span className="text-indigo-300/85">
-                prev: {processStatus.previous_model}
-              </span>
-            )}
+      {contextStatus.total_tokens > 0 ? (
+        <span className={`ml-auto flex items-center gap-1.5 ${contextStatus.used_tokens > 0 ? kvColor : "text-[var(--text-2)]"}`}>
+          <Database size={12} />
+          {contextStatus.used_tokens > 0
+            ? `${contextStatus.used_tokens.toLocaleString()}/${contextStatus.total_tokens.toLocaleString()} (${pct}%)`
+            : `${contextStatus.total_tokens.toLocaleString()} context`}
+        </span>
+      ) : (
+        <span className="ml-auto" />
+      )}
 
-          {crashes > 0 && (
-            <span className="text-orange-300">Crashes: {crashes}</span>
-          )}
+      {crashes > 0 && (
+        <span className="flex items-center gap-1.5 text-amber-300">
+          <TriangleAlert size={12} />
+          {crashes} crash{crashes === 1 ? "" : "es"}
+        </span>
+      )}
 
-          <span className={`rounded-full border px-3 py-1 ${apiStateTone(apiState)}`}>
-            API {apiState}
-          </span>
-        </div>
+      {processStatus?.server_version && (
+        <span className="hidden text-[var(--text-3)] xl:inline">llama.cpp {processStatus.server_version}</span>
+      )}
 
-        <div className="flex flex-wrap items-center gap-3">
-          <span className="text-slate-500">{apiUrl}</span>
-
-          {processStatus?.api_error && (
-            <span className="max-w-[28rem] truncate text-rose-300" title={processStatus.api_error}>
-              {processStatus.api_error}
-            </span>
-          )}
-
-          {contextStatus.total_tokens > 0 ? (
-            <span className={contextStatus.used_tokens > 0 ? kvColor : "text-slate-400"}>
-              KV:{" "}
-              {contextStatus.used_tokens > 0
-                ? `${contextStatus.used_tokens.toLocaleString()}/${contextStatus.total_tokens.toLocaleString()} (${pct}%)`
-                : `${contextStatus.total_tokens.toLocaleString()} ctx`}
-            </span>
-          ) : state === "Running" ? (
-            <span className="text-slate-500">KV: waiting...</span>
-          ) : null}
-
-          {processStatus?.server_version && (
-            <span className="text-slate-500">
-              llama.cpp {processStatus.server_version}
-            </span>
-          )}
-        </div>
-      </div>
+      {processStatus?.api_error && (
+        <span className="max-w-[260px] truncate text-rose-300" title={processStatus.api_error}>
+          {processStatus.api_error}
+        </span>
+      )}
     </footer>
   );
 }

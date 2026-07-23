@@ -11,7 +11,7 @@
 port = 8800
 host = "127.0.0.1"
 autostart = true
-default_ctx_size = 40960
+default_ctx_size = 32768
 tool_argument_repair_enabled = true
 # Empty or omitted means no Bearer auth is required.
 api_key = ""
@@ -42,17 +42,19 @@ use_mlock = false
 cont_batching = true
 parallel_slots = 1
 main_gpu = 0
-defrag_thold = 0.1
+# Legacy compatibility setting; no --defrag-thold flag is emitted.
+defrag_thold = 0.0
 rope_freq_scale = 0.0
 fit_mode = ""
 # cache_ram_mb = 8192
 # ctxcp = 4
 use_jinja = true
-reasoning_mode = ""
+reasoning_mode = "" # Tess/Qwen3.6 profiles resolve this explicitly to on or off
 template_mode = "repo"
 # template_name = "chatml"
 # custom_template_path = "C:\\path\\to\\template.jinja"
-# chat_template_kwargs_json = "{\"enable_thinking\":false}"
+# Model-specific template kwargs only; use reasoning_mode for thinking on/off.
+# chat_template_kwargs_json = "{}"
 cache_type_k = "q8_0"
 cache_type_v = "q8_0"
 kv_unified = true
@@ -74,6 +76,28 @@ model_load_timeout_secs = 300
 first_token_timeout_secs = 300
 inter_token_timeout_secs = 120
 health_poll_interval_ms = 150
+
+[image_generation]
+# Experimental native image runtime. It stays unavailable until enabled and
+# every file in the selected bundle validates.
+enabled = false
+runner_path = ""
+# Empty uses the app support `images` directory.
+output_dir = ""
+default_bundle = "qwen-image-2512-q6"
+default_profile = "quality" # preview, quality, max_quality
+warn_temperature_c = 85.0
+cooldown_temperature_c = 70.0
+
+# Add a bundle only after installing and verifying all three components:
+# [[image_generation.bundles]]
+# id = "qwen-image-2512-q6"
+# name = "Qwen-Image-2512 Q6"
+# architecture = "qwen_image"
+# quantization = "Q6_K"
+# transformer_path = "C:\\path\\to\\qwen-image-2512-q6_k.gguf"
+# text_encoder_path = "C:\\path\\to\\qwen2.5-vl-7b-q8_0.gguf"
+# vae_path = "C:\\path\\to\\qwen_image_vae.safetensors"
 
 [providers]
 active = "managed_llamacpp" # managed_llamacpp, lm_studio, sglang, openai

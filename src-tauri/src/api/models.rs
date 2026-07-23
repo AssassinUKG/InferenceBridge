@@ -27,6 +27,43 @@ pub struct LoadModelRequest {
         alias = "numCtx"
     )]
     pub context_size: Option<u32>,
+    #[serde(
+        default,
+        alias = "gpuLayers",
+        alias = "gpu_layers",
+        alias = "n_gpu_layers"
+    )]
+    pub gpu_layers: Option<i32>,
+    #[serde(default)]
+    pub threads: Option<u32>,
+    #[serde(default, alias = "threadsBatch", alias = "threads_batch")]
+    pub threads_batch: Option<u32>,
+    #[serde(default, alias = "batchSize", alias = "batch_size")]
+    pub batch_size: Option<u32>,
+    #[serde(default, alias = "ubatchSize", alias = "ubatch_size")]
+    pub ubatch_size: Option<u32>,
+    #[serde(default, alias = "flashAttn", alias = "flash_attn")]
+    pub flash_attn: Option<bool>,
+    #[serde(default, alias = "useMmap", alias = "use_mmap")]
+    pub use_mmap: Option<bool>,
+    #[serde(default, alias = "useMlock", alias = "use_mlock")]
+    pub use_mlock: Option<bool>,
+    #[serde(default, alias = "contBatching", alias = "cont_batching")]
+    pub cont_batching: Option<bool>,
+    #[serde(default, alias = "parallelSlots", alias = "parallel_slots")]
+    pub parallel_slots: Option<u32>,
+    #[serde(default, alias = "mainGpu", alias = "main_gpu")]
+    pub main_gpu: Option<i32>,
+    #[serde(default, alias = "cacheTypeK", alias = "cache_type_k")]
+    pub cache_type_k: Option<String>,
+    #[serde(default, alias = "cacheTypeV", alias = "cache_type_v")]
+    pub cache_type_v: Option<String>,
+    #[serde(default, alias = "kvUnified", alias = "kv_unified")]
+    pub kv_unified: Option<bool>,
+    #[serde(default, alias = "noWarmup", alias = "no_warmup")]
+    pub no_warmup: Option<bool>,
+    #[serde(default, alias = "ctxShift", alias = "ctx_shift")]
+    pub ctx_shift: Option<bool>,
     #[serde(default, alias = "hfRepo", alias = "hf_repo", alias = "repo_id")]
     pub hf_repo: Option<String>,
     #[serde(default, alias = "hfFile", alias = "hf_file", alias = "file")]
@@ -98,6 +135,8 @@ pub struct LoadModelRequest {
     pub draft_p_min: Option<f32>,
     #[serde(default, alias = "extraArgs", alias = "extra_args")]
     pub extra_args: Option<Vec<String>>,
+    #[serde(default, alias = "attachMmproj", alias = "attach_mmproj")]
+    pub attach_mmproj: Option<bool>,
     #[serde(default)]
     pub echo_load_config: bool,
     #[serde(default, alias = "forceReload", alias = "force_reload")]
@@ -167,6 +206,22 @@ pub async fn load_model(
         model_name.clone(),
         context_size,
         crate::commands::model::RuntimeLoadOverrides {
+            gpu_layers: req.gpu_layers,
+            threads: req.threads,
+            threads_batch: req.threads_batch,
+            batch_size: req.batch_size,
+            ubatch_size: req.ubatch_size,
+            flash_attn: req.flash_attn,
+            use_mmap: req.use_mmap,
+            use_mlock: req.use_mlock,
+            cont_batching: req.cont_batching,
+            parallel_slots: req.parallel_slots,
+            main_gpu: req.main_gpu,
+            cache_type_k: req.cache_type_k.clone(),
+            cache_type_v: req.cache_type_v.clone(),
+            kv_unified: req.kv_unified,
+            no_warmup: req.no_warmup,
+            ctx_shift: req.ctx_shift,
             hf_repo: req.hf_repo.clone(),
             hf_file: req.hf_file.clone(),
             fit_mode: req.fit_mode.clone(),
@@ -186,8 +241,9 @@ pub async fn load_model(
             draft_min_tokens: req.draft_min_tokens,
             draft_p_min: req.draft_p_min,
             extra_args: req.extra_args.clone(),
-            attach_mmproj: None,
+            attach_mmproj: req.attach_mmproj,
             force_reload: req.force_reload,
+            ..Default::default()
         },
     )
     .await
@@ -255,6 +311,56 @@ mod tests {
 
         assert!(request.force_reload);
         assert_eq!(request.requested_context_size(), Some(16384));
+    }
+
+    #[test]
+    fn deserializes_attach_mmproj_alias_for_model_load() {
+        let request: LoadModelRequest = serde_json::from_str(
+            r#"{
+                "model": "Tess-4-27B-Q4_K_M.gguf",
+                "attachMmproj": false
+            }"#,
+        )
+        .expect("load request should parse attachMmproj");
+
+        assert_eq!(request.attach_mmproj, Some(false));
+    }
+
+    #[test]
+    fn deserializes_tess_runtime_load_controls() {
+        let request: LoadModelRequest = serde_json::from_str(
+            r#"{
+                "model": "Tess-4-27B-Q4_K_M.gguf",
+                "contextLength": 32768,
+                "gpuLayers": -1,
+                "parallel_slots": 1,
+                "flashAttn": true,
+                "cache_type_k": "q8_0",
+                "cacheTypeV": "q8_0",
+                "kvUnified": true,
+                "cont_batching": true,
+                "threads": 8,
+                "batchSize": 2048,
+                "ubatch_size": 512,
+                "ctxShift": false,
+                "attachMmproj": true
+            }"#,
+        )
+        .expect("Tess load controls should deserialize");
+
+        assert_eq!(request.requested_context_size(), Some(32_768));
+        assert_eq!(request.gpu_layers, Some(-1));
+        assert_eq!(request.parallel_slots, Some(1));
+        assert_eq!(request.flash_attn, Some(true));
+        assert_eq!(request.cache_type_k.as_deref(), Some("q8_0"));
+        assert_eq!(request.cache_type_v.as_deref(), Some("q8_0"));
+        assert_eq!(request.kv_unified, Some(true));
+        assert_eq!(request.cont_batching, Some(true));
+        assert_eq!(request.threads, Some(8));
+        assert_eq!(request.batch_size, Some(2048));
+        assert_eq!(request.ubatch_size, Some(512));
+        assert_eq!(request.ctx_shift, Some(false));
+        assert_eq!(request.attach_mmproj, Some(true));
     }
 
     #[test]

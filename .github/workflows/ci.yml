@@ -24,6 +24,9 @@ jobs:
       - name: Build frontend
         run: npm run build
 
+      - name: Frontend and behavior tests
+        run: npm test
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
 
@@ -44,3 +47,6 @@ jobs:
 
       - name: Cargo check
         run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Rust library tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib

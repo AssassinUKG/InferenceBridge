@@ -13,7 +13,7 @@ export const PRESETS: Record<string, Preset> = {
     label: "Coding",
     icon: "</>",
     description:
-      "Near-greedy. Deterministic, low hallucination. Enable Thinking for best results on Qwen3/R1.",
+      "Near-greedy sampler for deterministic code. It does not change the loaded reasoning mode.",
     sampling: {
       temperature: 0.1,
       top_p: 0.95,
@@ -25,7 +25,7 @@ export const PRESETS: Record<string, Preset> = {
   chat: {
     label: "Chat",
     icon: "...",
-    description: "Balanced creativity and coherence. Good for conversation and Q&A.",
+    description: "Balanced creativity and coherence. Sampler only; it does not change reasoning mode.",
     sampling: {
       temperature: 0.7,
       top_p: 0.8,
@@ -37,7 +37,7 @@ export const PRESETS: Record<string, Preset> = {
   creative: {
     label: "Creative",
     icon: "*",
-    description: "Higher temperature for diverse, imaginative, varied responses.",
+    description: "Higher temperature for varied responses. Sampler only; it does not change reasoning mode.",
     sampling: {
       temperature: 0.9,
       top_p: 0.95,
@@ -49,7 +49,7 @@ export const PRESETS: Record<string, Preset> = {
   precise: {
     label: "Precise",
     icon: "=",
-    description: "Greedy and deterministic. Best for structured output, JSON, and classification.",
+    description: "Greedy sampler for structured output, JSON, and classification. Reasoning mode is unchanged.",
     sampling: {
       temperature: 0.0,
       top_p: 1.0,
@@ -61,7 +61,7 @@ export const PRESETS: Record<string, Preset> = {
   reasoning: {
     label: "Reasoning",
     icon: "?",
-    description: "Tuned for math, logic, and multi-step reasoning. Thinking mode on.",
+    description: "Sampler for math and multi-step work. Enable reasoning in the load dialog; this preset does not change it.",
     sampling: {
       temperature: 0.6,
       top_p: 0.95,
@@ -87,6 +87,7 @@ export function modelSupportsThinking(modelName: string | null | undefined): boo
   return (
     m.includes("qwen3") ||
     m.includes("qwen3.5") ||
+    m.includes("tess-4") ||
     (m.includes("deepseek") && (m.includes("r1") || m.includes("reasoning")))
   );
 }

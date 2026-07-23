@@ -57,6 +57,15 @@ pub(crate) fn reachable_probe_host(host: &str) -> String {
     }
 }
 
+pub(crate) fn socket_bind_address(host: &str, port: u16) -> String {
+    let host = host.trim();
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 pub(crate) fn reachable_api_url(host: &str, port: u16) -> String {
     let probe_host = reachable_probe_host(host);
     if probe_host.contains(':') && !probe_host.starts_with('[') {
@@ -98,7 +107,7 @@ async fn serve_api_server(
 ) -> anyhow::Result<()> {
     let attempt = API_SERVER_ATTEMPTS.fetch_add(1, Ordering::SeqCst) + 1;
     let pid = std::process::id();
-    let addr = format!("{host}:{port}");
+    let addr = socket_bind_address(host, port);
 
     tracing::info!(pid, attempt, source, %addr, "API server start requested");
 
@@ -205,10 +214,10 @@ async fn evict_port_blocker(host: &str, port: u16, current_pid: u32) {
     {
         use std::net::TcpListener;
 
-        let probe_host = reachable_probe_host(host);
+        let bind_addr = socket_bind_address(host, port);
 
         // Fast path — nothing to do.
-        if TcpListener::bind(format!("{probe_host}:{port}")).is_ok() {
+        if TcpListener::bind(&bind_addr).is_ok() {
             tracing::debug!(port, "evict_port_blocker: port is free, nothing to do");
             return;
         }
@@ -240,7 +249,7 @@ async fn evict_port_blocker(host: &str, port: u16, current_pid: u32) {
                 current_pid,
                 "evict_port_blocker: port is still owned by this process; waiting for previous listener to release"
             );
-            if wait_until_port_bindable(&probe_host, port, Duration::from_secs(5)).await {
+            if wait_until_port_bindable(&bind_addr, Duration::from_secs(5)).await {
                 tracing::info!(
                     port,
                     owner_pid,
@@ -286,7 +295,7 @@ async fn evict_port_blocker(host: &str, port: u16, current_pid: u32) {
             "evict_port_blocker: taskkill issued"
         );
 
-        let freed = wait_until_port_bindable(&probe_host, port, Duration::from_secs(5)).await;
+        let freed = wait_until_port_bindable(&bind_addr, Duration::from_secs(5)).await;
 
         if freed {
             tracing::info!(
@@ -313,10 +322,10 @@ async fn evict_port_blocker(host: &str, port: u16, current_pid: u32) {
 }
 
 #[cfg(windows)]
-async fn wait_until_port_bindable(probe_host: &str, port: u16, timeout: Duration) -> bool {
+async fn wait_until_port_bindable(bind_addr: &str, timeout: Duration) -> bool {
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
-        if std::net::TcpListener::bind(format!("{probe_host}:{port}")).is_ok() {
+        if std::net::TcpListener::bind(bind_addr).is_ok() {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -468,7 +477,7 @@ fn force_kill_pid(pid: u32) -> bool {
 /// Bind the public API listener. Retries long enough for Windows to release a
 /// listener that was just stopped during settings-save/API restarts.
 async fn bind_with_retry(host: &str, port: u16) -> std::io::Result<tokio::net::TcpListener> {
-    let addr = format!("{host}:{port}");
+    let addr = socket_bind_address(host, port);
     const MAX_ATTEMPTS: u32 = 20;
     const RETRY_DELAY_MS: u64 = 250;
 
@@ -978,7 +987,10 @@ impl Drop for ApiServerGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{constant_time_eq, is_api_auth_exempt, port_owner_is_killable, strip_utf8_bom};
+    use super::{
+        constant_time_eq, is_api_auth_exempt, port_owner_is_killable, reachable_api_url,
+        socket_bind_address, strip_utf8_bom,
+    };
     use axum::body::Bytes;
     use axum::http::Method;
 
@@ -1025,5 +1037,20 @@ mod tests {
         assert!(!port_owner_is_killable(100, Some("node.exe"), 200));
         assert!(!port_owner_is_killable(100, None, 200));
         assert!(!port_owner_is_killable(100, Some("llama-server.exe"), 100));
+    }
+
+    #[test]
+    fn wildcard_socket_checks_use_exact_bind_address_while_http_probes_use_loopback() {
+        assert_eq!(socket_bind_address("0.0.0.0", 8800), "0.0.0.0:8800");
+        assert_eq!(
+            reachable_api_url("0.0.0.0", 8800),
+            "http://127.0.0.1:8800/v1"
+        );
+    }
+
+    #[test]
+    fn ipv6_socket_checks_preserve_wildcard_while_http_probes_use_loopback() {
+        assert_eq!(socket_bind_address("::", 8800), "[::]:8800");
+        assert_eq!(reachable_api_url("::", 8800), "http://[::1]:8800/v1");
     }
 }

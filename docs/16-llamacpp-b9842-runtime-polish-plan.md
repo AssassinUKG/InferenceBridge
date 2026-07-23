@@ -32,7 +32,10 @@ The current downloader still matches the latest Windows CUDA asset layout:
 - Recent CUDA/scheduler fixes after `b9804` are worth taking as quiet stability/performance updates.
 - DFlash speculative decoding landed upstream and uses `--spec-type draft-dflash` with a compatible draft model.
 - `--reasoning-preserve` landed upstream; useful for debugging/thinking preservation, but it should stay disabled by default because it can bloat prompts/context.
-- InferenceBridge already emits `--spec-type` without `-md`, so self-MTP support is already correct.
+- InferenceBridge can emit `--spec-type` without `-md` for a main GGUF that
+  genuinely contains self-MTP layers. A repository or path containing `MTP` is
+  not sufficient evidence; ordinary main GGUFs must keep speculation disabled
+  unless a compatible separate draft is selected.
 
 ## Implementation Steps
 
@@ -59,8 +62,13 @@ For Qwen3.6 27B on RTX 3090:
 - Keep `cont_batching=true`.
 - Keep `parallel_slots=1` for agent stability.
 - Keep `cache_type_k=q8_0` and `cache_type_v=q8_0` for quality.
-- Use self-MTP first: `spec_type=draft-mtp`, `spec_draft_n_max=2`, blank draft model path.
+- Keep speculative decoding disabled by default. For Tess-4-27B, use
+  `draft-mtp` only with a matching separate `mtp-Tess-4-27B-*.gguf` draft; do
+  not enable self-MTP on the ordinary main GGUF.
 - Test DFlash only with a matching Qwen DFlash draft GGUF: `spec_type=draft-dflash`, `spec_draft_n_max=8-15`, draft model path set.
+
+The current Tess-specific 32K, reasoning, tools, vision, and MTP decisions are
+canonical in [docs/20-tess-4-27b-runtime-guide.md](20-tess-4-27b-runtime-guide.md).
 
 ## Notes
 

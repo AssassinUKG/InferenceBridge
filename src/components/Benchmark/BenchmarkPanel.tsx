@@ -2,9 +2,23 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 
 import * as api from "../../lib/tauri";
 import type { ModelTestStats } from "../../lib/tauri";
+import {
+  applyBenchmarkDeletion,
+  retainExpandedBenchmarkRows,
+  type BenchmarkDeletion,
+} from "../../lib/benchmarkData";
+import {
+  BENCHMARK_RUNTIME_CANDIDATES,
+  BENCHMARK_SAMPLING_CANDIDATES,
+  benchmarkCombinationCount,
+  selectedRuntimeCandidates,
+  selectedSamplingCandidates,
+  type BenchmarkRuntimeId,
+  type BenchmarkSamplingId,
+} from "../../lib/benchmarkMatrix";
 import type { ModelInfo, ProcessStatusInfo } from "../../lib/types";
 
-type BenchmarkKind = "chat" | "decode" | "instruction_follow" | "prompt" | "context_recall" | "tool_single" | "tool_sequence" | "tool_refusal" | "agent_action" | "reasoning" | "coding" | "agent_prompt_injection" | "agent_secret_handling" | "agent_destructive_restraint" | "agent_patch_scope" | "agent_failed_tool_recovery" | "agent_long_context_conflict" | "agent_uncertainty" | "cyber_pentest" | "cyber_xss_lab" | "cyber_sqli_lab" | "cyber_triage";
+type BenchmarkKind = "chat" | "decode" | "instruction_follow" | "prompt" | "context_recall" | "tool_single" | "tool_sequence" | "tool_refusal" | "agent_action" | "agent_tool_loop" | "reasoning" | "coding" | "agent_prompt_injection" | "agent_secret_handling" | "agent_destructive_restraint" | "agent_patch_scope" | "agent_failed_tool_recovery" | "agent_long_context_conflict" | "agent_uncertainty" | "cyber_pentest" | "cyber_xss_lab" | "cyber_sqli_lab" | "cyber_triage";
 type RunStatus = "queued" | "running" | "passed" | "failed" | "cancelled";
 type BenchmarkView = "setup" | "results" | "summary";
 type BenchmarkGroup = "Core" | "Tools" | "Agent" | "Cyber";
@@ -16,6 +30,7 @@ interface BenchmarkCase {
   description: string;
   prompt: string | ((contextSize: number) => string);
   maxTokens: number;
+  execution?: "single" | "agent-tool-loop";
   score: (stats: ModelTestStats) => { passed: boolean; score: number; note: string };
 }
 
@@ -25,6 +40,7 @@ const PROMOTION_GATE_TESTS: BenchmarkKind[] = [
   "tool_sequence",
   "tool_refusal",
   "agent_action",
+  "agent_tool_loop",
   "agent_prompt_injection",
   "agent_secret_handling",
   "agent_destructive_restraint",
@@ -36,6 +52,8 @@ interface BenchmarkResult {
   model: ModelInfo;
   test: BenchmarkCase;
   contextSize: number;
+  samplingId: BenchmarkSamplingId;
+  runtimeId: BenchmarkRuntimeId;
   status: RunStatus;
   stats: ModelTestStats | null;
   score: number | null;
@@ -58,6 +76,8 @@ interface BenchmarkPreset {
   selectedTests: BenchmarkKind[];
   contextLengths: string[];
   enabledContextSlots: boolean[];
+  selectedSamplingIds?: BenchmarkSamplingId[];
+  selectedRuntimeIds?: BenchmarkRuntimeId[];
   createdAt: string;
 }
 
@@ -323,6 +343,28 @@ const TESTS: BenchmarkCase[] = [
     },
   },
   {
+    id: "agent_tool_loop",
+    group: "Tools",
+    name: "Executed Agent Tool Loop",
+    description: "Runs create, append, verify, and final-answer turns through native tool schemas.",
+    prompt: "InferenceBridge executes this isolated workflow in memory through its production chat/tool path.",
+    maxTokens: 512,
+    execution: "agent-tool-loop",
+    score: (stats) => {
+      const successful = stats.agent_steps.filter((step) => step.ok).map((step) => step.tool);
+      const exactSequence = successful.join(",") === "create_file,append_file,verify_file";
+      const recoveredErrors = stats.agent_steps.filter((step) => !step.ok).length;
+      const passed = stats.agent_success === true && exactSequence;
+      return {
+        passed,
+        score: passed ? Math.max(0.75, 1 - recoveredErrors * 0.08) : exactSequence ? 0.55 : 0.15,
+        note: passed
+          ? `Executed and verified the serial file chain${recoveredErrors ? ` after ${recoveredErrors} recoverable error(s)` : " without recovery"}.`
+          : stats.agent_failure ?? "The executed agent tool loop did not complete.",
+      };
+    },
+  },
+  {
     id: "reasoning",
     group: "Core",
     name: "Reasoning",
@@ -496,7 +538,7 @@ function reliabilityColor(band: ReliabilityBand) {
 }
 
 function isToolReliabilityTest(test: BenchmarkCase) {
-  return test.id.startsWith("tool_") || test.id === "agent_action";
+  return test.id.startsWith("tool_") || test.id === "agent_action" || test.id === "agent_tool_loop";
 }
 
 function isAgentReliabilityTest(test: BenchmarkCase) {
@@ -526,6 +568,10 @@ function resultReliabilityGate(result: BenchmarkResult): ReliabilityGate | null 
     if (leftover.length > 0) {
       score -= 0.2;
       reasons.push("Tool-call text had leftover unparsed content.");
+    }
+    if (result.test.id === "agent_tool_loop" && result.stats?.agent_success !== true) {
+      score -= 0.45;
+      reasons.push(result.stats?.agent_failure ?? "Executed agent tool loop did not complete.");
     }
   }
   if ((result.stats?.completion_tokens ?? 0) >= result.test.maxTokens) {
@@ -619,18 +665,29 @@ function modelBestForAdvice(model: ModelInfo, test: BenchmarkCase, stats: ModelT
   const prompt = stats?.prompt_tokens_per_second ?? 0;
   if (test.id === "decode" && decode >= 100) advice.push(`Best for fast chat, agents, and repeated short tasks at ${model.quant ?? "this quant"}.`);
   if ((test.id === "prompt" || test.id === "context_recall") && prompt >= 1000) advice.push("Strong for long prompts and document/context-heavy work.");
-  if ((test.id.startsWith("tool_") || test.id === "agent_action") && model.supports_tools) advice.push("Good candidate for tool use; keep template mode on auto/repo and Jinja enabled where the profile requires it.");
+  if ((test.id.startsWith("tool_") || test.id === "agent_action" || test.id === "agent_tool_loop") && model.supports_tools) advice.push("Good candidate for tool use; keep template mode on auto/repo and Jinja enabled where the profile requires it.");
   if ((test.id === "reasoning" || test.id === "chat") && model.supports_reasoning) advice.push("Good candidate for reasoning workloads; use reasoning auto/on and deterministic seeds for comparisons.");
   if (model.size_gb > 12 && decode > 0 && decode < 80) advice.push("For faster interactive use, compare this against Q4_K_M or a smaller parameter model.");
   return advice;
 }
 
 function toCsv(results: BenchmarkResult[]) {
-  const header = ["model", "quant", "size_gb", "requested_context_size", "actual_prompt_tokens", "test", "status", "quality", "score", "reliability_band", "reliability_score", "load_ms", "load_reused", "ttft_ms", "prompt_eval_tps", "generation_tps", "e2e_tps", "elapsed_ms", "completion_tokens", "tool_calls", "tool_remaining_text", "advice", "error"];
+  const header = ["model", "quant", "size_gb", "sampling_candidate", "runtime_candidate", "temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty", "seed", "spec_type", "spec_draft_n_max", "requested_context_size", "actual_prompt_tokens", "test", "status", "quality", "score", "reliability_band", "reliability_score", "load_ms", "load_reused", "ttft_ms", "prompt_eval_tps", "generation_tps", "e2e_tps", "elapsed_ms", "completion_tokens", "tool_calls", "agent_steps", "agent_success", "agent_failure", "tool_remaining_text", "advice", "error"];
   const rows = results.map((result) => [
     result.model.filename,
     result.model.quant ?? "",
     result.model.size_gb.toFixed(2),
+    result.samplingId,
+    result.runtimeId,
+    result.stats?.sampling?.temperature ?? "",
+    result.stats?.sampling?.top_p ?? "",
+    result.stats?.sampling?.top_k ?? "",
+    result.stats?.sampling?.min_p ?? "",
+    result.stats?.sampling?.presence_penalty ?? "",
+    result.stats?.sampling?.repeat_penalty ?? "",
+    result.stats?.sampling?.seed ?? "",
+    result.stats?.runtime?.spec_type ?? "",
+    result.stats?.runtime?.spec_draft_n_max ?? "",
     result.contextSize,
     result.stats?.prompt_tokens ?? "",
     result.test.name,
@@ -648,6 +705,9 @@ function toCsv(results: BenchmarkResult[]) {
     result.stats?.elapsed_ms ?? "",
     result.stats?.completion_tokens ?? "",
     result.stats?.tool_calls ? JSON.stringify(result.stats.tool_calls) : "",
+    result.stats?.agent_steps ? JSON.stringify(result.stats.agent_steps) : "",
+    result.stats?.agent_success ?? "",
+    result.stats?.agent_failure ?? "",
     result.stats?.tool_remaining_text ?? "",
     result.advice.join(" "),
     result.error ?? "",
@@ -690,7 +750,12 @@ function serializeResult(result: BenchmarkResult): StoredBenchmarkResult {
 function restoreResult(result: StoredBenchmarkResult): BenchmarkResult | null {
   const test = TESTS.find((item) => item.id === result.testId);
   if (!test) return null;
-  const restored = { ...result, test };
+  const restored = {
+    ...result,
+    test,
+    samplingId: result.samplingId ?? "deterministic" as BenchmarkSamplingId,
+    runtimeId: result.runtimeId ?? "auto" as BenchmarkRuntimeId,
+  };
   return { ...restored, reliability: restored.reliability ?? resultReliabilityGate(restored) };
 }
 
@@ -725,6 +790,40 @@ function makeHistoryRun(results: BenchmarkResult[]): BenchmarkHistoryRun | null 
   };
 }
 
+function InlineDeleteConfirmation({
+  message,
+  onConfirm,
+  onCancel,
+  compact = false,
+}: {
+  message: string;
+  onConfirm: () => void;
+  onCancel: () => void;
+  compact?: boolean;
+}) {
+  return (
+    <div className={compact ? "flex flex-col items-start gap-1" : "flex items-center justify-end gap-2"}>
+      <span className="text-[11px]" style={{ color: "#fca5a5" }}>{message}</span>
+      <button
+        type="button"
+        onClick={onConfirm}
+        className="rounded px-2 py-1 text-xs font-semibold"
+        style={{ background: "rgba(248,113,113,0.15)", border: "1px solid rgba(248,113,113,0.3)", color: "#f87171" }}
+      >
+        Confirm
+      </button>
+      <button
+        type="button"
+        onClick={onCancel}
+        className="rounded px-2 py-1 text-xs"
+        style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}
+      >
+        Cancel
+      </button>
+    </div>
+  );
+}
+
 export function BenchmarkPanel({
   models,
   processStatus,
@@ -737,13 +836,14 @@ export function BenchmarkPanel({
   const [selectedTests, setSelectedTests] = useState<BenchmarkKind[]>(["prompt", "context_recall"]);
   const [contextLengths, setContextLengths] = useState<string[]>(["8k", "16k", "32k"]);
   const [enabledContextSlots, setEnabledContextSlots] = useState<boolean[]>([true, true, true]);
-  const [temperature] = useState(0);
-  const [seed] = useState(42);
+  const [selectedSamplingIds, setSelectedSamplingIds] = useState<BenchmarkSamplingId[]>(["deterministic"]);
+  const [selectedRuntimeIds, setSelectedRuntimeIds] = useState<BenchmarkRuntimeId[]>(["auto"]);
   const [results, setResults] = useState<BenchmarkResult[]>(loadStoredResults);
   const [history, setHistory] = useState<BenchmarkHistoryRun[]>(() => readStorageJson<BenchmarkHistoryRun[]>(BENCHMARK_HISTORY_STORAGE_KEY, []));
   const [presets, setPresets] = useState<BenchmarkPreset[]>(() => readStorageJson<BenchmarkPreset[]>(BENCHMARK_PRESETS_STORAGE_KEY, []));
   const [presetName, setPresetName] = useState("");
   const [expandedResultIds, setExpandedResultIds] = useState<Record<string, boolean>>({});
+  const [pendingDeletion, setPendingDeletion] = useState<BenchmarkDeletion | null>(null);
   const [running, setRunning] = useState(false);
   const [current, setCurrent] = useState<string | null>(null);
   const [activeView, setActiveView] = useState<BenchmarkView>("setup");
@@ -778,6 +878,20 @@ export function BenchmarkPanel({
     () => parseContextLengths(contextLengths.filter((_, index) => enabledContextSlots[index])),
     [contextLengths, enabledContextSlots]
   );
+  const selectedSamplingOptions = useMemo(
+    () => selectedSamplingCandidates(selectedSamplingIds),
+    [selectedSamplingIds]
+  );
+  const plannedRunCount = useMemo(
+    () => benchmarkCombinationCount(
+      selectedModelObjects.map((model) => model.filename),
+      selectedContextLengths.length,
+      selectedTestObjects.length,
+      selectedSamplingIds,
+      selectedRuntimeIds,
+    ),
+    [selectedContextLengths.length, selectedModelObjects, selectedRuntimeIds, selectedSamplingIds, selectedTestObjects.length]
+  );
   const bestDecode = results.reduce((best, result) => Math.max(best, result.stats?.decode_tokens_per_second ?? 0), 0);
   const bestTtft = results.reduce<number | null>((best, result) => {
     const value = result.stats?.ttft_ms;
@@ -796,8 +910,10 @@ export function BenchmarkPanel({
   const modelScores = useMemo(() => {
     const grouped = new Map<string, { label: string; scoreTotal: number; scored: number; passed: number; decode: number; prompt: number }>();
     for (const result of finishedResults) {
-      const key = result.model.filename;
-      const entry = grouped.get(key) ?? { label: modelLabel(result.model), scoreTotal: 0, scored: 0, passed: 0, decode: 0, prompt: 0 };
+      const key = `${result.model.filename}::${result.contextSize}::${result.samplingId}::${result.runtimeId}`;
+      const sampling = BENCHMARK_SAMPLING_CANDIDATES.find((candidate) => candidate.id === result.samplingId)?.label ?? result.samplingId;
+      const runtime = BENCHMARK_RUNTIME_CANDIDATES.find((candidate) => candidate.id === result.runtimeId)?.label ?? result.runtimeId;
+      const entry = grouped.get(key) ?? { label: `${modelLabel(result.model)} / ${result.contextSize.toLocaleString()} ctx / ${sampling} / ${runtime}`, scoreTotal: 0, scored: 0, passed: 0, decode: 0, prompt: 0 };
       if (result.score != null) {
         entry.scoreTotal += result.score;
         entry.scored += 1;
@@ -872,12 +988,38 @@ export function BenchmarkPanel({
     setExpandedResultIds((current) => ({ ...current, [id]: !current[id] }));
   }
 
+  function requestDeletion(deletion: BenchmarkDeletion) {
+    if (!running) setPendingDeletion(deletion);
+  }
+
+  function confirmDeletion() {
+    if (!pendingDeletion || running) return;
+    const next = applyBenchmarkDeletion({ results, history }, pendingDeletion);
+    setResults(next.results);
+    setHistory(next.history);
+    const remainingIds = new Set(next.results.map((result) => result.id));
+    setExpandedResultIds((current) => retainExpandedBenchmarkRows(current, remainingIds));
+    setPendingDeletion(null);
+  }
+
   function setContextLength(index: number, value: string) {
     setContextLengths((current) => current.map((item, itemIndex) => (itemIndex === index ? value : item)));
   }
 
   function toggleContextSlot(index: number) {
     setEnabledContextSlots((current) => current.map((enabled, itemIndex) => (itemIndex === index ? !enabled : enabled)));
+  }
+
+  function toggleSampling(id: BenchmarkSamplingId) {
+    setSelectedSamplingIds((current) => current.includes(id)
+      ? current.filter((item) => item !== id)
+      : [...current, id]);
+  }
+
+  function toggleRuntime(id: BenchmarkRuntimeId) {
+    setSelectedRuntimeIds((current) => current.includes(id)
+      ? current.filter((item) => item !== id)
+      : [...current, id]);
   }
 
   function savePreset() {
@@ -889,6 +1031,8 @@ export function BenchmarkPanel({
       selectedTests,
       contextLengths,
       enabledContextSlots,
+      selectedSamplingIds,
+      selectedRuntimeIds,
       createdAt: new Date().toISOString(),
     };
     setPresets((current) => [preset, ...current].slice(0, 20));
@@ -900,6 +1044,8 @@ export function BenchmarkPanel({
     setSelectedTests(preset.selectedTests);
     setContextLengths(preset.contextLengths);
     setEnabledContextSlots(preset.enabledContextSlots);
+    setSelectedSamplingIds(preset.selectedSamplingIds?.length ? preset.selectedSamplingIds : ["deterministic"]);
+    setSelectedRuntimeIds(preset.selectedRuntimeIds?.length ? preset.selectedRuntimeIds : ["auto"]);
   }
 
   function deletePreset(id: string) {
@@ -916,6 +1062,7 @@ export function BenchmarkPanel({
       .map(restoreResult)
       .filter((result): result is BenchmarkResult => !!result);
     setResults(restored);
+    setPendingDeletion(null);
     setActiveView("results");
   }
 
@@ -929,7 +1076,7 @@ export function BenchmarkPanel({
   }
 
   async function runBenchmarks() {
-    if (selectedModelObjects.length === 0 || selectedTestObjects.length === 0 || selectedContextLengths.length === 0 || running) return;
+    if (selectedModelObjects.length === 0 || selectedTestObjects.length === 0 || selectedContextLengths.length === 0 || selectedSamplingOptions.length === 0 || plannedRunCount === 0 || running) return;
     cancelRef.current = false;
     setRunning(true);
     setResults([]);
@@ -945,31 +1092,45 @@ export function BenchmarkPanel({
         const maxContext = model.max_context_window ?? Math.max(...selectedContextLengths, defaultContext(model));
         const modelContexts = Array.from(new Set(selectedContextLengths.map((requestedContext) => Math.max(512, Math.min(requestedContext, maxContext))))).sort((a, b) => b - a);
         for (const runContext of modelContexts) {
-          for (const test of selectedTestObjects) {
-            const id = `${Date.now()}-${model.filename}-${runContext}-${test.id}`;
+          const runtimeCandidates = selectedRuntimeCandidates(selectedRuntimeIds, model.filename);
+          for (const runtime of runtimeCandidates) {
+            for (const sampling of selectedSamplingOptions) {
+              for (const test of selectedTestObjects) {
+            const id = `${Date.now()}-${model.filename}-${runContext}-${runtime.id}-${sampling.id}-${test.id}`;
             if (cancelRef.current) {
-              const cancelledBase = { id, model, test, contextSize: runContext, status: "cancelled" as RunStatus, stats: null, score: null, passed: null, advice: ["Benchmark was cancelled before this test started."], error: null, reliability: null, startedAt: new Date().toISOString(), finishedAt: new Date().toISOString() };
+              const cancelledBase = { id, model, test, contextSize: runContext, samplingId: sampling.id, runtimeId: runtime.id, status: "cancelled" as RunStatus, stats: null, score: null, passed: null, advice: ["Benchmark was cancelled before this test started."], error: null, reliability: null, startedAt: new Date().toISOString(), finishedAt: new Date().toISOString() };
               const cancelledResult = { ...cancelledBase, reliability: resultReliabilityGate(cancelledBase) };
               upsertRunResult(cancelledResult);
               setResults((currentResults) => [...currentResults, cancelledResult]);
               continue;
             }
-            setCurrent(`${modelLabel(model)} / ${runContext.toLocaleString()} ctx / ${test.name}`);
+            setCurrent(`${modelLabel(model)} / ${runContext.toLocaleString()} ctx / ${runtime.label} / ${sampling.label} / ${test.name}`);
             const startedAt = new Date().toISOString();
-            const runningBase = { id, model, test, contextSize: runContext, status: "running" as RunStatus, stats: null, score: null, passed: null, advice: [], error: null, reliability: null, startedAt, finishedAt: null };
+            const runningBase = { id, model, test, contextSize: runContext, samplingId: sampling.id, runtimeId: runtime.id, status: "running" as RunStatus, stats: null, score: null, passed: null, advice: [], error: null, reliability: null, startedAt, finishedAt: null };
             const runningResult = { ...runningBase, reliability: resultReliabilityGate(runningBase) };
             upsertRunResult(runningResult);
             setResults((currentResults) => [...currentResults, runningResult]);
             try {
-              const stats = await api.runModelTest({
+              const request = {
                 modelName: model.filename,
                 contextSize: runContext,
-                prompt: promptForTest(test, runContext),
-                maxTokens: test.maxTokens,
-                temperature: 0,
-                topP: 0.9,
-                seed: 42,
-              });
+                temperature: sampling.temperature,
+                topP: sampling.topP,
+                topK: sampling.topK,
+                minP: sampling.minP,
+                presencePenalty: sampling.presencePenalty,
+                repeatPenalty: sampling.repeatPenalty,
+                seed: sampling.seed,
+                specType: runtime.specType,
+                specDraftNMax: runtime.specDraftNMax,
+              };
+              const stats = test.execution === "agent-tool-loop"
+                ? await api.runAgentToolLoop(request)
+                : await api.runModelTest({
+                    ...request,
+                    prompt: promptForTest(test, runContext),
+                    maxTokens: test.maxTokens,
+                  });
               const scored = test.score(stats);
               const finishedBase = { ...runningResult, status: scored.passed ? "passed" as RunStatus : "failed" as RunStatus, stats, score: scored.score, passed: scored.passed, advice: [], finishedAt: new Date().toISOString() };
               const reliability = resultReliabilityGate(finishedBase);
@@ -1008,6 +1169,8 @@ export function BenchmarkPanel({
                 )
               );
             }
+              }
+            }
           }
         }
       }
@@ -1028,13 +1191,31 @@ export function BenchmarkPanel({
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <h2 className="text-2xl font-semibold">Benchmark</h2>
-            <p className="mt-1 text-sm" style={{ color: "var(--text-2)" }}>Compare local models with repeatable speed, structure, and reasoning tests.</p>
+            <p className="mt-1 text-sm" style={{ color: "var(--text-2)" }}>Compare models and runtime/sampling settings with repeatable quality tests and an executed agent tool loop.</p>
           </div>
           <div className="flex flex-wrap gap-2">
-            <button onClick={() => void runBenchmarks()} disabled={running || selectedModelObjects.length === 0 || selectedTestObjects.length === 0 || selectedContextLengths.length === 0} className="rounded px-4 py-2 text-sm font-semibold disabled:opacity-50" style={{ background: "#22d3ee", color: "#041014", border: "none", cursor: running ? "wait" : "pointer" }}>{running ? "Running..." : "Run benchmark"}</button>
+            <button onClick={() => void runBenchmarks()} disabled={running || plannedRunCount === 0} className="ib-button ib-button-primary h-9 px-4 text-sm disabled:opacity-50">{running ? "Running..." : `Run ${plannedRunCount} test${plannedRunCount === 1 ? "" : "s"}`}</button>
             <button onClick={() => void cancelBenchmarks()} disabled={!running} className="rounded px-4 py-2 text-sm font-medium disabled:opacity-40" style={{ background: "rgba(248,113,113,0.12)", border: "1px solid rgba(248,113,113,0.24)", color: "#f87171" }}>Cancel</button>
             <button onClick={() => downloadText("inferencebridge-benchmark.json", JSON.stringify(results, null, 2), "application/json")} disabled={results.length === 0} className="rounded px-3 py-2 text-sm disabled:opacity-40" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}>Export JSON</button>
             <button onClick={() => downloadText("inferencebridge-benchmark.csv", toCsv(results), "text/csv")} disabled={results.length === 0} className="rounded px-3 py-2 text-sm disabled:opacity-40" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-1)" }}>Export CSV</button>
+            {pendingDeletion?.scope === "all" ? (
+              <InlineDeleteConfirmation
+                message="Clear results and history?"
+                onConfirm={confirmDeletion}
+                onCancel={() => setPendingDeletion(null)}
+              />
+            ) : (
+              <button
+                type="button"
+                onClick={() => requestDeletion({ scope: "all" })}
+                disabled={running || (results.length === 0 && history.length === 0)}
+                title="Clear current results and saved run history. Saved presets are kept."
+                className="rounded px-3 py-2 text-sm disabled:opacity-40"
+                style={{ background: "rgba(248,113,113,0.08)", border: "1px solid rgba(248,113,113,0.22)", color: "#f87171" }}
+              >
+                Clear all data
+              </button>
+            )}
           </div>
         </div>
         <div className="mt-4 flex flex-wrap gap-2">
@@ -1044,16 +1225,16 @@ export function BenchmarkPanel({
               onClick={() => setActiveView(view)}
               className="rounded px-3 py-1.5 text-xs font-semibold"
               style={{
-                background: activeView === view ? "rgba(34,211,238,0.16)" : "var(--surface-2)",
-                border: activeView === view ? "1px solid rgba(34,211,238,0.42)" : "1px solid var(--border)",
-                color: activeView === view ? "#67e8f9" : "var(--text-1)",
+                background: activeView === view ? "rgba(255,255,255,0.10)" : "var(--surface-2)",
+                border: activeView === view ? "1px solid var(--border-mid)" : "1px solid var(--border)",
+                color: activeView === view ? "var(--text-0)" : "var(--text-1)",
               }}
             >
               {view === "setup" ? "Setup" : view === "results" ? `Results ${results.length}` : "Summary"}
             </button>
           ))}
         </div>
-        {current && <div className="mt-3 rounded px-3 py-2 text-xs" style={{ background: "rgba(34,211,238,0.08)", border: "1px solid rgba(34,211,238,0.18)", color: "#67e8f9" }}>Running {current}</div>}
+        {current && <div className="mt-3 rounded-lg px-3 py-2 text-xs" style={{ background: "rgba(255,255,255,0.06)", border: "1px solid var(--border)", color: "var(--text-0)" }}>Running {current}</div>}
       </div>
 
       <div className={`grid min-h-0 flex-1 gap-0 overflow-hidden ${activeView === "setup" ? "grid-cols-[320px_minmax(0,1fr)]" : activeView === "results" ? "grid-cols-[minmax(0,1fr)_340px]" : "grid-cols-1"}`}>
@@ -1069,14 +1250,14 @@ export function BenchmarkPanel({
               >
                 Loaded
               </button>
-              <button onClick={() => setSelectedModels(models.map((model) => model.filename))} className="text-xs" style={{ color: "#22d3ee", background: "transparent", border: "none", cursor: "pointer" }}>All</button>
+              <button onClick={() => setSelectedModels(models.map((model) => model.filename))} className="text-xs" style={{ color: "var(--text-0)", background: "transparent", border: "none", cursor: "pointer" }}>All</button>
             </div>
           </div>
           <div className="space-y-2">
             {models.map((model) => {
               const selected = selectedModels.includes(model.filename);
               return (
-                <button key={model.path} onClick={() => toggleModel(model.filename)} className="w-full rounded px-3 py-2 text-left" style={{ background: selected ? "rgba(34,211,238,0.10)" : "var(--surface-2)", border: selected ? "1px solid rgba(34,211,238,0.32)" : "1px solid var(--border)", color: "var(--text-0)" }}>
+                <button key={model.path} onClick={() => toggleModel(model.filename)} className="w-full rounded-lg px-3 py-2 text-left" style={{ background: selected ? "rgba(255,255,255,0.10)" : "var(--surface-2)", border: selected ? "1px solid var(--border-mid)" : "1px solid var(--border)", color: "var(--text-0)" }}>
                   <div className="flex items-start gap-2">
                     <input type="checkbox" checked={selected} readOnly className="mt-1" />
                     <div className="min-w-0 flex-1">
@@ -1101,7 +1282,7 @@ export function BenchmarkPanel({
               <div className="flex items-center justify-between gap-3">
                 <h3 className="text-sm font-semibold">Test Suite</h3>
                 <div className="flex items-center gap-2">
-                  <button onClick={selectPromotionGateTests} className="rounded px-3 py-1.5 text-xs font-semibold" style={{ background: "rgba(34,211,238,0.10)", border: "1px solid rgba(34,211,238,0.24)", color: "#67e8f9", cursor: "pointer" }}>
+                  <button onClick={selectPromotionGateTests} className="rounded-lg px-3 py-1.5 text-xs font-semibold" style={{ background: "rgba(255,255,255,0.08)", border: "1px solid var(--border-mid)", color: "var(--text-0)", cursor: "pointer" }}>
                     Promotion Gate
                   </button>
                   <div className="text-xs" style={{ color: "var(--text-2)" }}>{selectedTestObjects.length} selected</div>
@@ -1119,14 +1300,14 @@ export function BenchmarkPanel({
                         </button>
                         <span className="text-xs" style={{ color: "var(--text-2)" }}>{selectedCount}/{tests.length}</span>
                         <div className="ml-auto flex gap-2">
-                          <button onClick={() => setGroupSelected(group, true)} className="text-xs" style={{ color: "#22d3ee", background: "transparent", border: "none", cursor: "pointer" }}>All</button>
+                          <button onClick={() => setGroupSelected(group, true)} className="text-xs" style={{ color: "var(--text-0)", background: "transparent", border: "none", cursor: "pointer" }}>All</button>
                           <button onClick={() => setGroupSelected(group, false)} className="text-xs" style={{ color: "var(--text-2)", background: "transparent", border: "none", cursor: "pointer" }}>None</button>
                         </div>
                       </div>
                       {expanded && (
                         <div className="grid gap-1 border-t p-2" style={{ borderColor: "var(--border)" }}>
                           {tests.map((test) => (
-                            <label key={test.id} className="flex cursor-pointer items-start gap-3 rounded px-3 py-2" style={{ background: selectedTests.includes(test.id) ? "rgba(34,211,238,0.08)" : "transparent" }}>
+                            <label key={test.id} className="flex cursor-pointer items-start gap-3 rounded-lg px-3 py-2" style={{ background: selectedTests.includes(test.id) ? "rgba(255,255,255,0.07)" : "transparent" }}>
                               <input type="checkbox" checked={selectedTests.includes(test.id)} onChange={() => toggleTest(test.id)} className="mt-1" />
                               <span>
                                 <span className="block text-sm font-medium">{test.name}</span>
@@ -1157,10 +1338,36 @@ export function BenchmarkPanel({
                     </div>
                     <div className="mt-1 text-[11px]" style={{ color: "var(--text-2)" }}>Checked context lengths run largest first; actual prompt tokens are reported in results.</div>
                   </div>
-                  <label className="text-xs" style={{ color: "var(--text-2)" }} title="Benchmarks run at temperature=0, seed=42 for reproducibility. These settings apply to manual test runs only.">Temperature<input value={temperature} disabled type="number" step="0.1" className="mt-1 w-full rounded px-3 py-2 text-sm outline-none disabled:cursor-not-allowed" style={{ background: "rgba(255,255,255,0.025)", border: "1px solid var(--border)", color: "var(--text-2)" }} /></label>
-                  <label className="text-xs" style={{ color: "var(--text-2)" }} title="Benchmarks run at temperature=0, seed=42 for reproducibility. These settings apply to manual test runs only.">Seed<input value={seed} disabled type="number" className="mt-1 w-full rounded px-3 py-2 text-sm outline-none disabled:cursor-not-allowed" style={{ background: "rgba(255,255,255,0.025)", border: "1px solid var(--border)", color: "var(--text-2)" }} /></label>
+                  <div>
+                    <div className="text-xs" style={{ color: "var(--text-1)" }}>Sampling candidates</div>
+                    <div className="mt-1 grid gap-2">
+                      {BENCHMARK_SAMPLING_CANDIDATES.map((candidate) => (
+                        <label key={candidate.id} className="flex cursor-pointer items-start gap-2 rounded px-2 py-2" style={{ background: selectedSamplingIds.includes(candidate.id) ? "rgba(255,255,255,0.08)" : "var(--surface-2)", border: "1px solid var(--border)" }}>
+                          <input type="checkbox" checked={selectedSamplingIds.includes(candidate.id)} onChange={() => toggleSampling(candidate.id)} className="mt-0.5" />
+                          <span className="min-w-0">
+                            <span className="block text-xs font-semibold">{candidate.label}</span>
+                            <span className="block text-[10px]" style={{ color: "var(--text-2)" }}>temp {candidate.temperature} / top-p {candidate.topP} / top-k {candidate.topK} / presence {candidate.presencePenalty}</span>
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-xs" style={{ color: "var(--text-1)" }}>Runtime candidates</div>
+                    <div className="mt-1 grid grid-cols-2 gap-2">
+                      {BENCHMARK_RUNTIME_CANDIDATES.map((candidate) => (
+                        <label key={candidate.id} className="flex cursor-pointer items-start gap-2 rounded px-2 py-2" style={{ background: selectedRuntimeIds.includes(candidate.id) ? "rgba(255,255,255,0.08)" : "var(--surface-2)", border: "1px solid var(--border)" }}>
+                          <input type="checkbox" checked={selectedRuntimeIds.includes(candidate.id)} onChange={() => toggleRuntime(candidate.id)} className="mt-0.5" />
+                          <span>
+                            <span className="block text-xs font-semibold">{candidate.label}</span>
+                            <span className="block text-[10px]" style={{ color: "var(--text-2)" }}>{candidate.mtpOnly ? "MTP GGUFs only" : "All models"}</span>
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
                 </div>
-                <div className="mt-3 rounded px-3 py-2 text-xs" style={{ background: "rgba(34,211,238,0.08)", border: "1px solid rgba(34,211,238,0.18)", color: "#67e8f9" }}>Benchmarks run at temperature=0 and seed=42 for reproducibility.</div>
+                <div className="mt-3 rounded-lg px-3 py-2 text-xs" style={{ background: "rgba(255,255,255,0.05)", border: "1px solid var(--border)", color: "var(--text-1)" }}>{plannedRunCount} total combinations. Each result records the sampling values and actual launch arguments.</div>
                 <div className="mt-4 rounded px-3 py-2 text-xs" style={{ background: "rgba(251,191,36,0.08)", border: "1px solid rgba(251,191,36,0.18)", color: "#fde68a" }}>Generation tok/s is the LM Studio-style chat speed. Prompt eval tok/s is how fast the model reads input context. Requested context is a load target; actual prompt tokens come from llama-server.</div>
               </div>
               <div className="rounded p-4" style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}>
@@ -1170,7 +1377,7 @@ export function BenchmarkPanel({
                 </div>
                 <div className="mt-3 flex gap-2">
                   <input value={presetName} onChange={(event) => setPresetName(event.target.value)} placeholder="Preset name" className="min-w-0 flex-1 rounded px-3 py-2 text-sm outline-none" style={{ background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text-0)" }} />
-                  <button onClick={savePreset} className="rounded px-3 py-2 text-xs font-semibold" style={{ background: "#22d3ee", color: "#041014", border: "none", cursor: "pointer" }}>Save</button>
+                  <button onClick={savePreset} className="ib-button ib-button-primary h-9 px-3 text-xs">Save</button>
                 </div>
                 <div className="mt-3 grid gap-2">
                   {presets.length === 0 ? (
@@ -1180,7 +1387,7 @@ export function BenchmarkPanel({
                       <div className="flex items-start gap-2">
                         <div className="min-w-0 flex-1">
                           <div className="truncate text-sm font-semibold">{preset.name}</div>
-                          <div className="mt-1 text-[11px]" style={{ color: "var(--text-2)" }}>{preset.selectedModels.length} models / {preset.contextLengths.filter((_, index) => preset.enabledContextSlots[index]).join(", ")} / {preset.selectedTests.length} tests</div>
+                          <div className="mt-1 text-[11px]" style={{ color: "var(--text-2)" }}>{preset.selectedModels.length} models / {preset.contextLengths.filter((_, index) => preset.enabledContextSlots[index]).join(", ")} / {preset.selectedTests.length} tests / {preset.selectedSamplingIds?.length ?? 1} sampling</div>
                         </div>
                         <button onClick={() => loadPreset(preset)} className="text-xs font-semibold" style={{ color: "#67e8f9", background: "transparent", border: "none", cursor: "pointer" }}>Load</button>
                         <button onClick={() => deletePreset(preset.id)} className="text-xs" style={{ color: "#f87171", background: "transparent", border: "none", cursor: "pointer" }}>Delete</button>
@@ -1194,18 +1401,37 @@ export function BenchmarkPanel({
 
           {activeView === "results" && <div className="overflow-hidden rounded" style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}>
             <div className="border-b px-4 py-3" style={{ borderColor: "var(--border)" }}>
-              <h3 className="text-sm font-semibold">Results</h3>
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="text-sm font-semibold">Results</h3>
+                {pendingDeletion?.scope === "current-results" ? (
+                  <InlineDeleteConfirmation
+                    message={`Clear ${results.length} results?`}
+                    onConfirm={confirmDeletion}
+                    onCancel={() => setPendingDeletion(null)}
+                  />
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => requestDeletion({ scope: "current-results" })}
+                    disabled={running || results.length === 0}
+                    className="text-xs disabled:opacity-40"
+                    style={{ color: "#f87171", background: "transparent", border: "none", cursor: running || results.length === 0 ? "not-allowed" : "pointer" }}
+                  >
+                    Clear current results
+                  </button>
+                )}
+              </div>
             </div>
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[980px] text-left text-xs">
+              <table className="w-full min-w-[1080px] text-left text-xs">
                 <thead style={{ color: "var(--text-2)" }}>
                   <tr>
-                    {["Model", "Requested ctx", "Actual prompt", "Test", "Status", "Quality", "Score", "Reliability", "Load", "TTFT", "Prompt eval", "Generation", "E2E", "Latency", "Completion", "Advice"].map((heading) => <th key={heading} className="border-b px-3 py-2 font-medium" style={{ borderColor: "var(--border)" }}>{heading}</th>)}
+                    {["Model", "Settings", "Requested ctx", "Actual prompt", "Test", "Status", "Quality", "Score", "Reliability", "Load", "TTFT", "Prompt eval", "Generation", "E2E", "Latency", "Completion", "Advice", "Actions"].map((heading) => <th key={heading} className={`border-b px-3 py-2 font-medium ${heading === "Actions" ? "min-w-[96px]" : ""}`} style={{ borderColor: "var(--border)" }}>{heading}</th>)}
                   </tr>
                 </thead>
                 <tbody>
                   {results.length === 0 ? (
-                    <tr><td colSpan={16} className="px-3 py-8 text-center" style={{ color: "var(--text-2)" }}>Select models, context lengths, and tests, then run a benchmark.</td></tr>
+                    <tr><td colSpan={18} className="px-3 py-8 text-center" style={{ color: "var(--text-2)" }}>Select models, context lengths, settings, and tests, then run a benchmark.</td></tr>
                   ) : results.map((result) => {
                     const expanded = !!expandedResultIds[result.id];
                     const statusColor = result.status === "passed" ? "#34d399" : result.status === "failed" ? "#f87171" : result.status === "running" ? "#22d3ee" : "#fbbf24";
@@ -1215,11 +1441,12 @@ export function BenchmarkPanel({
                       <Fragment key={result.id}>
                         <tr onClick={() => toggleResult(result.id)} style={{ borderTop: "1px solid var(--border)", cursor: "pointer" }}>
                           <td className="max-w-[220px] truncate px-3 py-2">{modelLabel(result.model)}<div style={{ color: "var(--text-2)" }}>{result.model.quant ?? "-"} / {result.model.size_gb.toFixed(1)} GB</div></td>
+                          <td className="min-w-[130px] px-3 py-2">{BENCHMARK_SAMPLING_CANDIDATES.find((candidate) => candidate.id === result.samplingId)?.label ?? result.samplingId}<div style={{ color: "var(--text-2)" }}>{BENCHMARK_RUNTIME_CANDIDATES.find((candidate) => candidate.id === result.runtimeId)?.label ?? result.runtimeId}</div></td>
                           <td className="px-3 py-2">{result.contextSize.toLocaleString()}</td>
                           <td className="px-3 py-2">{result.stats?.prompt_tokens?.toLocaleString() ?? "-"}</td>
                           <td className="px-3 py-2">{result.test.name}<div style={{ color: "var(--text-2)" }}>{expanded ? "Hide details" : "Show output"}</div></td>
                           <td className="px-3 py-2" style={{ color: statusColor }}>{result.status}</td>
-                          <td className="px-3 py-2">
+                          <td className="min-w-[96px] px-3 py-2">
                             <span className="rounded px-2 py-0.5 text-[11px] font-semibold" style={{ background: `${qualityColor(band)}22`, border: `1px solid ${qualityColor(band)}44`, color: qualityColor(band) }}>{band}</span>
                           </td>
                           <td className="px-3 py-2">{result.score == null ? "-" : `${Math.round(result.score * 100)}%`}</td>
@@ -1236,10 +1463,37 @@ export function BenchmarkPanel({
                           <td className="px-3 py-2">{fmtMs(result.stats?.elapsed_ms)}</td>
                           <td className="px-3 py-2">{result.stats?.completion_tokens ?? "-"}</td>
                           <td className="max-w-[320px] px-3 py-2" style={{ color: "var(--text-1)" }}>{result.error ?? result.advice.join(" ")}</td>
+                          <td className="px-3 py-2">
+                            {pendingDeletion?.scope === "result" && pendingDeletion.id === result.id ? (
+                              <div onClick={(event) => event.stopPropagation()}>
+                                <InlineDeleteConfirmation
+                                  message="Delete?"
+                                  onConfirm={confirmDeletion}
+                                  onCancel={() => setPendingDeletion(null)}
+                                  compact
+                                />
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  requestDeletion({ scope: "result", id: result.id });
+                                }}
+                                disabled={running}
+                                aria-label={`Delete ${result.test.name} result for ${modelLabel(result.model)}`}
+                                title="Delete this current result"
+                                className="text-xs disabled:opacity-40"
+                                style={{ color: "#f87171", background: "transparent", border: "none", cursor: running ? "not-allowed" : "pointer" }}
+                              >
+                                Delete
+                              </button>
+                            )}
+                          </td>
                         </tr>
                         {expanded && (
                           <tr>
-                            <td colSpan={16} className="px-3 py-3" style={{ background: "rgba(255,255,255,0.025)", borderTop: "1px solid var(--border)" }}>
+                            <td colSpan={18} className="px-3 py-3" style={{ background: "rgba(255,255,255,0.025)", borderTop: "1px solid var(--border)" }}>
                               <div className="grid gap-3 lg:grid-cols-2">
                                 <div>
                                   <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider" style={{ color: "var(--text-2)" }}>Prompt</div>
@@ -1258,6 +1512,8 @@ export function BenchmarkPanel({
                                 <span>Actual prompt tokens {result.stats?.prompt_tokens?.toLocaleString() ?? "-"}</span>
                                 <span>Completion tokens {result.stats?.completion_tokens ?? "-"}</span>
                                 <span>Tool calls {result.stats?.tool_calls.length ?? 0}</span>
+                                <span>Sampling {result.samplingId}</span>
+                                <span>Runtime {result.stats?.runtime?.spec_type || result.runtimeId}{result.stats?.runtime?.spec_draft_n_max ? ` x${result.stats.runtime.spec_draft_n_max}` : ""}</span>
                                 {result.reliability && <span>Reliability {result.reliability.band} {Math.round(result.reliability.score * 100)}%</span>}
                               </div>
                               {result.reliability && (
@@ -1269,6 +1525,12 @@ export function BenchmarkPanel({
                                 <div className="mt-3">
                                   <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider" style={{ color: "var(--text-2)" }}>Parsed Tool Calls</div>
                                   <pre className="max-h-44 overflow-auto whitespace-pre-wrap rounded p-3 font-mono text-[11px] leading-5" style={{ background: "var(--bg)", border: "1px solid var(--border)", color: "#67e8f9" }}>{JSON.stringify(result.stats?.tool_calls ?? [], null, 2)}</pre>
+                                </div>
+                              )}
+                              {(result.stats?.agent_steps?.length ?? 0) > 0 && (
+                                <div className="mt-3">
+                                  <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider" style={{ color: "var(--text-2)" }}>Executed Agent Steps</div>
+                                  <pre className="max-h-56 overflow-auto whitespace-pre-wrap rounded p-3 font-mono text-[11px] leading-5" style={{ background: "var(--bg)", border: "1px solid var(--border)", color: result.stats?.agent_success ? "#34d399" : "#fca5a5" }}>{JSON.stringify({ success: result.stats?.agent_success, failure: result.stats?.agent_failure, steps: result.stats?.agent_steps }, null, 2)}</pre>
                                 </div>
                               )}
                             </td>
@@ -1315,20 +1577,66 @@ export function BenchmarkPanel({
               <div className="rounded p-4" style={{ background: "var(--surface-1)", border: "1px solid var(--border)" }}>
                 <div className="flex items-center justify-between gap-3">
                   <h3 className="text-sm font-semibold">Recent Runs</h3>
-                  <button onClick={() => setHistory([])} disabled={history.length === 0} className="text-xs disabled:opacity-40" style={{ color: "#f87171", background: "transparent", border: "none", cursor: history.length ? "pointer" : "not-allowed" }}>Clear</button>
+                  {pendingDeletion?.scope === "history" ? (
+                    <InlineDeleteConfirmation
+                      message={`Clear ${history.length} saved runs?`}
+                      onConfirm={confirmDeletion}
+                      onCancel={() => setPendingDeletion(null)}
+                    />
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => requestDeletion({ scope: "history" })}
+                      disabled={running || history.length === 0}
+                      className="text-xs disabled:opacity-40"
+                      style={{ color: "#f87171", background: "transparent", border: "none", cursor: running || history.length === 0 ? "not-allowed" : "pointer" }}
+                    >
+                      Clear history
+                    </button>
+                  )}
                 </div>
                 <div className="mt-3 overflow-hidden rounded" style={{ border: "1px solid var(--border)" }}>
                   {history.length === 0 ? (
                     <div className="px-3 py-8 text-center text-sm" style={{ color: "var(--text-2)" }}>Completed runs will appear here and survive app restarts.</div>
-                  ) : history.slice(0, 10).map((run, index) => (
-                    <div key={run.id} className="grid gap-3 px-3 py-3 text-sm md:grid-cols-[170px_minmax(0,1fr)_120px_90px]" style={{ borderTop: index === 0 ? "none" : "1px solid var(--border)" }}>
+                  ) : history.map((run, index) => (
+                    <div key={run.id} className="grid gap-3 px-3 py-3 text-sm md:grid-cols-[170px_minmax(0,1fr)_120px_220px]" style={{ borderTop: index === 0 ? "none" : "1px solid var(--border)" }}>
                       <div style={{ color: "var(--text-1)" }}>{new Date(run.finishedAt).toLocaleString()}</div>
                       <div className="min-w-0">
                         <div className="truncate font-semibold">{run.modelLabels.join(", ")}</div>
                         <div className="mt-1 truncate text-xs" style={{ color: "var(--text-2)" }}>{run.contextSizes.map((ctx) => ctx.toLocaleString()).join(", ")} ctx / {run.testNames.length} tests</div>
                       </div>
                       <div>{run.passedCount}/{run.resultCount} passed</div>
-                      <button onClick={() => restoreHistoryRun(run)} className="text-xs font-semibold" style={{ color: "#67e8f9", background: "transparent", border: "none", cursor: "pointer" }}>Load</button>
+                      <div className="flex items-center justify-end gap-3">
+                        <button
+                          type="button"
+                          onClick={() => restoreHistoryRun(run)}
+                          disabled={running}
+                          className="text-xs font-semibold disabled:opacity-40"
+                          style={{ color: "#67e8f9", background: "transparent", border: "none", cursor: running ? "not-allowed" : "pointer" }}
+                        >
+                          Load
+                        </button>
+                        {pendingDeletion?.scope === "history-run" && pendingDeletion.id === run.id ? (
+                          <InlineDeleteConfirmation
+                            message="Delete run?"
+                            onConfirm={confirmDeletion}
+                            onCancel={() => setPendingDeletion(null)}
+                            compact
+                          />
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => requestDeletion({ scope: "history-run", id: run.id })}
+                            disabled={running}
+                            aria-label={`Delete benchmark run from ${new Date(run.finishedAt).toLocaleString()}`}
+                            title="Delete this saved benchmark run"
+                            className="text-xs disabled:opacity-40"
+                            style={{ color: "#f87171", background: "transparent", border: "none", cursor: running ? "not-allowed" : "pointer" }}
+                          >
+                            Delete
+                          </button>
+                        )}
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -1340,7 +1648,7 @@ export function BenchmarkPanel({
         {activeView === "results" && <aside className="min-h-0 overflow-y-auto border-l p-4" style={{ borderColor: "var(--border)", background: "var(--surface-1)" }}>
           <h3 className="text-sm font-semibold">Run Summary</h3>
           <div className="mt-3 grid gap-2">
-            <div className="rounded p-3" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}><div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--text-2)" }}>Selected</div><div className="mt-1 text-lg font-semibold">{selectedModelObjects.length} models / {selectedContextLengths.length} ctx / {selectedTestObjects.length} tests</div></div>
+            <div className="rounded p-3" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}><div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--text-2)" }}>Selected</div><div className="mt-1 text-lg font-semibold">{plannedRunCount} combinations</div><div className="mt-1 text-[11px]" style={{ color: "var(--text-2)" }}>{selectedModelObjects.length} models / {selectedContextLengths.length} ctx / {selectedSamplingOptions.length} sampling / {selectedTestObjects.length} tests</div></div>
             <div className="rounded p-3" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}><div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--text-2)" }}>Best Decode</div><div className="mt-1 text-lg font-semibold">{fmtRate(bestDecode)}</div><div className="mt-1 text-[11px]" style={{ color: "var(--text-2)" }}>Use Decode Speed rows for the closest chat tok/s comparison.</div></div>
             <div className="rounded p-3" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}><div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--text-2)" }}>Best TTFT</div><div className="mt-1 text-lg font-semibold">{fmtMs(bestTtft)}</div><div className="mt-1 text-[11px]" style={{ color: "var(--text-2)" }}>Time to first token from streaming benchmark runs.</div></div>
             <div className="rounded p-3" style={{ background: "var(--surface-2)", border: "1px solid var(--border)" }}><div className="text-[10px] uppercase tracking-wider" style={{ color: "var(--text-2)" }}>Passed</div><div className="mt-1 text-lg font-semibold">{results.filter((result) => result.passed).length} / {results.filter((result) => result.status !== "running").length}</div></div>

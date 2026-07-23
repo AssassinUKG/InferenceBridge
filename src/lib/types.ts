@@ -4,6 +4,7 @@ export interface ModelInfo {
   size_gb: number;
   family: string;
   supports_tools: boolean;
+  supports_parallel_tools: boolean;
   supports_reasoning: boolean;
   supports_vision: boolean;
   context_window: number | null;
@@ -23,6 +24,8 @@ export interface ModelInfo {
   template_source: string | null;
   vision_runtime_ready: boolean;
   vision_status: string;
+  mmproj_available: boolean;
+  mmproj_candidate_path: string | null;
   provider_type: string;
   provider_name: string;
   provider_base_url: string | null;
@@ -57,6 +60,14 @@ export interface LaunchPreview {
   template_path: string | null;
   template_name: string | null;
   chat_template_kwargs_json: string | null;
+  sampling_defaults?: {
+    temperature: number | null;
+    top_p: number | null;
+    top_k: number | null;
+    min_p: number | null;
+    presence_penalty: number | null;
+    repeat_penalty: number | null;
+  };
   draft_model_path: string;
   spec_type: string;
   spec_draft_n_max: number;
@@ -163,10 +174,99 @@ export interface LoadProgress {
   error: string | null;
 }
 
+export interface ImageGenerationRequest {
+  prompt: string;
+  bundle_id?: string | null;
+  profile_id?: string | null;
+  seed?: number | null;
+}
+
+export interface ImageGenerationProgress {
+  job_id: string;
+  status: string;
+  stage: "loading" | "generating" | "saving" | "completed" | "cancelled" | "failed" | string;
+  message: string;
+  bundle_id: string;
+  profile_id: string;
+  current_step: number;
+  total_steps: number;
+  progress: number;
+  elapsed_seconds: number;
+  eta_seconds: number | null;
+  started_at: string;
+  updated_at: string;
+  done: boolean;
+  error: string | null;
+  output_path: string | null;
+}
+
+export interface ImageBundleStatus {
+  id: string;
+  name: string;
+  architecture: string;
+  quantization: string;
+  ready: boolean;
+  reasons: string[];
+}
+
+export interface ImageProfileStatus {
+  id: string;
+  name: string;
+  width: number;
+  height: number;
+  steps: number;
+  ready: boolean;
+  reason: string | null;
+}
+
+export interface ImageGenerationCapabilityStatus {
+  enabled: boolean;
+  ready: boolean;
+  runner_path: string | null;
+  output_dir: string;
+  default_bundle: string;
+  default_profile: string;
+  warn_temperature_c: number;
+  cooldown_temperature_c: number;
+  reasons: string[];
+  bundles: ImageBundleStatus[];
+  profiles: ImageProfileStatus[];
+  active_job: ImageGenerationProgress | null;
+}
+
+export interface ImageGenerationPreview {
+  bundle_id: string;
+  bundle_name: string;
+  profile_id: string;
+  profile_name: string;
+  width: number;
+  height: number;
+  steps: number;
+  seed: number;
+  output_path: string;
+  arguments: string[];
+}
+
+export interface ImageGenerationResult {
+  job_id: string;
+  status: string;
+  bundle_id: string;
+  profile_id: string;
+  prompt: string;
+  seed: number;
+  width: number;
+  height: number;
+  steps: number;
+  elapsed_seconds: number;
+  output_path: string | null;
+  error: string | null;
+}
+
 export interface SessionInfo {
   id: string;
   name: string | null;
   model_id: string | null;
+  pinned: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -175,11 +275,22 @@ export interface MessageInfo {
   id: number;
   role: string;
   content: string | null;
+  display_content?: string | null;
+  reasoning_content?: string | null;
   image_base64?: string | null;
   token_count: number | null;
   tokens_evaluated?: number | null;
   tokens_predicted?: number | null;
   created_at: string;
+  tool_calls?: ToolCallInfo[];
+}
+
+export interface ToolCallInfo {
+  id: number;
+  call_id: string | null;
+  name: string;
+  arguments: string | null;
+  result: string | null;
 }
 
 export interface ContextStatus {
@@ -311,9 +422,14 @@ export interface HfSidecarSyncFile {
 }
 
 export interface HfSidecarSyncSummary {
+  mode: "check" | "apply";
   models_checked: number;
   repos_checked: number;
+  repos_with_updates: number;
+  repos_updated: number;
   files_cached: number;
+  files_updated: number;
+  files_unchanged: number;
   files_skipped: number;
   files_failed: number;
   hf_token_configured: boolean;
@@ -324,12 +440,27 @@ export interface HfSidecarSyncSummary {
 export interface HfSidecarCacheStatus {
   filename: string;
   repo_id: string | null;
+  source_repo_id: string | null;
   template_path: string | null;
   template_cached: boolean;
   template_cache_path: string | null;
+  template_source: string | null;
   sidecar_cached_count: number;
   sidecar_expected_count: number;
   sidecar_cache_dir: string | null;
+  active_revision: string | null;
+  remote_revision: string | null;
+  update_available: boolean;
+  last_checked_at: string | null;
+  rollback_available: boolean;
+}
+
+export interface HfSidecarRollbackSummary {
+  repo_id: string;
+  restored_revision: string | null;
+  replaced_revision: string | null;
+  files_restored: number;
+  template_restored: boolean;
 }
 
 export interface LogEntry {

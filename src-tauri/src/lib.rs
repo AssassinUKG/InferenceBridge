@@ -3,6 +3,7 @@ pub mod commands;
 pub mod config;
 pub mod context;
 pub mod engine;
+pub mod image_generation;
 pub mod logging;
 pub mod models;
 pub mod normalize;
@@ -193,6 +194,8 @@ pub fn run() {
             commands::session::create_session,
             commands::session::list_sessions,
             commands::session::delete_session,
+            commands::session::rename_session,
+            commands::session::set_session_pinned,
             commands::session::get_session_messages,
             commands::context::get_context_status,
             commands::debug::get_raw_prompt,
@@ -212,8 +215,11 @@ pub fn run() {
             commands::settings::list_runtime_packs,
             commands::settings::download_llama_build,
             commands::benchmark::run_model_test,
+            commands::benchmark::run_agent_tool_loop,
             commands::model::get_hf_sidecar_cache_status,
+            commands::model::check_hf_sidecar_updates,
             commands::model::sync_hf_sidecar_cache,
+            commands::model::rollback_hf_sidecar_cache,
             commands::browse::download_hub_model,
             commands::browse::list_downloads,
             commands::browse::cancel_download,
@@ -226,6 +232,10 @@ pub fn run() {
             commands::browse::open_external_url,
             commands::browse::search_hub_models,
             commands::browse::show_in_folder,
+            commands::image::get_image_generation_status,
+            commands::image::preview_image_generation,
+            commands::image::generate_image,
+            commands::image::cancel_image_generation,
         ])
         .setup(move |app| {
             // Warn if existing llama-server processes may cause port conflicts
@@ -246,6 +256,14 @@ pub fn run() {
 
             // Register state so Tauri commands can access it
             app.manage(shared_state.clone());
+
+            // Download metadata is restored before state registration. Resume only
+            // transfers that were active when the previous process ended; downloads
+            // explicitly paused by the user remain paused in the manager.
+            commands::browse::resume_interrupted_downloads(
+                app.handle().clone(),
+                shared_state.clone(),
+            );
 
             // Mirror headless mode: populate the model registry on GUI launch so
             // the public API can answer /v1/models immediately.
@@ -417,14 +435,11 @@ pub fn run_headless(
             tracing::info!(count, "Scanned models");
         }
 
-        // Auto-load model if specified. CLI --ctx-size takes priority; fall back to
-        // server.default_ctx_size from config/CLI flags.
+        // Auto-load model if specified. Pass only an explicit CLI context;
+        // backend loading applies the model-specific practical default before
+        // the generic server fallback.
         if let Some(ref model_name) = auto_model {
-            let effective_ctx = {
-                let s = shared_state.read().await;
-                ctx_size.or(s.config.server.default_ctx_size)
-            };
-            headless_load_model(&shared_state, model_name, effective_ctx).await;
+            headless_load_model(&shared_state, model_name, ctx_size).await;
         }
 
         // Print status banner
@@ -584,7 +599,7 @@ async fn legacy_headless_load_model(
         };
 
         let ctx = ctx_size;
-        let profile = crate::models::overrides::detect_effective_profile(&model.filename);
+        let profile = s.effective_profile_for_model(&model.filename);
         let use_jinja = s.config.process.use_jinja
             || matches!(
                 profile.tool_call_format,
@@ -992,8 +1007,7 @@ pub fn run_one_shot(
 
         // Build request
         let s = shared_state.read().await;
-        let profile =
-            models::profiles::ModelProfile::detect(s.loaded_model.as_deref().unwrap_or(""));
+        let profile = s.effective_profile_for_model(s.loaded_model.as_deref().unwrap_or(""));
 
         let messages = vec![templates::engine::ChatMessage {
             role: "user".to_string(),
@@ -1221,10 +1235,14 @@ pub fn run_model_test_cli(
             false,
             &prompt,
             max_tokens,
-            temperature,
-            top_p,
-            top_k,
-            seed,
+            crate::engine::benchmark::BenchmarkSamplingSettings {
+                temperature,
+                top_p,
+                top_k,
+                seed,
+                ..Default::default()
+            },
+            Default::default(),
         )
         .await
         {

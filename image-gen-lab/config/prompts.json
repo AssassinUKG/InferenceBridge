@@ -1,0 +1,56 @@
+{
+  "prompts": [
+    {
+      "id": "surfboard-cat",
+      "category": "animals-water",
+      "prompt": "A highly realistic photograph of a confident ginger cat balancing on a turquoise surfboard in the open sea, a curling wave behind it, wet detailed fur, individual water droplets, natural midday sunlight, realistic ocean colour, sharp focus, professional wildlife photography"
+    },
+    {
+      "id": "portrait-hands",
+      "category": "human-anatomy",
+      "prompt": "Editorial photograph of a woman in her thirties seated at a wooden pottery wheel, both hands clearly visible shaping a clay bowl, realistic fingers and skin texture, small flecks of wet clay, soft north-facing studio light, 85mm lens, natural expression"
+    },
+    {
+      "id": "cafe-sign",
+      "category": "text-rendering",
+      "prompt": "Photorealistic street-level photograph of a small British cafe with a painted sign that reads exactly \"THE QUIET CUP\" and a chalkboard that reads exactly \"TEA, CAKE & GOOD BOOKS\", correct spelling, clean readable typography, overcast daylight, authentic shopfront details",
+      "expected_text": ["THE QUIET CUP", "TEA, CAKE & GOOD BOOKS"]
+    },
+    {
+      "id": "spatial-objects",
+      "category": "prompt-adherence",
+      "prompt": "Product photograph on a plain cream background: a red ceramic teapot in the centre, exactly two blue cups to its left, one yellow lemon to its right, and a silver teaspoon directly in front, all objects fully visible, soft studio shadows"
+    },
+    {
+      "id": "night-reflections",
+      "category": "lighting-detail",
+      "prompt": "Cinematic night photograph of a narrow futuristic city street after heavy rain, deep puddles reflecting pink and cyan signs, pedestrians under transparent umbrellas, convincing wet materials, realistic volumetric mist, detailed architecture, no oversaturation"
+    },
+    {
+      "id": "landscape-fur",
+      "category": "natural-detail",
+      "prompt": "A red fox standing in frost-covered Scottish heather at sunrise, highly detailed winter fur moving slightly in the wind, visible breath, distant misty hills, physically realistic warm rim light and cool shadows, wildlife documentary photograph"
+    }
+  ],
+  "suites": {
+    "smoke": {
+      "prompt_ids": ["surfboard-cat"],
+      "seeds": [424242]
+    },
+    "smoke-reliability": {
+      "prompt_ids": ["surfboard-cat"],
+      "seeds": [424242, 8675309, 314159]
+    },
+    "quality-core": {
+      "prompt_ids": [
+        "surfboard-cat",
+        "portrait-hands",
+        "cafe-sign",
+        "spatial-objects",
+        "night-reflections",
+        "landscape-fur"
+      ],
+      "seeds": [424242, 8675309, 314159]
+    }
+  }
+}

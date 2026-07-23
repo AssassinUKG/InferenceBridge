@@ -25,7 +25,7 @@ The Benchmark tab should support:
 - [x] Multi-model comparison.
 - [ ] Current loaded model only shortcut.
 - [x] Sequential auto-load of selected models.
-- [ ] Optional comparison of different launch settings for the same model.
+- [x] Compare sampling, context, and self-MTP launch candidates for the same model without creating profiles.
 
 Each selectable model row should show:
 
@@ -93,6 +93,33 @@ Metrics:
 - Argument correctness.
 - Parse repair needed.
 - Latency and token speed.
+
+The `Executed Agent Tool Loop` is the compact HelixClaw-style readiness check. It
+uses the production OpenAI-compatible chat path with native tool schemas, executes
+an isolated in-memory `create -> append -> verify` chain, feeds each tool result
+back to the model, and requires an exact final answer. It therefore measures an
+agent loop rather than merely asking the model to print tool-shaped text.
+
+## Profile-Free Settings Matrix
+
+Benchmark candidates are run directly and recorded with each result; they do not
+create or mutate model profiles.
+
+- Sampling candidates: deterministic, instruct/tool, and coding.
+- Context candidates: the existing editable context-size matrix.
+- Runtime candidates: detected auto defaults plus self-MTP draft depths 1, 2,
+  3, and 4 for MTP GGUF filenames.
+- The ranking groups by model + context + sampling candidate + runtime
+  candidate so the winning row identifies both the model and the settings.
+- Changing context or runtime depth reloads the model. Tests sharing an exact
+  model/context/runtime combination reuse that load.
+- Runtime auto clears inherited speculative overrides before using detected
+  model defaults, keeping the comparison independent from the active profile.
+
+InferenceBridge owns this fast, repeatable settings search. Mauler remains the
+second-stage soak test for longer delegation, shell/file work, recovery, and
+multi-agent behaviour. A candidate should first win here, then be confirmed in
+Mauler; HelixClaw does not need a new profile for every benchmark candidate.
 
 ### Reasoning
 
@@ -326,7 +353,7 @@ Persist results under app support storage so history survives restarts.
 - [x] Stop context inputs snapping back to 512 while editing.
 - [x] Add large-report context recall test.
 - [x] Size context recall prompts near the requested context instead of tripling it.
-- [x] Run context matrix largest-first so smaller contexts can reuse the largest load.
+- [x] Run context matrix largest-first and load each exact context so context comparisons are not contaminated by a larger prior load.
 - [x] Show actual prompt tokens from llama-server beside requested context.
 - [x] Hide TTFT from the UI until true streaming TTFT is implemented.
 - [x] Seed a default model after model scan populates.
@@ -334,7 +361,9 @@ Persist results under app support storage so history survives restarts.
 - [x] TTFT result field reserved in backend.
 - [ ] True streaming TTFT measurement.
 - [ ] Backend event stream for benchmark progress.
-- [ ] Persist benchmark history across restarts.
+- [x] Persist benchmark history across restarts.
+- [x] Delete individual current results and saved runs.
+- [x] Add confirmed clear-current, clear-history, and clear-all actions while preserving presets.
 
 ### Phase 2: Quality Suites
 
@@ -347,15 +376,18 @@ Persist results under app support storage so history survives restarts.
 
 ### Phase 3: Tuning Sweeps
 
-- Compare context sizes.
+- [x] Compare context sizes.
+- [x] Compare sampling presets.
 - Compare fit modes.
 - Compare batch/ubatch.
 - Compare flash attention on/off.
-- Compare draft model/speculative settings.
+- [x] Compare self-MTP draft depths.
+- Compare external draft-model speculative settings.
 
 ### Phase 4: History And Reports
 
-- Saved run history.
+- [x] Saved run history.
+- [x] Per-result/per-run deletion and scoped history cleanup.
 - Trend charts.
 - Markdown report export.
 - “Best model for this machine” recommendation.
@@ -370,4 +402,4 @@ Persist results under app support storage so history survives restarts.
 - [x] Failed runs do not wedge the UI.
 - [x] Advice is specific to measured bottlenecks.
 - [x] Results are exportable.
-- [ ] Benchmark runs are cancellable during active generation.
+- [x] Benchmark runs are cancellable during active generation.

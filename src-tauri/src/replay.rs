@@ -62,6 +62,7 @@ pub struct CanonicalModelResponse {
     pub visible_text: String,
     pub reasoning_text: String,
     pub tool_calls: Vec<Value>,
+    pub finish_reason: Option<String>,
     pub usage: CanonicalUsage,
     pub timings: CanonicalTimings,
     pub backend: CanonicalBackend,
@@ -173,6 +174,7 @@ pub fn build_canonical_response(
         visible_text,
         reasoning_text: extract_reasoning_content_with_style(raw_text, profile.think_tag_style),
         tool_calls,
+        finish_reason: response.stop_type.clone(),
         usage: CanonicalUsage {
             prompt_tokens,
             completion_tokens,

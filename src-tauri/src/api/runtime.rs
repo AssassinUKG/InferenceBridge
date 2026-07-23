@@ -59,7 +59,7 @@ pub fn start_managed(state: SharedState, host: String, port: u16, source: &'stat
         if source == "gui" {
             // Brief pause only if the port is still held from a previous instance.
             // Skip entirely when the port is already free (the common case).
-            let addr = format!("{host}:{port}");
+            let addr = crate::api::server::socket_bind_address(&host, port);
             if tokio::net::TcpListener::bind(&addr).await.is_err() {
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
@@ -134,8 +134,7 @@ pub async fn stop_managed(state: SharedState) -> bool {
 }
 
 async fn wait_for_api_port_release(host: &str, port: u16) {
-    let probe_host = crate::api::server::reachable_probe_host(host);
-    let addr = format!("{probe_host}:{port}");
+    let addr = crate::api::server::socket_bind_address(host, port);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         if std::net::TcpListener::bind(&addr).is_ok() {

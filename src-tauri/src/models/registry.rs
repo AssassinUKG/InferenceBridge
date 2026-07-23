@@ -1,6 +1,7 @@
 //! In-memory model registry — tracks scanned models.
 
 use super::scanner::ScannedModel;
+use super::{overrides::detect_effective_profile_with_arch, profiles::ModelProfile};
 
 /// Registry of known model files.
 pub struct ModelRegistry {
@@ -54,5 +55,63 @@ impl ModelRegistry {
     /// Find a model by exact path.
     pub fn find_by_path(&self, path: &std::path::Path) -> Option<&ScannedModel> {
         self.models.iter().find(|m| m.path == path)
+    }
+
+    /// Resolve the effective runtime profile for a model name using the same
+    /// GGUF architecture metadata captured by the scanner.
+    ///
+    /// Request-time callers must use this instead of filename-only detection;
+    /// author names such as `Tess-4-27B` do not contain the underlying Qwen
+    /// family even though their GGUF advertises `general.architecture=qwen35`.
+    pub fn effective_profile_for_name(&self, name: &str) -> ModelProfile {
+        if let Some(model) = self.find_by_name(name) {
+            let architecture = model
+                .gguf_meta
+                .as_ref()
+                .and_then(|meta| meta.architecture.as_deref());
+            return detect_effective_profile_with_arch(&model.filename, architecture);
+        }
+
+        detect_effective_profile_with_arch(name, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{gguf::GgufMeta, profiles::ModelFamily};
+
+    #[test]
+    fn registry_uses_qwen35_architecture_for_tess_aliases() {
+        let filename = "Tess-4-27B-Q4_K_M.gguf";
+        let mut meta = GgufMeta::default();
+        meta.architecture = Some("qwen35".to_string());
+        let mut registry = ModelRegistry::new();
+        registry.update(vec![ScannedModel {
+            path: std::path::PathBuf::from(filename),
+            filename: filename.to_string(),
+            size_bytes: 1,
+            profile: detect_effective_profile_with_arch(filename, Some("qwen35")),
+            hf_metadata: None,
+            gguf_meta: Some(meta),
+        }]);
+
+        assert_eq!(
+            registry
+                .effective_profile_for_name("Tess-4-27B-Q4_K_M")
+                .family,
+            ModelFamily::Qwen3_5
+        );
+    }
+
+    #[test]
+    fn unscanned_names_still_receive_filename_profile() {
+        let registry = ModelRegistry::new();
+        assert_eq!(
+            registry
+                .effective_profile_for_name("Qwen3-8B-Q4_K_M.gguf")
+                .family,
+            ModelFamily::Qwen3
+        );
     }
 }

@@ -45,12 +45,14 @@ You do not need Rust, Node.js, or llama.cpp preinstalled. InferenceBridge can do
 
 ## Features
 
-- Browse and download GGUF models from Hugging Face
+- Browse and download GGUF models from Hugging Face, with restart-safe resumable transfers
+- Update chat templates and tokenizer/config metadata independently of model weights, with revision checks and rollback
 - Auto-detect local model directories and scan for `.gguf` files
 - Load and unload models from the GUI or API
 - Shared desktop UI and OpenAI-compatible API on the same local app state
 - Streaming chat, session history, and context monitoring
 - Vision image paste support for compatible models
+- Experimental validated Qwen-Image native runner foundation with cancellable, measured in-chat progress
 - Interactive in-app API editor and logs workspace
 - Optional API key protection for the public endpoint
 
@@ -64,6 +66,20 @@ You do not need Rust, Node.js, or llama.cpp preinstalled. InferenceBridge can do
 6. Chat in the app or point external tools at `http://127.0.0.1:8800/v1`.
 
 If you already have GGUF files on disk, add their folder under `Settings > Model Directories`.
+
+### Restart-safe model downloads
+
+InferenceBridge saves model download jobs and writes incoming data to `.part` files. Closing and reopening the app automatically resumes transfers that were active. Downloads you explicitly paused remain paused until you choose **Resume** in Download Manager; cancelling or discarding a transfer removes its partial file and prevents it from returning.
+
+If Windows temporarily blocks deletion, the job is shown as **Cleanup pending** with **Retry discard** and remains non-resumable. Cleanup is retried automatically on the next app start, so an explicit cancellation can never turn back into a download.
+
+The partial file length on disk is treated as the source of truth, so restored progress reflects bytes that were actually written. If a partial file predates this job registry, reselecting the exact repository file once supplies its missing source URL and resumes it instead of discarding the existing bytes.
+
+### Template and metadata updates without model downloads
+
+For a local model linked to a Hugging Face repository, the Models page can check for newer chat templates and small tokenizer/config files without touching the GGUF weights. Choose **Check HF files** for one model, review the update state, then choose **Update HF files** to apply a detected change. Reload an active model after a template update so llama.cpp reads the new Jinja file.
+
+InferenceBridge follows a quantized repository's declared upstream base model when available, records the exact source repository and commit, accepts only `chat_template.jinja`, `tokenizer_config.json`, `config.json`, `generation_config.json`, and `special_tokens_map.json`, and caps every file at 2 MiB. It also recognises templates stored inside `tokenizer_config.json`. Each applied update keeps the previous snapshot available through **Restore previous**; model weights and arbitrary repository files are always blocked from this updater.
 
 ## OpenAI-Compatible API
 
@@ -181,6 +197,14 @@ The Debug tab includes:
 
 See [docs/04-debug-api-workspace.md](docs/04-debug-api-workspace.md) for example flows and cURL snippets.
 
+For Tess-4-27B/Qwen3.6, including the approved 32K RTX 3090 profile,
+thinking/tool presets, vision projector, and MTP requirements, see
+[docs/20-tess-4-27b-runtime-guide.md](docs/20-tess-4-27b-runtime-guide.md).
+
+The measured Qwen-Image-2512 decision, native runtime design, progress contract,
+and staged chat swap/restore plan are in
+[docs/22-image-generation-integration-plan.md](docs/22-image-generation-integration-plan.md).
+
 ## Configuration
 
 InferenceBridge stores configuration in:
@@ -291,6 +315,8 @@ That will run the `Release` workflow and create a draft release with platform in
 - [docs/05-inference-runtime-roadmap.md](docs/05-inference-runtime-roadmap.md)
 - [docs/08-local-provider-runtime-improvement-plan.md](docs/08-local-provider-runtime-improvement-plan.md)
 - [docs/09-agent-reliability-tracker.md](docs/09-agent-reliability-tracker.md)
+- [docs/20-tess-4-27b-runtime-guide.md](docs/20-tess-4-27b-runtime-guide.md)
+- [docs/22-image-generation-integration-plan.md](docs/22-image-generation-integration-plan.md)
 
 ## License
 

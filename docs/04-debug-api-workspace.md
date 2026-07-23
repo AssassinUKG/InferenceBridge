@@ -240,7 +240,10 @@ curl http://127.0.0.1:8800/v1/models/Qwen3.5-35B-A3B-Q4_K_M.gguf
 
 Available on both `/v1/models/load` and `/api/v1/models/load`.
 
-Load a model into the llama-server backend. The context size you send is passed directly to `--ctx-size` — no defaults are injected.
+Load a model into the llama-server backend. An explicit context size is passed
+directly to `--ctx-size`. When omitted, InferenceBridge uses the detected
+model-profile recommendation first, then the configured server default. For
+Tess/Qwen3.6 this resolves to the approved 32K local default.
 
 **Request:**
 
@@ -253,11 +256,34 @@ curl -X POST http://127.0.0.1:8800/v1/models/load \
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `model` | string | yes | Model filename or path-style name (e.g. `"qwen/qwen3.5-4b"`) |
-| `context_size` | u32 | no | Context window size passed to `--ctx-size`. Omit to use the model's GGUF metadata default. |
+| `context_size` | u32 | no | Context window passed to `--ctx-size`. Omit to use the detected model-profile recommendation, then the server default. |
+| `gpu_layers` | i32 | no | GPU offload count. `-1` selects every compatible layer. |
+| `threads`, `threads_batch` | u32 | no | Generation and batch thread pools. `0` lets llama.cpp choose. |
+| `batch_size`, `ubatch_size` | u32 | no | Evaluation and physical batch sizes. `0` keeps llama.cpp defaults. |
+| `flash_attn` | bool | no | Enables supported Flash Attention. |
+| `use_mmap`, `use_mlock` | bool | no | Controls memory mapping and locked host memory. |
+| `cont_batching` | bool | no | Enables continuous batching. |
+| `parallel_slots` | u32 | no | Number of decode slots. The reliable Tess tools profile uses `1`. |
+| `main_gpu` | i32 | no | Primary GPU index. |
+| `cache_type_k`, `cache_type_v` | string | no | KV cache types such as `q8_0` or `f16`. |
+| `kv_unified` | bool | no | Enables llama.cpp's unified KV buffer. |
+| `no_warmup` | bool | no | Skips the launch warm-up when true. |
+| `ctx_shift` | bool | no | Enables context shifting. The approved Tess profile leaves it off and compacts structured history before overflow. |
+| `hf_repo`, `hf_file` | string | no | Optional repository/file identity used for template and model resolution. |
+| `fit_mode`, `cache_ram_mb`, `ctxcp` | string/u32 | no | Advanced llama.cpp fit and cache controls. |
+| `use_jinja` | bool | no | Enables native Jinja chat rendering. Required for Tess structured tools. |
+| `reasoning_mode` | string | no | Explicit launch-time `on`, `off`, or `auto`; Tess presets use `on`/`off`. |
+| `reasoning_preserve` | bool | no | Preserves eligible historical reasoning independently of the on/off switch. |
+| `template_mode`, `template_name`, `custom_template_path` | string | no | Selects repository/embedded, built-in, or custom chat templates. |
+| `chat_template_kwargs_json` | string | no | Model-specific Jinja kwargs. Deprecated thinking keys are rejected/removed; use `reasoning_mode`. |
 | `draft_model_path` | string | no | GGUF draft model path passed to llama.cpp as `-md`. Aliases include `draftModelPath`, `draft_model`, and `spec_draft_model`. |
 | `spec_type` | string | no | Speculative decoding type passed as `--spec-type`, for example `"draft-mtp"`. |
 | `spec_draft_n_max` | u32 | no | Draft tokens per MTP step passed as `--spec-draft-n-max`; Gemma 4 draft models commonly use `3`. |
+| `draft_max_tokens`, `draft_min_tokens`, `draft_p_min` | number | no | Additional draft acceptance limits. |
+| `attach_mmproj` | bool | no | Resolves and attaches a matching vision projector when available; image requests still validate the real launch preview. |
+| `extra_args` | string[] | no | Additional llama-server arguments. Explicit sampler flags here become the active launch preset. |
 | `echo_load_config` | bool | no | If `true`, response includes `load_config` with the effective context. |
+| `force_reload` | bool | no | Reloads even when the same model/context is already active. |
 
 **Context size aliases** — all of these map to the same field:
 
@@ -269,7 +295,9 @@ Also extracted from nested objects: `load_config.context_size`, `options.num_ctx
 
 - If the same model is already loaded with the same context, the request returns immediately (coalesce).
 - If the same model is loaded but with a different context, it **reloads** with the new context.
-- If no `context_size` is sent, llama-server uses the GGUF metadata default.
+- If no `context_size` is sent, InferenceBridge uses the detected model-profile
+  recommendation first, then the configured server default. Tess/Qwen3.6 uses
+  the approved local 32,768-token recommendation.
 - Path-style model names (e.g. `"qwen/qwen3.5-4b"`) are resolved by extracting the last segment and matching against scanned filenames.
 
 **Response:**
@@ -543,6 +571,22 @@ curl "http://127.0.0.1:8800/v1/debug/profile?model=Qwen3.5-35B-A3B-Q4_K_M.gguf"
 
 Returns the resolved profile including family, tool format, think tag style, context windows, and any user overrides applied.
 
+For Tess-4-27B, the resolved profile must not be `Generic` or the older Qwen3
+profile. A healthy result reports `family: "Qwen3_5"`,
+`tool_call_format: "QwenXml"`, `parser_type: "QwenStateMachine"`, and
+`renderer_type: "QwenChat"`:
+
+```bash
+curl "http://127.0.0.1:8800/v1/debug/profile?model=Tess-4-27B-Q4_K_M.gguf"
+```
+
+After loading, inspect `GET /v1/runtime/status` and its
+`last_launch_preview`. For the default Tess tool profile, verify a 32,768-token
+context, repository/embedded Jinja, `--reasoning off`, one slot, no speculative
+draft, and a non-empty `mmproj_path` before using vision. See the
+[Tess-4-27B runtime guide](20-tess-4-27b-runtime-guide.md) for all presets and
+the regression checklist.
+
 ---
 
 ## Configuration Reference
@@ -587,7 +631,7 @@ All values come from `inference-bridge.toml`. No hardcoded defaults are injected
 | `cont_batching` | bool | `true` | Continuous batching (`-cb`). |
 | `parallel_slots` | u32 | `1` | Parallel inference slots. |
 | `main_gpu` | i32 | `0` | Primary GPU index for multi-GPU. |
-| `defrag_thold` | f32 | `0.0` | KV cache defrag threshold. `0` = disabled. |
+| `defrag_thold` | f32 | `0.0` | Legacy compatibility field. Current managed launches do not emit llama.cpp's deprecated `--defrag-thold` flag. |
 | `rope_freq_scale` | f32 | `0.0` | RoPE frequency scale. `0` = auto. |
 | `backend_port` | u16 | `8801` | Internal llama-server port. |
 | `model_load_timeout_secs` | u64 | `300` | Max time to wait for model load. |

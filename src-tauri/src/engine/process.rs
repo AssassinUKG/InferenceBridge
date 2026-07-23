@@ -170,107 +170,161 @@ fn llama_flags_from_help_text(help_text: &str, flags: &[&str]) -> (Vec<String>, 
     (supported, missing)
 }
 
-fn filename_supports_vision(path: &Path) -> bool {
+fn parse_last_cli_value<T>(args: &[String], names: &[&str]) -> Option<T>
+where
+    T: std::str::FromStr,
+{
+    let mut parsed = None;
+    for (index, arg) in args.iter().enumerate() {
+        for name in names {
+            let value = if arg == name {
+                args.get(index + 1).map(String::as_str)
+            } else {
+                arg.strip_prefix(&format!("{name}="))
+            };
+            if let Some(value) = value.and_then(|value| value.parse::<T>().ok()) {
+                parsed = Some(value);
+            }
+        }
+    }
+    parsed
+}
+
+fn sampling_defaults_from_args(args: &[String]) -> SamplingDefaults {
+    SamplingDefaults {
+        temperature: parse_last_cli_value(args, &["--temp", "--temperature"]),
+        top_p: parse_last_cli_value(args, &["--top-p", "--top_p"]),
+        top_k: parse_last_cli_value(args, &["--top-k", "--top_k"]),
+        min_p: parse_last_cli_value(args, &["--min-p", "--min_p"]),
+        presence_penalty: parse_last_cli_value(args, &["--presence-penalty", "--presence_penalty"]),
+        repeat_penalty: parse_last_cli_value(args, &["--repeat-penalty", "--repeat_penalty"]),
+    }
+}
+
+fn effective_profile_for_model_path(path: &Path) -> ModelProfile {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    crate::models::overrides::detect_effective_profile(&name).supports_vision
+    let metadata = crate::models::gguf::read_gguf_meta_cached(path);
+    let architecture = metadata
+        .as_ref()
+        .and_then(|meta| meta.architecture.as_deref());
+    crate::models::overrides::detect_effective_profile_with_arch(&name, architecture)
 }
 
 const DEFAULT_SELF_MTP_SPEC_TYPE: &str = "draft-mtp";
 const DEFAULT_SELF_MTP_DRAFT_N_MAX: u32 = 2;
 
-fn launch_config_model_key(config: &LaunchConfig) -> String {
-    format!(
-        "{} {} {}",
-        config.model_path.to_string_lossy(),
-        config.hf_repo.as_deref().unwrap_or_default(),
-        config.hf_file.as_deref().unwrap_or_default()
-    )
-    .to_ascii_lowercase()
-}
-
-fn launch_config_looks_self_mtp(config: &LaunchConfig) -> bool {
+fn launch_config_supports_self_mtp(config: &LaunchConfig) -> bool {
     if !config.draft_model_path.trim().is_empty() {
         return false;
     }
 
-    let key = launch_config_model_key(config);
-    key.contains("-mtp")
-        || key.contains("_mtp")
-        || key.contains(".mtp")
-        || key.contains(" mtp")
-        || key.contains("mtp-")
-        || key.contains("mtp_")
-        || key.contains("mtp.")
-        || key.ends_with("mtp")
+    crate::models::gguf::has_mtp_tensors(&config.model_path)
 }
 
-fn effective_spec_type(config: &LaunchConfig) -> Option<String> {
+fn effective_spec_type(config: &LaunchConfig, supports_self_mtp: bool) -> Option<String> {
     let explicit = config.spec_type.trim();
     if !explicit.is_empty() {
         return Some(explicit.to_string());
     }
 
-    if launch_config_looks_self_mtp(config) {
+    if supports_self_mtp {
         return Some(DEFAULT_SELF_MTP_SPEC_TYPE.to_string());
     }
 
     None
 }
 
-fn effective_spec_draft_n_max(config: &LaunchConfig, spec_type: &str) -> u32 {
+fn effective_spec_draft_n_max(
+    config: &LaunchConfig,
+    spec_type: &str,
+    supports_self_mtp: bool,
+) -> u32 {
     if config.spec_draft_n_max > 0 {
         return config.spec_draft_n_max;
     }
 
-    if spec_type == DEFAULT_SELF_MTP_SPEC_TYPE && launch_config_looks_self_mtp(config) {
+    if spec_type == DEFAULT_SELF_MTP_SPEC_TYPE && supports_self_mtp {
         return DEFAULT_SELF_MTP_DRAFT_N_MAX;
     }
 
     0
 }
 
-fn reasoning_mode_disables_thinking(reasoning_mode: Option<&str>) -> bool {
-    matches!(
-        reasoning_mode.map(|value| value.trim().to_ascii_lowercase()),
-        Some(value)
-            if matches!(
-                value.as_str(),
-                "off" | "false" | "none" | "disabled" | "disable" | "0" | "no"
-            )
-    )
+fn canonical_reasoning_mode(reasoning_mode: Option<&str>) -> anyhow::Result<Option<String>> {
+    let Some(reasoning_mode) = reasoning_mode else {
+        return Ok(None);
+    };
+    let value = reasoning_mode.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let canonical = match value.as_str() {
+        "on" | "true" | "enabled" | "enable" | "1" | "yes" => "on",
+        "off" | "false" | "none" | "disabled" | "disable" | "0" | "no" => "off",
+        "auto" => "auto",
+        "deepseek" | "deepseek-legacy" | "deepseek_legacy" => {
+            tracing::warn!(
+                configured = %value,
+                "Migrating legacy reasoning mode to llama.cpp --reasoning auto"
+            );
+            "auto"
+        }
+        _ => anyhow::bail!("Invalid reasoning mode {value:?}; expected on, off, or auto"),
+    };
+    Ok(Some(canonical.to_string()))
 }
 
-fn normalize_chat_template_kwargs_for_profile(
+fn normalize_reasoning_configuration(
     kwargs_json: Option<&str>,
     reasoning_mode: Option<&str>,
     profile: &ModelProfile,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<(Option<String>, Option<String>)> {
     let trimmed = kwargs_json.map(str::trim).filter(|value| !value.is_empty());
-    let should_disable_template_thinking =
-        matches!(profile.family, ModelFamily::Gemma4 | ModelFamily::Qwen3)
-            && reasoning_mode_disables_thinking(reasoning_mode);
-
-    if !should_disable_template_thinking {
-        return Ok(trimmed.map(ToOwned::to_owned));
+    let mut effective_reasoning_mode = canonical_reasoning_mode(reasoning_mode)?;
+    let reasoning_capable = matches!(
+        profile.family,
+        ModelFamily::Gemma4 | ModelFamily::Qwen3_5 | ModelFamily::Qwen3
+    );
+    if effective_reasoning_mode.is_none() && profile.family == ModelFamily::Qwen3_5 {
+        // Tess/qwen35 defaults to the approved direct/tool-safe mode. Thinking
+        // remains available through an explicit `--reasoning on` override.
+        effective_reasoning_mode = Some("off".to_string());
     }
 
-    let mut value = match trimmed {
-        Some(raw) => serde_json::from_str::<serde_json::Value>(raw)
-            .map_err(|error| anyhow::anyhow!("Invalid chat_template_kwargs_json: {error}"))?,
-        None => serde_json::json!({}),
+    let Some(raw) = trimmed else {
+        return Ok((effective_reasoning_mode, None));
     };
-
+    let mut value = serde_json::from_str::<serde_json::Value>(raw)
+        .map_err(|error| anyhow::anyhow!("Invalid chat_template_kwargs_json: {error}"))?;
     let Some(object) = value.as_object_mut() else {
         anyhow::bail!("chat_template_kwargs_json must be a JSON object");
     };
-    object
-        .entry("enable_thinking".to_string())
-        .or_insert(serde_json::Value::Bool(false));
 
-    Ok(Some(serde_json::to_string(&value)?))
+    if reasoning_capable {
+        // Current llama.cpp exposes thinking control through --reasoning. Old
+        // enable_thinking/thinking template kwargs are deprecated and can
+        // conflict with the explicit flag, so translate them once and remove
+        // them from the forwarded kwargs object.
+        for key in ["enable_thinking", "enableThinking", "thinking"] {
+            if let Some(deprecated) = object.remove(key) {
+                if effective_reasoning_mode.is_none() {
+                    if let Some(enabled) = deprecated.as_bool() {
+                        effective_reasoning_mode = Some(if enabled { "on" } else { "off" }.into());
+                    }
+                }
+            }
+        }
+    }
+
+    let normalized_kwargs = if object.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(&value)?)
+    };
+    Ok((effective_reasoning_mode, normalized_kwargs))
 }
 
 fn is_mmproj_candidate(path: &Path) -> bool {
@@ -321,7 +375,7 @@ fn model_family_token(path: &Path) -> Option<&'static str> {
         .unwrap_or_default();
 
     [
-        "gemma", "qwen", "llava", "mistral", "phi", "internvl", "minicpm",
+        "tess", "gemma", "qwen", "llava", "mistral", "phi", "internvl", "minicpm",
     ]
     .into_iter()
     .find(|family| name.contains(family))
@@ -351,11 +405,14 @@ fn model_scan_root(model_path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-fn best_mmproj_candidate(model_path: &Path, candidates: Vec<PathBuf>) -> Option<PathBuf> {
+fn best_mmproj_candidate(model_path: &Path, candidates: &[PathBuf]) -> Option<PathBuf> {
     let model_family = model_family_token(model_path);
-    let min_score = 4;
+    // Tess's canonical projector name (`mmproj-Tess-4-27B-F16.gguf`)
+    // shares only the stable `tess` and `27b` tokens with a quantized main
+    // model. Requiring the family token keeps that lower threshold precise.
+    let min_score = if model_family == Some("tess") { 2 } else { 4 };
     let mut scored = candidates
-        .into_iter()
+        .iter()
         .filter_map(|candidate| {
             let score = shared_token_score(model_path, &candidate);
             if score < min_score {
@@ -367,7 +424,7 @@ fn best_mmproj_candidate(model_path: &Path, candidates: Vec<PathBuf>) -> Option<
                     .map(|name| name.to_string_lossy().to_lowercase().contains(family))
                     .unwrap_or(false)
             });
-            family_matches.then_some((score, candidate))
+            family_matches.then_some((score, candidate.clone()))
         })
         .collect::<Vec<_>>();
 
@@ -380,35 +437,105 @@ fn best_mmproj_candidate(model_path: &Path, candidates: Vec<PathBuf>) -> Option<
     scored.into_iter().map(|(_, candidate)| candidate).next()
 }
 
-fn find_mmproj_for_model(model_path: &Path) -> Option<PathBuf> {
+fn is_generic_mmproj_candidate(path: &Path) -> bool {
+    let filename = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let Some(suffix) = filename
+        .strip_prefix("mmproj-")
+        .and_then(|name| name.strip_suffix(".gguf"))
+    else {
+        return false;
+    };
+
+    matches!(suffix, "bf16" | "f16" | "f32") || suffix.starts_with('q') || suffix.starts_with("iq")
+}
+
+fn colocated_generic_mmproj_is_unambiguous(model_path: &Path) -> bool {
+    let Some(parent) = model_path.parent() else {
+        return false;
+    };
+
+    let parent_matches_model = model_family_token(model_path).is_some_and(|family| {
+        parent
+            .file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase().contains(family))
+            .unwrap_or(false)
+            && shared_token_score(model_path, parent) >= 2
+    });
+    if parent_matches_model {
+        return true;
+    }
+
+    let mut standalone_models = 0usize;
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return false;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if path.is_file()
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+            && !is_mmproj_candidate(&path)
+        {
+            standalone_models += 1;
+            if standalone_models > 1 {
+                return false;
+            }
+        }
+    }
+
+    standalone_models == 1
+}
+
+fn best_colocated_generic_mmproj(model_path: &Path, candidates: &[PathBuf]) -> Option<PathBuf> {
+    if !colocated_generic_mmproj_is_unambiguous(model_path) {
+        return None;
+    }
+
+    let mut generic = candidates
+        .iter()
+        .filter(|candidate| is_generic_mmproj_candidate(candidate))
+        .cloned()
+        .collect::<Vec<_>>();
+    generic.sort_by_key(|candidate| candidate.to_string_lossy().to_ascii_lowercase());
+    generic.into_iter().next()
+}
+
+pub(crate) fn find_mmproj_for_model(model_path: &Path) -> Option<PathBuf> {
     let parent = model_path.parent()?;
     let mut candidates = Vec::new();
     collect_mmproj_candidates(parent, false, &mut candidates);
 
-    if let Some(best) = best_mmproj_candidate(model_path, candidates) {
+    if let Some(best) = best_mmproj_candidate(model_path, &candidates) {
+        return Some(best);
+    }
+    if let Some(best) = best_colocated_generic_mmproj(model_path, &candidates) {
         return Some(best);
     }
 
     let root = model_scan_root(model_path)?;
     let mut candidates = Vec::new();
     collect_mmproj_candidates(&root, true, &mut candidates);
-    best_mmproj_candidate(model_path, candidates)
+    best_mmproj_candidate(model_path, &candidates)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        filename_supports_vision, find_mmproj_for_model, llama_flags_from_help_text,
-        normalize_chat_template_kwargs_for_profile, parse_llama_load_progress, LaunchConfig,
-        LlamaProcess,
+        effective_profile_for_model_path, find_mmproj_for_model, llama_flags_from_help_text,
+        normalize_reasoning_configuration, parse_llama_load_progress, sampling_defaults_from_args,
+        LaunchConfig, LlamaProcess, SamplingDefaults,
     };
     use crate::models::profiles::ModelProfile;
 
     #[test]
     fn gemma4_12b_filename_is_vision_capable() {
-        assert!(filename_supports_vision(std::path::Path::new(
-            "gemma-4-12B-it-Q4_K_M.gguf"
-        )));
+        assert!(
+            effective_profile_for_model_path(std::path::Path::new("gemma-4-12B-it-Q4_K_M.gguf"))
+                .supports_vision
+        );
     }
 
     #[test]
@@ -427,41 +554,108 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_reasoning_off_sets_enable_thinking_false() {
+    fn gemma4_reasoning_off_uses_authoritative_reasoning_flag() {
         let profile = ModelProfile::detect("gemma-4-26B-A4B-it-QAT-Q4_0.gguf");
-        let kwargs =
-            normalize_chat_template_kwargs_for_profile(None, Some("off"), &profile).unwrap();
+        let (reasoning, kwargs) =
+            normalize_reasoning_configuration(None, Some("off"), &profile).unwrap();
 
-        assert_eq!(kwargs.as_deref(), Some(r#"{"enable_thinking":false}"#));
+        assert_eq!(reasoning.as_deref(), Some("off"));
+        assert_eq!(kwargs, None);
     }
 
     #[test]
-    fn qwen36_reasoning_off_sets_enable_thinking_false_without_clobbering_kwargs() {
-        let profile = ModelProfile::detect("Qwen3.6-27B-Q4_K_M.gguf");
-        let kwargs = normalize_chat_template_kwargs_for_profile(
-            Some(r#"{"preserve_thinking":true}"#),
+    fn qwen35_reasoning_off_preserves_non_conflicting_kwargs() {
+        let profile = ModelProfile::detect_with_arch("Tess-4-27B-Q4_K_M.gguf", Some("qwen35"));
+        let (reasoning, kwargs) = normalize_reasoning_configuration(
+            Some(r#"{"preserve_thinking":false}"#),
             Some("none"),
             &profile,
         )
-        .unwrap()
-        .expect("kwargs should exist");
+        .unwrap();
+        let kwargs = kwargs.expect("kwargs should exist");
         let parsed: serde_json::Value = serde_json::from_str(&kwargs).unwrap();
 
-        assert_eq!(parsed["enable_thinking"], false);
-        assert_eq!(parsed["preserve_thinking"], true);
+        assert_eq!(reasoning.as_deref(), Some("off"));
+        assert!(parsed.get("enable_thinking").is_none());
+        assert_eq!(parsed["preserve_thinking"], false);
     }
 
     #[test]
-    fn explicit_enable_thinking_kwargs_are_preserved() {
-        let profile = ModelProfile::detect("Qwen3.6-27B-Q4_K_M.gguf");
-        let kwargs = normalize_chat_template_kwargs_for_profile(
-            Some(r#"{"enable_thinking":true}"#),
+    fn explicit_reasoning_wins_and_deprecated_kwargs_are_removed() {
+        let profile = ModelProfile::detect_with_arch("Tess-4-27B-Q4_K_M.gguf", Some("qwen35"));
+        let (reasoning, kwargs) = normalize_reasoning_configuration(
+            Some(r#"{"enable_thinking":true,"preserve_thinking":false}"#),
             Some("off"),
             &profile,
         )
         .unwrap();
 
-        assert_eq!(kwargs.as_deref(), Some(r#"{"enable_thinking":true}"#));
+        assert_eq!(reasoning.as_deref(), Some("off"));
+        let parsed: serde_json::Value = serde_json::from_str(&kwargs.unwrap()).unwrap();
+        assert!(parsed.get("enable_thinking").is_none());
+        assert_eq!(parsed["preserve_thinking"], false);
+    }
+
+    #[test]
+    fn qwen35_default_reasoning_overrides_deprecated_thinking_kwarg() {
+        let profile = ModelProfile::detect_with_arch("Tess-4-27B-Q4_K_M.gguf", Some("qwen3_5"));
+        let (reasoning, kwargs) =
+            normalize_reasoning_configuration(Some(r#"{"enable_thinking":true}"#), None, &profile)
+                .unwrap();
+
+        assert_eq!(reasoning.as_deref(), Some("off"));
+        assert_eq!(kwargs, None);
+    }
+
+    #[test]
+    fn legacy_deepseek_reasoning_mode_migrates_to_auto() {
+        let profile = ModelProfile::detect("Qwen3-8B-Q4_K_M.gguf");
+        let (reasoning, _) =
+            normalize_reasoning_configuration(None, Some("deepseek-legacy"), &profile).unwrap();
+        assert_eq!(reasoning.as_deref(), Some("auto"));
+    }
+
+    #[test]
+    fn unknown_reasoning_mode_is_rejected_before_launch() {
+        let profile = ModelProfile::detect("Qwen3-8B-Q4_K_M.gguf");
+        let error = normalize_reasoning_configuration(None, Some("mystery"), &profile)
+            .expect_err("unknown mode must fail")
+            .to_string();
+        assert!(error.contains("expected on, off, or auto"));
+    }
+
+    #[test]
+    fn parses_active_launch_sampling_defaults_with_last_value_winning() {
+        let args = [
+            "--temp",
+            "0.7",
+            "--top-p=0.8",
+            "--top-k",
+            "20",
+            "--min-p",
+            "0",
+            "--presence-penalty",
+            "1.5",
+            "--repeat-penalty",
+            "1",
+            "--temp",
+            "0.6",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+        assert_eq!(
+            sampling_defaults_from_args(&args),
+            SamplingDefaults {
+                temperature: Some(0.6),
+                top_p: Some(0.8),
+                top_k: Some(20),
+                min_p: Some(0.0),
+                presence_penalty: Some(1.5),
+                repeat_penalty: Some(1.0),
+            }
+        );
     }
 
     #[test]
@@ -483,6 +677,23 @@ mod tests {
     }
 
     #[test]
+    fn finds_official_tess_4_27b_mmproj_sidecar() {
+        let dir = std::env::temp_dir().join(format!(
+            "inference-bridge-tess-mmproj-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create Tess model dir");
+        let model = dir.join("Tess-4-27B-Q4_K_M.gguf");
+        let mmproj = dir.join("mmproj-Tess-4-27B-F16.gguf");
+        std::fs::write(&model, b"").expect("write Tess model placeholder");
+        std::fs::write(&mmproj, b"").expect("write Tess mmproj placeholder");
+
+        assert_eq!(find_mmproj_for_model(&model), Some(mmproj));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn finds_dot_mmproj_sidecar() {
         let dir = std::env::temp_dir().join(format!(
             "inference-bridge-mmproj-test-{}",
@@ -499,6 +710,46 @@ mod tests {
         assert_eq!(found.file_name(), mmproj.file_name());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finds_generic_mmproj_in_dedicated_model_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "inference-bridge-generic-mmproj-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let dir = root.join("unsloth").join("Qwen3.6-27B-GGUF");
+        std::fs::create_dir_all(&dir).expect("create model dir");
+        let model = dir.join("Qwen3.6-27B-UD-IQ3_XXS.gguf");
+        let mmproj = dir.join("mmproj-F32.gguf");
+        std::fs::write(&model, b"").expect("write model placeholder");
+        std::fs::write(&mmproj, b"").expect("write mmproj placeholder");
+
+        let found = find_mmproj_for_model(&model).expect("generic mmproj should be found");
+        assert_eq!(found, mmproj);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ignores_generic_mmproj_in_ambiguous_mixed_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "inference-bridge-ambiguous-mmproj-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let dir = root.join("publisher").join("mixed-models");
+        std::fs::create_dir_all(&dir).expect("create mixed model dir");
+        let qwen = dir.join("Qwen3.6-27B-Q4_K_M.gguf");
+        let gemma = dir.join("gemma-4-12B-Q4_K_M.gguf");
+        let mmproj = dir.join("mmproj-F32.gguf");
+        std::fs::write(&qwen, b"").expect("write qwen placeholder");
+        std::fs::write(&gemma, b"").expect("write gemma placeholder");
+        std::fs::write(&mmproj, b"").expect("write mmproj placeholder");
+
+        assert!(find_mmproj_for_model(&qwen).is_none());
+        assert!(find_mmproj_for_model(&gemma).is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -729,6 +980,86 @@ mod tests {
         }
     }
 
+    fn write_test_gguf(path: &std::path::Path, tensor_names: &[&str]) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&(tensor_names.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // no metadata entries
+        for name in tensor_names {
+            bytes.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(&1u32.to_le_bytes()); // n_dims
+            bytes.extend_from_slice(&1u64.to_le_bytes()); // dimensions[0]
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // ggml tensor type
+            bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor data offset
+        }
+        std::fs::write(path, bytes).expect("write test GGUF");
+    }
+
+    fn write_test_gguf_with_arch(path: &std::path::Path, architecture: &str) {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // no tensors
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // one metadata entry
+        let key = "general.architecture";
+        bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // GGUF string
+        bytes.extend_from_slice(&(architecture.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(architecture.as_bytes());
+        std::fs::write(path, bytes).expect("write architecture test GGUF");
+    }
+
+    #[test]
+    fn tess_qwen35_preview_defaults_to_reasoning_off_without_deprecated_kwargs() {
+        let dir = std::env::temp_dir().join(format!(
+            "inference-bridge-tess-reasoning-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let model = dir.join("Tess-4-27B-Q4_K_M.gguf");
+        write_test_gguf_with_arch(&model, "qwen35");
+        let server = dir.join("llama-server.exe");
+        std::fs::write(&server, b"").expect("write server placeholder");
+
+        let mut process = LlamaProcess::new();
+        process.set_server_path(server);
+        let preview = process
+            .build_args_preview(&test_launch_config(model))
+            .expect("build Tess preview");
+
+        assert_eq!(preview.reasoning_mode.as_deref(), Some("off"));
+        let reasoning_index = preview
+            .args
+            .iter()
+            .position(|arg| arg == "--reasoning")
+            .expect("reasoning flag");
+        assert_eq!(
+            preview.args.get(reasoning_index + 1).map(String::as_str),
+            Some("off")
+        );
+        assert_eq!(
+            preview
+                .args
+                .iter()
+                .filter(|arg| *arg == "--reasoning")
+                .count(),
+            1
+        );
+        assert!(!preview
+            .args
+            .iter()
+            .any(|arg| arg == "--chat-template-kwargs"));
+        assert!(!preview.args.iter().any(|arg| arg == "--defrag-thold"));
+        assert_eq!(preview.spec_type, "");
+        assert!(!preview.args.iter().any(|arg| arg == "--spec-type"));
+        assert_eq!(preview.chat_template_kwargs_json, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn validates_missing_draft_model_before_launch() {
         let dir = std::env::temp_dir().join(format!(
@@ -764,7 +1095,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let model = dir.join("Qwen3.6-27B-MTP-UD-Q4_K_XL.gguf");
-        std::fs::write(&model, b"").expect("write model placeholder");
+        write_test_gguf(&model, &["blk.64.nextn.shared_head_norm.weight"]);
         let server = dir.join("llama-server.exe");
         std::fs::write(&server, b"").expect("write server placeholder");
 
@@ -813,7 +1144,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let model = dir.join("Qwen3.6-35B-A3B-Native-MTP-Preserved.Q4_K_M.gguf");
-        std::fs::write(&model, b"").expect("write model placeholder");
+        write_test_gguf(&model, &["blk.40.nextn.shared_head_norm.weight"]);
         let server = dir.join("llama-server.exe");
         std::fs::write(&server, b"").expect("write server placeholder");
 
@@ -875,6 +1206,62 @@ mod tests {
             "non-MTP model should not emit speculative flags, got {:?}",
             preview.args
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mtp_parent_and_repo_names_do_not_enable_speculation_for_regular_gguf() {
+        let dir = std::env::temp_dir()
+            .join(format!(
+                "inference-bridge-false-mtp-parent-test-{}",
+                uuid::Uuid::new_v4()
+            ))
+            .join("Gemma4-Balanced-MTP");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let model = dir.join("Gemma4-Balanced-Q4_K_M.gguf");
+        write_test_gguf(&model, &["blk.0.attn_q.weight"]);
+        let server = dir.join("llama-server.exe");
+        std::fs::write(&server, b"").expect("write server placeholder");
+
+        let mut process = LlamaProcess::new();
+        process.set_server_path(server);
+
+        let mut config = test_launch_config(model);
+        config.hf_repo = Some("publisher/Gemma4-Balanced-MTP".to_string());
+        config.hf_file = Some("Gemma4-Balanced-MTP-Q4_K_M.gguf".to_string());
+        let preview = process
+            .build_args_preview(&config)
+            .expect("build regular GGUF preview");
+
+        assert_eq!(preview.spec_type, "");
+        assert_eq!(preview.spec_draft_n_max, 0);
+        assert!(
+            !preview.args.iter().any(|arg| arg == "--spec-type"),
+            "directory/repository naming must not enable MTP, got {:?}",
+            preview.args
+        );
+
+        let _ = std::fs::remove_dir_all(dir.parent().expect("test parent"));
+    }
+
+    #[test]
+    fn explicit_self_mtp_rejects_regular_gguf_before_launch() {
+        let dir = std::env::temp_dir().join(format!(
+            "inference-bridge-incompatible-self-mtp-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let model = dir.join("Gemma4-Balanced-Q4_K_M.gguf");
+        write_test_gguf(&model, &["blk.0.attn_q.weight"]);
+
+        let mut config = test_launch_config(model);
+        config.spec_type = "draft-mtp".to_string();
+        let error = LlamaProcess::validate_launch_config(&config)
+            .expect_err("regular GGUF must reject self-MTP")
+            .to_string();
+
+        assert!(error.contains("does not contain MTP prediction-head tensors"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1083,7 +1470,21 @@ pub struct LaunchPreview {
     pub draft_max_tokens: u32,
     pub draft_min_tokens: u32,
     pub draft_p_min: f32,
+    /// Sampler defaults selected for this active launch. Request-time callers
+    /// use these when a client omits the corresponding value.
+    #[serde(default)]
+    pub sampling_defaults: SamplingDefaults,
     pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SamplingDefaults {
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<i32>,
+    pub min_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repeat_penalty: Option<f32>,
 }
 
 /// Resources extracted from a live LlamaProcess for async shutdown outside the AppState lock.
@@ -1248,8 +1649,18 @@ impl LlamaProcess {
             anyhow::bail!("Model file does not exist: {}", config.model_path.display());
         }
         let draft_model_path = config.draft_model_path.trim();
-        if config.spec_type.trim() == "draft-dflash" && draft_model_path.is_empty() {
+        let spec_type = config.spec_type.trim().to_ascii_lowercase();
+        if spec_type == "draft-dflash" && draft_model_path.is_empty() {
             anyhow::bail!("DFlash speculative decoding requires a draft model path (-md)");
+        }
+        if spec_type == DEFAULT_SELF_MTP_SPEC_TYPE
+            && draft_model_path.is_empty()
+            && config.model_path.is_file()
+            && !crate::models::gguf::has_mtp_tensors(&config.model_path)
+        {
+            anyhow::bail!(
+                "Self-MTP speculative decoding was requested, but this GGUF does not contain MTP prediction-head tensors. Disable speculative decoding or choose a native MTP-preserved GGUF"
+            );
         }
         if !draft_model_path.is_empty() {
             let draft_path = Path::new(draft_model_path);
@@ -1292,12 +1703,20 @@ impl LlamaProcess {
     pub fn build_args_preview(&self, config: &LaunchConfig) -> anyhow::Result<LaunchPreview> {
         Self::validate_launch_config(config)?;
 
-        let profile = ModelProfile::detect(&format!(
+        let profile_name = format!(
             "{} {} {}",
             config.model_path.to_string_lossy(),
             config.hf_repo.as_deref().unwrap_or_default(),
             config.hf_file.as_deref().unwrap_or_default()
-        ));
+        );
+        let model_metadata = crate::models::gguf::read_gguf_meta_cached(&config.model_path);
+        let architecture = model_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.architecture.as_deref());
+        let profile = crate::models::overrides::detect_effective_profile_with_arch(
+            &profile_name,
+            architecture,
+        );
 
         if matches!(profile.family, ModelFamily::DiffusionGemma) {
             return self.build_diffusion_args_preview(config);
@@ -1307,13 +1726,16 @@ impl LlamaProcess {
             .find_server_binary_with_preference(&config.backend_preference)
             .ok_or_else(|| anyhow::anyhow!("llama-server binary not found"))?;
 
-        let mmproj_path = if config.attach_mmproj && filename_supports_vision(&config.model_path) {
+        // Sidecar discovery is deliberately independent of filename/profile
+        // heuristics. Derivative names such as Tess do not advertise `vision`
+        // even though their qwen35 GGUF is multimodal.
+        let mmproj_path = if config.attach_mmproj {
             find_mmproj_for_model(&config.model_path)
         } else {
             None
         };
 
-        let chat_template_kwargs_json = normalize_chat_template_kwargs_for_profile(
+        let (reasoning_mode, chat_template_kwargs_json) = normalize_reasoning_configuration(
             config.chat_template_kwargs_json.as_deref(),
             config.reasoning_mode.as_deref(),
             &profile,
@@ -1379,11 +1801,7 @@ impl LlamaProcess {
         if config.use_jinja {
             args.push("--jinja".to_string());
         }
-        if let Some(reasoning_mode) = config
-            .reasoning_mode
-            .as_ref()
-            .filter(|value| !value.trim().is_empty())
-        {
+        if let Some(reasoning_mode) = reasoning_mode.as_ref() {
             args.push("--reasoning".to_string());
             args.push(reasoning_mode.clone());
         }
@@ -1451,10 +1869,10 @@ impl LlamaProcess {
             args.push("--main-gpu".to_string());
             args.push(config.main_gpu.to_string());
         }
-        if config.defrag_thold > 0.0 {
-            args.push("--defrag-thold".to_string());
-            args.push(format!("{:.4}", config.defrag_thold));
-        }
+        // Recent llama.cpp builds no longer require --defrag-thold and emit a
+        // deprecation warning when it is supplied. Keep the persisted field
+        // readable for backwards-compatible settings files, but deliberately
+        // do not forward it to the server.
         if config.rope_freq_scale > 0.0 {
             args.push("--rope-freq-scale".to_string());
             args.push(format!("{:.6}", config.rope_freq_scale));
@@ -1499,10 +1917,11 @@ impl LlamaProcess {
         // --spec-type drives BOTH self-MTP (no draft model) and draft-model modes.
         // It must be emitted whenever a spec type is configured, independent of -md,
         // otherwise self-MTP never activates. --spec-draft-n-max pairs with it.
-        let spec_type = effective_spec_type(config);
+        let supports_self_mtp = launch_config_supports_self_mtp(config);
+        let spec_type = effective_spec_type(config, supports_self_mtp);
         let spec_draft_n_max = spec_type
             .as_deref()
-            .map(|spec_type| effective_spec_draft_n_max(config, spec_type))
+            .map(|spec_type| effective_spec_draft_n_max(config, spec_type, supports_self_mtp))
             .unwrap_or(0);
 
         if let Some(spec_type) = spec_type.as_deref() {
@@ -1530,6 +1949,8 @@ impl LlamaProcess {
         }
         args.extend(config.extra_args.iter().cloned());
 
+        let sampling_defaults = sampling_defaults_from_args(&args);
+
         Ok(LaunchPreview {
             runtime: "llama-server".to_string(),
             server_path: server_path.to_string_lossy().to_string(),
@@ -1545,7 +1966,7 @@ impl LlamaProcess {
             cache_ram_mb: config.cache_ram_mb,
             ctxcp: config.ctxcp,
             use_jinja: config.use_jinja,
-            reasoning_mode: config.reasoning_mode.clone(),
+            reasoning_mode,
             reasoning_preserve: config.reasoning_preserve,
             template_mode: config.template_mode.clone(),
             template_source: config.template_source.clone(),
@@ -1561,6 +1982,7 @@ impl LlamaProcess {
             draft_max_tokens: config.draft_max_tokens,
             draft_min_tokens: config.draft_min_tokens,
             draft_p_min: config.draft_p_min,
+            sampling_defaults,
             args,
         })
     }
@@ -1634,6 +2056,7 @@ impl LlamaProcess {
             draft_max_tokens: 0,
             draft_min_tokens: 0,
             draft_p_min: 0.0,
+            sampling_defaults: SamplingDefaults::default(),
             args,
         })
     }
@@ -2033,12 +2456,16 @@ impl LlamaProcess {
                 mmproj = %mmproj_path,
                 "Using multimodal projection sidecar for vision model"
             );
-        } else if config.attach_mmproj && filename_supports_vision(&config.model_path) {
+        } else if config.attach_mmproj
+            && effective_profile_for_model_path(&config.model_path).supports_vision
+        {
             tracing::warn!(
                 model = %config.model_path.display(),
                 "Vision-capable model detected but no mmproj sidecar was found nearby; image understanding may fail"
             );
-        } else if !config.attach_mmproj && filename_supports_vision(&config.model_path) {
+        } else if !config.attach_mmproj
+            && effective_profile_for_model_path(&config.model_path).supports_vision
+        {
             tracing::info!(
                 model = %config.model_path.display(),
                 "Skipping mmproj attachment for this text-only launch"

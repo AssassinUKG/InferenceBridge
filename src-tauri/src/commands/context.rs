@@ -6,20 +6,16 @@ use crate::state::SharedState;
 pub async fn get_context_status(
     state: tauri::State<'_, SharedState>,
 ) -> Result<tracker::ContextStatus, String> {
-    let (loaded, running, port, stored) = {
+    let (can_poll, port, stored) = {
         let s = state.read().await;
         (
-            s.loaded_model.is_some(),
-            matches!(
-                s.process.state(),
-                crate::engine::process::ProcessState::Running
-            ),
+            tracker::can_poll_context(s.loaded_model.is_some(), s.process.state()),
             s.process.port(),
             s.last_context_status.clone(),
         )
     };
 
-    if !loaded || !running {
+    if !can_poll {
         return Ok(stored.unwrap_or_else(tracker::ContextStatus::empty));
     }
 

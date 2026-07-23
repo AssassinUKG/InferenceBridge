@@ -1,5 +1,11 @@
 # Template & Tool-Call Audit
 
+> Historical audit note: for Tess-4-27B/Qwen3.6, the approved current behavior
+> is explicit llama.cpp `--reasoning on/off`, the repository's embedded Jinja,
+> and native Qwen XML tools. Where this audit's older prompt-injection advice
+> conflicts with that behavior, follow
+> [docs/20-tess-4-27b-runtime-guide.md](20-tess-4-27b-runtime-guide.md).
+
 ## Files reviewed
 
 - `src-tauri/src/models/profiles.rs` — profile detection and family settings

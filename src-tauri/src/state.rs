@@ -11,8 +11,9 @@ use tokio_util::sync::CancellationToken;
 use crate::commands::browse::DownloadProgress;
 use crate::config::AppConfig;
 use crate::context::tracker::ContextStatus;
-use crate::engine::process::{LaunchPreview, LlamaProcess};
+use crate::engine::process::{LaunchPreview, LlamaProcess, SamplingDefaults};
 use crate::engine::scheduler::RequestScheduler;
+use crate::image_generation::ImageGenerationProgress;
 use crate::models::overrides::ModelProfileOverride;
 use crate::models::profiles::ModelProfile;
 use crate::models::registry::ModelRegistry;
@@ -155,8 +156,12 @@ pub struct AppState {
     pub api_server_port: Option<u16>,
     pub app_handle: Option<tauri::AppHandle>,
     pub active_downloads: HashMap<String, ActiveDownload>,
+    pub download_persist_mutex: Arc<AsyncMutex<()>>,
     pub request_scheduler: Arc<RequestScheduler>,
     pub model_load_mutex: Arc<AsyncMutex<()>>,
+    pub image_generation_progress: Option<ImageGenerationProgress>,
+    pub image_generation_cancel: CancellationToken,
+    pub image_generation_mutex: Arc<AsyncMutex<()>>,
     pub cumulative_metrics: CumulativeMetrics,
 }
 
@@ -166,6 +171,19 @@ impl AppState {
     pub fn new(config: AppConfig) -> anyhow::Result<Self> {
         let session_db = SessionDb::open()?;
         let scheduler_limit = config.process.parallel_slots;
+        let active_downloads =
+            crate::commands::browse::load_persisted_downloads(&config.models.scan_dirs)
+                .into_iter()
+                .map(|progress| {
+                    (
+                        progress.id.clone(),
+                        ActiveDownload {
+                            progress,
+                            cancel_token: CancellationToken::new(),
+                        },
+                    )
+                })
+                .collect();
         let mut process = LlamaProcess::new();
         if !config.process.llama_server_path.trim().is_empty() {
             process.set_server_path(config.process.llama_server_path.clone().into());
@@ -202,11 +220,29 @@ impl AppState {
             api_server_host: None,
             api_server_port: None,
             app_handle: None,
-            active_downloads: HashMap::new(),
+            active_downloads,
+            download_persist_mutex: Arc::new(AsyncMutex::new(())),
             request_scheduler: Arc::new(RequestScheduler::new(scheduler_limit)),
             model_load_mutex: Arc::new(AsyncMutex::new(())),
+            image_generation_progress: None,
+            image_generation_cancel: CancellationToken::new(),
+            image_generation_mutex: Arc::new(AsyncMutex::new(())),
             cumulative_metrics: CumulativeMetrics::default(),
         })
+    }
+
+    /// Resolve a model profile through the scanned registry so request-time
+    /// rendering/parsing uses the GGUF architecture rather than filename-only
+    /// heuristics.
+    pub fn effective_profile_for_model(&self, model_name: &str) -> ModelProfile {
+        self.model_registry.effective_profile_for_name(model_name)
+    }
+
+    pub fn active_sampling_defaults(&self) -> SamplingDefaults {
+        self.last_launch_preview
+            .as_ref()
+            .map(|preview| preview.sampling_defaults)
+            .unwrap_or_default()
     }
 }
 
@@ -313,17 +349,34 @@ pub async fn finish_api_generation_for_request(
     request_id: &str,
     status: &str,
 ) {
+    finish_generation_for_request(state, request_id, status).await;
+}
+
+pub async fn finish_generation_for_request(state: &SharedState, request_id: &str, status: &str) {
     let mut s = state.write().await;
     s.generation_cancels.remove(request_id);
+    let effective_status = s
+        .live_streams
+        .iter()
+        .find(|stream| stream.request_id == request_id)
+        .map(|stream| {
+            if stream.status == "cancelled" {
+                "cancelled"
+            } else {
+                status
+            }
+        })
+        .unwrap_or(status)
+        .to_string();
     if let Some(active) = s
         .active_generation
         .as_mut()
         .filter(|active| active.id == request_id)
     {
-        active.status = status.to_string();
+        active.status = effective_status.clone();
     }
     let snapshot = update_live_stream_locked(&mut s, request_id, |stream| {
-        stream.status = status.to_string();
+        stream.status = effective_status;
     });
     if let (Some(handle), Some(snapshot)) = (s.app_handle.clone(), snapshot) {
         let _ = handle.emit("llm-stream-done", snapshot);
@@ -378,17 +431,40 @@ pub async fn begin_live_generation(
 }
 
 pub async fn cancel_all_generations(state: &SharedState) -> usize {
-    let mut s = state.write().await;
-    let count = s.generation_cancels.len();
-    for cancel in s.generation_cancels.values() {
-        cancel.cancel();
-    }
-    s.generation_cancel.cancel();
-    if count > 0 {
-        s.cumulative_metrics.total_cancellations += count as u64;
-    }
-    if let Some(gen) = s.active_generation.as_mut() {
-        gen.status = "cancelled".to_string();
+    let (handle, snapshots, count) = {
+        let mut s = state.write().await;
+        let request_ids = s.generation_cancels.keys().cloned().collect::<Vec<_>>();
+        let count = request_ids.len();
+        for cancel in s.generation_cancels.values() {
+            cancel.cancel();
+        }
+        s.generation_cancel.cancel();
+        s.generation_cancels.clear();
+        if count > 0 {
+            s.cumulative_metrics.total_cancellations += count as u64;
+        }
+        if s.active_generation
+            .as_ref()
+            .is_some_and(|active| request_ids.contains(&active.id))
+        {
+            s.active_generation = None;
+        }
+
+        let mut snapshots = Vec::with_capacity(count);
+        for request_id in &request_ids {
+            if let Some(snapshot) = update_live_stream_locked(&mut s, request_id, |stream| {
+                stream.status = "cancelled".to_string();
+            }) {
+                snapshots.push(snapshot);
+            }
+        }
+        (s.app_handle.clone(), snapshots, count)
+    };
+
+    if let Some(handle) = handle {
+        for snapshot in snapshots {
+            let _ = handle.emit("llm-stream-done", snapshot);
+        }
     }
     count
 }
@@ -443,6 +519,7 @@ pub async fn append_live_stream_delta_for_request(
                     stream.raw_output.push_str(text);
                 }
                 "content_buffered" => {}
+                "input" => {}
                 "tool_call" => {}
                 _ => {
                     stream.raw_output.push_str(text);
@@ -543,8 +620,8 @@ pub fn summarize_reasoning_tokens(
 #[cfg(test)]
 mod tests {
     use super::{
-        append_live_stream_delta_for_request, begin_api_generation, cancel_all_generations,
-        AppState,
+        append_live_stream_delta_for_request, begin_api_generation, begin_live_generation,
+        cancel_all_generations, finish_generation_for_request, AppState, GenerationDropGuard,
     };
     use crate::config::AppConfig;
     use std::sync::Arc;
@@ -567,6 +644,14 @@ mod tests {
         assert_eq!(cancelled, 2);
         assert!(first.cancel.is_cancelled());
         assert!(second.cancel.is_cancelled());
+
+        let s = state.read().await;
+        assert!(s.generation_cancels.is_empty());
+        assert!(s.active_generation.is_none());
+        assert!(s
+            .live_streams
+            .iter()
+            .all(|stream| stream.status == "cancelled"));
     }
 
     #[tokio::test]
@@ -590,5 +675,190 @@ mod tests {
         assert_eq!(stream.raw_output, "Hello");
         assert_eq!(stream.events.len(), 2);
         assert_eq!(stream.events[1].kind, "content_buffered");
+    }
+
+    #[tokio::test]
+    async fn request_input_is_recorded_without_polluting_model_output() {
+        let state = Arc::new(RwLock::new(
+            AppState::new(AppConfig::default()).expect("state should initialize"),
+        ));
+
+        let generation = begin_live_generation(
+            &state,
+            "gui",
+            Some("session-input".to_string()),
+            "model-a".to_string(),
+        )
+        .await;
+        append_live_stream_delta_for_request(
+            &state,
+            &generation.request_id,
+            "input",
+            "hello from the user",
+        )
+        .await;
+
+        let s = state.read().await;
+        let stream = s.live_stream.as_ref().expect("stream should exist");
+        assert!(stream.raw_output.is_empty());
+        assert!(stream.visible_output.is_empty());
+        assert_eq!(stream.events.len(), 1);
+        assert_eq!(stream.events[0].kind, "input");
+        assert_eq!(stream.events[0].text, "hello from the user");
+    }
+
+    #[tokio::test]
+    async fn request_scoped_updates_do_not_cross_interleaved_generations() {
+        let state = Arc::new(RwLock::new(
+            AppState::new(AppConfig::default()).expect("state should initialize"),
+        ));
+
+        let gui = begin_live_generation(
+            &state,
+            "gui",
+            Some("session-a".to_string()),
+            "model-a".to_string(),
+        )
+        .await;
+        let api = begin_api_generation(&state, "model-b".to_string()).await;
+
+        append_live_stream_delta_for_request(&state, &gui.request_id, "raw", "gui raw").await;
+        append_live_stream_delta_for_request(&state, &gui.request_id, "content", "gui text").await;
+        append_live_stream_delta_for_request(&state, &api.request_id, "raw", "api raw").await;
+
+        let s = state.read().await;
+        let gui_stream = s
+            .live_streams
+            .iter()
+            .find(|stream| stream.request_id == gui.request_id)
+            .expect("GUI stream should remain in history");
+        let api_stream = s
+            .live_streams
+            .iter()
+            .find(|stream| stream.request_id == api.request_id)
+            .expect("API stream should remain in history");
+        assert_eq!(gui_stream.raw_output, "gui raw");
+        assert_eq!(gui_stream.visible_output, "gui text");
+        assert_eq!(api_stream.raw_output, "api raw");
+        assert!(api_stream.visible_output.is_empty());
+        assert_eq!(
+            s.live_stream.as_ref().map(|stream| &stream.request_id),
+            Some(&api.request_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn request_scoped_finish_updates_history_and_cleans_only_its_cancel() {
+        let state = Arc::new(RwLock::new(
+            AppState::new(AppConfig::default()).expect("state should initialize"),
+        ));
+
+        let gui = begin_live_generation(
+            &state,
+            "gui",
+            Some("session-a".to_string()),
+            "model-a".to_string(),
+        )
+        .await;
+        let api = begin_api_generation(&state, "model-b".to_string()).await;
+
+        finish_generation_for_request(&state, &gui.request_id, "completed").await;
+
+        {
+            let s = state.read().await;
+            let gui_stream = s
+                .live_streams
+                .iter()
+                .find(|stream| stream.request_id == gui.request_id)
+                .expect("GUI stream should remain in history");
+            let api_stream = s
+                .live_streams
+                .iter()
+                .find(|stream| stream.request_id == api.request_id)
+                .expect("API stream should remain in history");
+            assert_eq!(gui_stream.status, "completed");
+            assert_eq!(api_stream.status, "running");
+            assert!(!s.generation_cancels.contains_key(&gui.request_id));
+            assert!(s.generation_cancels.contains_key(&api.request_id));
+            assert_eq!(
+                s.live_stream.as_ref().map(|stream| &stream.request_id),
+                Some(&api.request_id)
+            );
+            assert_eq!(
+                s.active_generation.as_ref().map(|active| &active.id),
+                Some(&api.request_id)
+            );
+        }
+
+        finish_generation_for_request(&state, &api.request_id, "completed").await;
+
+        let s = state.read().await;
+        assert!(s.generation_cancels.is_empty());
+        assert!(s.active_generation.is_none());
+        assert_eq!(
+            s.live_stream.as_ref().map(|stream| stream.status.as_str()),
+            Some("completed")
+        );
+        assert!(s
+            .live_streams
+            .iter()
+            .all(|stream| stream.status == "completed"));
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_terminal_when_worker_finishes_after_cancel() {
+        let state = Arc::new(RwLock::new(
+            AppState::new(AppConfig::default()).expect("state should initialize"),
+        ));
+
+        let generation = begin_live_generation(
+            &state,
+            "gui",
+            Some("session-a".to_string()),
+            "model-a".to_string(),
+        )
+        .await;
+
+        assert_eq!(cancel_all_generations(&state).await, 1);
+        finish_generation_for_request(&state, &generation.request_id, "completed").await;
+
+        let s = state.read().await;
+        let stream = s
+            .live_streams
+            .iter()
+            .find(|stream| stream.request_id == generation.request_id)
+            .expect("cancelled stream should remain in history");
+        assert_eq!(stream.status, "cancelled");
+        assert!(s.generation_cancels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_guard_drop_preserves_completed_and_error_statuses() {
+        for terminal_status in ["completed", "error"] {
+            let state = Arc::new(RwLock::new(
+                AppState::new(AppConfig::default()).expect("state should initialize"),
+            ));
+            let generation = begin_api_generation(&state, "model-a".to_string()).await;
+            let request_id = generation.request_id.clone();
+            let cancellation = generation.cancel.clone();
+            let guard =
+                GenerationDropGuard::new(state.clone(), request_id.clone(), generation.cancel);
+
+            // SSE producers must perform these two operations before yielding a
+            // terminal frame because clients commonly drop immediately on it.
+            guard.mark_completed();
+            finish_generation_for_request(&state, &request_id, terminal_status).await;
+            drop(guard);
+            tokio::task::yield_now().await;
+
+            assert!(!cancellation.is_cancelled());
+            let state = state.read().await;
+            let stream = state
+                .live_streams
+                .iter()
+                .find(|stream| stream.request_id == request_id)
+                .expect("terminal stream should remain in history");
+            assert_eq!(stream.status, terminal_status);
+        }
     }
 }

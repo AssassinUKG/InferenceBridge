@@ -3,6 +3,10 @@ import { listen } from "@tauri-apps/api/event";
 import type { MessageInfo } from "../lib/types";
 import * as api from "../lib/tauri";
 import type { SamplingParams } from "../lib/tauri";
+import {
+  createOptimisticUserMessage,
+  reconcileLoadedSessionMessages,
+} from "../lib/chatPresentation";
 
 interface ChatState {
   messages: MessageInfo[];
@@ -17,6 +21,7 @@ export function useChat(sessionId: string | null) {
   const pendingTextRef = useRef("");
   const pendingReasoningRef = useRef("");
   const flushFrameRef = useRef<number | null>(null);
+  const optimisticMessageIdRef = useRef(-1);
   const [state, setState] = useState<ChatState>({
     messages: [],
     isStreaming: false,
@@ -32,10 +37,29 @@ export function useChat(sessionId: string | null) {
       return;
     }
 
+    let cancelled = false;
+
     api.getSessionMessages(sessionId).then(
-      (messages) => setState((current) => ({ ...current, messages, error: null })),
-      (error) => setState((current) => ({ ...current, error: String(error) }))
+      (messages) => {
+        if (cancelled) return;
+        setState((current) => ({
+          ...current,
+          messages: reconcileLoadedSessionMessages(
+            current.messages,
+            messages,
+            current.isStreaming,
+          ),
+          error: null,
+        }));
+      },
+      (error) => {
+        if (!cancelled) setState((current) => ({ ...current, error: String(error) }));
+      }
     );
+
+    return () => {
+      cancelled = true;
+    };
   }, [sessionId]);
 
   const flushStreamingBuffers = useCallback(() => {
@@ -78,8 +102,16 @@ export function useChat(sessionId: string | null) {
     ) => {
       if (!sessionId || state.isStreaming) return;
 
+      const optimisticMessageId = optimisticMessageIdRef.current--;
+      const optimisticMessage = createOptimisticUserMessage(
+        optimisticMessageId,
+        content,
+        imageBase64,
+      );
+
       setState((current) => ({
         ...current,
+        messages: [...current.messages, optimisticMessage],
         isStreaming: true,
         streamingText: "",
         streamingReasoning: "",
@@ -135,8 +167,15 @@ export function useChat(sessionId: string | null) {
         }));
       } catch (error) {
         cancelStreamingFlush();
+        let persistedMessages: MessageInfo[] | null = null;
+        try {
+          persistedMessages = await api.getSessionMessages(sessionId);
+        } catch {
+          // Keep the optimistic prompt visible when reconciliation itself fails.
+        }
         setState((current) => ({
           ...current,
+          messages: persistedMessages ?? current.messages,
           isStreaming: false,
           error: String(error),
           streamingText: "",

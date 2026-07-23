@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "lab_name": "InferenceBridge Image Generation Lab",
+  "runtime": {
+    "id": "stable-diffusion-cpp-cuda12-8a51eb9",
+    "project": "leejet/stable-diffusion.cpp",
+    "tag": "master-788-8a51eb9",
+    "commit": "8a51eb9",
+    "published_at": "2026-07-22T19:49:54Z",
+    "asset_name": "sd-master-8a51eb9-bin-win-cuda12-x64.zip",
+    "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-788-8a51eb9/sd-master-8a51eb9-bin-win-cuda12-x64.zip",
+    "size": 361974071,
+    "sha256": "3017e4434cf03e9a22f02facc2455bc2255df88d7ad1a85fe1f8e5ef46ddb0d9",
+    "cuda_runtime": {
+      "asset_name": "cudart-sd-bin-win-cu12-x64.zip",
+      "url": "https://github.com/leejet/stable-diffusion.cpp/releases/download/master-788-8a51eb9/cudart-sd-bin-win-cu12-x64.zip",
+      "size": 563452046,
+      "sha256": "fe20366827d357c00797eebb58244dddab7fd9a348d70090c3871004c320f38d"
+    }
+  },
+  "assets": {
+    "qwen-2512-transformer-q6": {
+      "role": "diffusion_transformer",
+      "repo": "unsloth/Qwen-Image-2512-GGUF",
+      "revision": "1626d7531f84b4d2ea1cd6d2e69f41ec027dd354",
+      "filename": "qwen-image-2512-Q6_K.gguf",
+      "relative_path": "models/qwen-image-2512/qwen-image-2512-Q6_K.gguf",
+      "url": "https://huggingface.co/unsloth/Qwen-Image-2512-GGUF/resolve/1626d7531f84b4d2ea1cd6d2e69f41ec027dd354/qwen-image-2512-Q6_K.gguf?download=true",
+      "size": 16824990240,
+      "sha256": "58c7fcea3d29eaee4dbe77041764a7de3ffe449f9758c8bc459f0b22a09536cf"
+    },
+    "qwen-2512-transformer-q8": {
+      "role": "diffusion_transformer",
+      "repo": "unsloth/Qwen-Image-2512-GGUF",
+      "revision": "1626d7531f84b4d2ea1cd6d2e69f41ec027dd354",
+      "filename": "qwen-image-2512-Q8_0.gguf",
+      "relative_path": "models/qwen-image-2512/qwen-image-2512-Q8_0.gguf",
+      "url": "https://huggingface.co/unsloth/Qwen-Image-2512-GGUF/resolve/1626d7531f84b4d2ea1cd6d2e69f41ec027dd354/qwen-image-2512-Q8_0.gguf?download=true",
+      "size": 21761817120,
+      "sha256": "e285a0692582acf09bb4086d9b120eb0e357c4386565d169a033cb968c6fa9a5"
+    },
+    "qwen25-vl-7b-encoder-q8": {
+      "role": "text_encoder",
+      "repo": "mradermacher/Qwen2.5-VL-7B-Instruct-GGUF",
+      "revision": "cfa2baa09946b211c107e6e104948987a64dd2c1",
+      "filename": "Qwen2.5-VL-7B-Instruct.Q8_0.gguf",
+      "relative_path": "models/qwen-image-2512/Qwen2.5-VL-7B-Instruct.Q8_0.gguf",
+      "url": "https://huggingface.co/mradermacher/Qwen2.5-VL-7B-Instruct-GGUF/resolve/cfa2baa09946b211c107e6e104948987a64dd2c1/Qwen2.5-VL-7B-Instruct.Q8_0.gguf?download=true",
+      "size": 8098524160,
+      "sha256": "577bfb3e41f93f00414e594c56a38bbe91207b3b636ab7faf343e34a20aa73ca"
+    },
+    "qwen-image-vae": {
+      "role": "vae",
+      "repo": "Comfy-Org/Qwen-Image_ComfyUI",
+      "revision": "46839d338df81ce625d5fae27d7e370314c0fbc9",
+      "filename": "qwen_image_vae.safetensors",
+      "relative_path": "models/qwen-image-2512/qwen_image_vae.safetensors",
+      "url": "https://huggingface.co/Comfy-Org/Qwen-Image_ComfyUI/resolve/46839d338df81ce625d5fae27d7e370314c0fbc9/split_files/vae/qwen_image_vae.safetensors?download=true",
+      "size": 253806246,
+      "sha256": "a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f"
+    }
+  },
+  "bundles": {
+    "qwen-2512-q6-quality": {
+      "description": "Quality-first RTX 3090 candidate",
+      "transformer": "qwen-2512-transformer-q6",
+      "text_encoder": "qwen25-vl-7b-encoder-q8",
+      "vae": "qwen-image-vae"
+    },
+    "qwen-2512-q8-experimental": {
+      "description": "Optional higher-precision comparison with heavier offloading",
+      "transformer": "qwen-2512-transformer-q8",
+      "text_encoder": "qwen25-vl-7b-encoder-q8",
+      "vae": "qwen-image-vae"
+    }
+  },
+  "profiles": {
+    "smoke": {
+      "width": 512,
+      "height": 512,
+      "steps": 4,
+      "cfg_scale": 2.5,
+      "flow_shift": 3.0,
+      "sampling_method": "euler",
+      "seed": 424242,
+      "max_vram_gib": -1.0,
+      "timeout_seconds": 1800,
+      "auto_fit": true,
+      "offload_to_cpu": false,
+      "vae_on_cpu": false,
+      "diffusion_flash_attention": true,
+      "verbose": true
+    },
+    "quality-1024": {
+      "width": 1024,
+      "height": 1024,
+      "steps": 50,
+      "cfg_scale": 2.5,
+      "flow_shift": 3.0,
+      "sampling_method": "euler",
+      "seed": 424242,
+      "max_vram_gib": -1.0,
+      "timeout_seconds": 5400,
+      "auto_fit": true,
+      "offload_to_cpu": false,
+      "vae_on_cpu": false,
+      "diffusion_flash_attention": true,
+      "verbose": true
+    },
+    "quality-native-square": {
+      "width": 1328,
+      "height": 1328,
+      "steps": 50,
+      "cfg_scale": 2.5,
+      "flow_shift": 3.0,
+      "sampling_method": "euler",
+      "seed": 424242,
+      "max_vram_gib": -1.0,
+      "timeout_seconds": 7200,
+      "auto_fit": true,
+      "offload_to_cpu": false,
+      "vae_on_cpu": false,
+      "diffusion_flash_attention": true,
+      "verbose": true
+    }
+  }
+}

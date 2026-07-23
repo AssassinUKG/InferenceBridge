@@ -181,6 +181,81 @@ pub fn read_gguf_meta(path: &Path) -> Option<GgufMeta> {
     parse_gguf_meta(&mut r)
 }
 
+/// Return whether a local GGUF actually contains the extra prediction-head
+/// tensors required by llama.cpp's self-MTP context.
+///
+/// Model repositories sometimes include `MTP` in a directory/repository name
+/// even when a particular quantized file was exported without those tensors.
+/// Looking at the tensor table keeps speculative decoding opt-in/compatible
+/// instead of inferring support from a path string.
+pub fn has_mtp_tensors(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    // SAFETY: read-only mapping, scoped to this function. Parse failures are
+    // treated conservatively as "MTP not detected".
+    let Ok(mmap) = (unsafe { memmap2::Mmap::map(&file) }) else {
+        return false;
+    };
+    let mut r = Cursor::new(&mmap[..]);
+    parse_has_mtp_tensors(&mut r).unwrap_or(false)
+}
+
+fn parse_has_mtp_tensors<R: Read + Seek>(r: &mut R) -> Option<bool> {
+    if read_u32(r)? != GGUF_MAGIC {
+        return None;
+    }
+
+    let version = read_u32(r)?;
+    if version == 0 || version > 3 {
+        return None;
+    }
+    let v1 = version == 1;
+    let n_tensors = if v1 {
+        read_u32(r)? as u64
+    } else {
+        read_u64(r)?
+    };
+    let n_kv = if v1 {
+        read_u32(r)? as u64
+    } else {
+        read_u64(r)?
+    };
+
+    // Avoid spending unbounded time on a corrupt header.
+    if n_tensors > 10_000_000 || n_kv > 10_000_000 {
+        return None;
+    }
+
+    for _ in 0..n_kv {
+        let _key = read_str(r, v1)?;
+        let ty = read_u32(r)?;
+        skip_val(r, ty, v1)?;
+    }
+
+    for _ in 0..n_tensors {
+        let name = read_str(r, v1)?;
+        let n_dims = read_u32(r)? as u64;
+        if n_dims > 64 {
+            return None;
+        }
+        seek_fwd(r, n_dims * if v1 { 4 } else { 8 })?;
+        // ggml tensor type + data offset.
+        seek_fwd(r, 4 + 8)?;
+
+        let name = name.to_ascii_lowercase();
+        if name.starts_with("nextn.")
+            || name.contains(".nextn.")
+            || name.starts_with("mtp.")
+            || name.contains(".mtp.")
+        {
+            return Some(true);
+        }
+    }
+
+    Some(false)
+}
+
 /// Core GGUF header parser, generic over any seekable byte source.
 fn parse_gguf_meta<R: Read + Seek>(r: &mut R) -> Option<GgufMeta> {
     if read_u32(r)? != GGUF_MAGIC {
@@ -373,6 +448,36 @@ pub fn flush_gguf_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_gguf_with_tensors(names: &[&str]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&(names.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // no metadata entries
+        for name in names {
+            bytes.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(&1u32.to_le_bytes()); // n_dims
+            bytes.extend_from_slice(&1u64.to_le_bytes()); // dimensions[0]
+            bytes.extend_from_slice(&0u32.to_le_bytes()); // ggml tensor type
+            bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor data offset
+        }
+        bytes
+    }
+
+    #[test]
+    fn detects_nextn_prediction_head_tensors() {
+        let bytes =
+            test_gguf_with_tensors(&["token_embd.weight", "blk.40.nextn.shared_head_norm.weight"]);
+        assert_eq!(parse_has_mtp_tensors(&mut Cursor::new(bytes)), Some(true));
+    }
+
+    #[test]
+    fn regular_tensor_table_is_not_mtp() {
+        let bytes = test_gguf_with_tensors(&["token_embd.weight", "blk.0.attn_q.weight"]);
+        assert_eq!(parse_has_mtp_tensors(&mut Cursor::new(bytes)), Some(false));
+    }
 
     #[test]
     fn head_dim_gqa() {
